@@ -50,6 +50,7 @@ const state = {
   typingChannel: null,
   reactionsChannel: null,
   presenceChannel: null,
+  realtimeResubscribePromise: null,
   inboxChannel: null,
   globalMsgChannel: null,
 
@@ -3140,14 +3141,21 @@ async function flushOutbox() {
 }
 
 function resubscribeRealtime() {
-  if (!state.me) return;
+  if (!state.me) return Promise.resolve();
+  if (state.realtimeResubscribePromise) return state.realtimeResubscribePromise;
 
-  if (
-    state.presenceChannel
-  ) {
-    supabase.removeChannel(
-      state.presenceChannel
-    );
+  state.realtimeResubscribePromise = (async () => {
+
+  // removeChannel is asynchronous. Do not attach presence listeners to a new
+  // channel while the previous channel with the same topic is still closing.
+  if (state.presenceChannel) {
+    const oldPresenceChannel = state.presenceChannel;
+    state.presenceChannel = null;
+    try {
+      await supabase.removeChannel(oldPresenceChannel);
+    } catch (error) {
+      console.warn("[realtime] تعذّر إغلاق قناة الحضور القديمة:", error);
+    }
   }
 
   subscribeGlobalPresence();
@@ -3183,6 +3191,11 @@ function resubscribeRealtime() {
       state.activeConversation.id
     );
   }
+  })().finally(() => {
+    state.realtimeResubscribePromise = null;
+  });
+
+  return state.realtimeResubscribePromise;
 }
 
 function subscribeToConversation(
@@ -3437,103 +3450,50 @@ async function setTyping(
 }
 
 function subscribeGlobalPresence() {
-  state.presenceChannel =
-    supabase.channel(
-      "presence:global",
-      {
-        config: {
-          presence: {
-            key:
-              state.me.id,
-          },
-        },
+  // Realtime throws when .on() is called after subscribe(). This guard also
+  // prevents duplicate channels during repeated visibility/network events.
+  if (state.presenceChannel) return;
+
+  const channel = supabase.channel("presence:global", {
+    config: { presence: { key: state.me.id } },
+  });
+  state.presenceChannel = channel;
+
+  channel
+    .on("presence", { event: "sync" }, () => {
+      const presState = channel.presenceState();
+      state.onlineMap = {};
+
+      Object.keys(presState).forEach((id) => {
+        state.onlineMap[id] = true;
+      });
+
+      loadContacts();
+      if (state.activeConversation) {
+        refreshPresenceLabel(state.activeConversation.otherProfile.id);
       }
-    );
+    })
+    .on("presence", { event: "leave" }, async ({ leftPresences = [] }) => {
+      if (!state.activeConversation) return;
 
-  state.presenceChannel
-    .on(
-      "presence",
-      {
-        event:
-          "sync",
-      },
-      () => {
-        const presState =
-          state.presenceChannel.presenceState();
+      const leftIds = leftPresences
+        .map((presence) => presence.key)
+        .filter(Boolean);
 
-        state.onlineMap = {};
-
-        Object.keys(
-          presState
-        ).forEach(
-          (id) =>
-            (state.onlineMap[
-              id
-            ] = true)
-        );
-
-        loadContacts();
-
-        if (
-          state.activeConversation
-        ) {
-          refreshPresenceLabel(
-            state.activeConversation
-              .otherProfile.id
-          );
-        }
+      if (leftIds.includes(state.activeConversation.otherProfile.id)) {
+        await refreshPresenceLabel(state.activeConversation.otherProfile.id);
       }
-    )
-    .on(
-      "presence",
-      {
-        event:
-          "leave",
-      },
-      async ({
-        leftPresences,
-      }) => {
-        if (
-          state.activeConversation
-        ) {
-          const leftIds =
-            leftPresences
-              .map(
-                (p) =>
-                  p.presence_ref &&
-                  p.key
-              )
-              .filter(Boolean);
+    })
+    .subscribe(async (status) => {
+      if (status !== "SUBSCRIBED") return;
 
-          if (
-            leftIds.includes(
-              state.activeConversation
-                .otherProfile.id
-            )
-          ) {
-            await refreshPresenceLabel(
-              state.activeConversation
-                .otherProfile.id
-            );
-          }
-        }
+      const result = await channel.track({
+        online_at: new Date().toISOString(),
+      });
+      if (result?.error) {
+        console.warn("[realtime] تعذّر تحديث حالة الحضور:", result.error);
       }
-    )
-    .subscribe(
-      async (status) => {
-        if (
-          status ===
-          "SUBSCRIBED"
-        ) {
-          await state.presenceChannel.track(
-            {
-              online_at:
-                new Date().toISOString(),
-            }
-          );
-        }
-      }
-    );
+    });
 }
 
 async function refreshPresenceLabel(

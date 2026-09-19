@@ -197,3 +197,11 @@ true, is_admin = true where email = '...';` من قسم 9 بالبريد الج�
 - حماية الامتيازات في قاعدة البيانات: trigger يمنع أي مستخدم من منح نفسه `is_admin` / `is_super_admin`.
 - تشديد سياسات التخزين: الرفع مسموح داخل مجلد المستخدم `<user_id>/` فقط.
 - ربط عناصر واجهة كانت معطّلة: حذف الصورة الشخصية/الخلفية، والبحث في قائمة المحادثات والرسائل.
+
+### هـ) إصلاح خطأ `dynamic use static key`
+إذا كان App Certificate مفعّلاً، انشر دالة التوكن قبل اختبار المكالمات:
+```bash
+supabase functions deploy agora-token --no-verify-jwt
+supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
+```
+لا تضع App Certificate في `js/config.js`. الدالة تتحقق من جلسة Supabase وتصدر توكناً صالحاً لمدة ساعة.
