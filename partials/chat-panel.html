@@ -20,7 +20,10 @@
         <div id="typing-indicator" class="typing-indicator hidden" data-i18n="typing">يكتب الآن...</div>
       </div>
       <div class="chat-header-actions">
-        <button id="chat-search-toggle" type="button" title="بحث">🔍</button>
+        <button id="chat-search-toggle" type="button" title="بحث" aria-label="بحث">🔍</button>
+        <!-- أزرار المكالمات عبر Agora — بجانب زر البحث مباشرة -->
+        <button id="chat-call-audio" class="call-btn" type="button" title="مكالمة صوتية" aria-label="مكالمة صوتية">📞</button>
+        <button id="chat-call-video" class="call-btn" type="button" title="مكالمة فيديو" aria-label="مكالمة فيديو">🎥</button>
       </div>
     </header>
 

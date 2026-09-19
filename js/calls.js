@@ -1,0 +1,988 @@
+/* ============================================================
+ * js/calls.js
+ * مكالمات صوتية ومرئية عبر منصة Agora RTC.
+ *
+ * المعمارية:
+ *   - الإشارات (Signaling): عبر Supabase Realtime Broadcast على قناة
+ *     خاصة بكل مستخدم `calls:user:<uid>` + جدول `call_rooms` للحالة الدائمة.
+ *   - الوسائط (Media): عبر Agora RTC Web SDK (يُحمَّل بشكل كسول Lazy
+ *     عند أول مكالمة فقط، حتى لا يبطئ إقلاع التطبيق).
+ *   - الأمان: كل شيء مغلّف بـ try/catch — أي فشل يُنهي المكالمة بلطف
+ *     ولا يُسقط الواجهة.
+ * ============================================================ */
+
+import { AGORA, isAgoraConfigured, buildAgoraChannelName } from "./config.js";
+import { safeAsync, safeQuery, safeDom, guard } from "./safety.js";
+
+/* ------------------------------------------------------------
+ * 1) تحميل Agora SDK بشكل كسول
+ * ---------------------------------------------------------- */
+let sdkPromise = null;
+
+function loadAgoraSdk() {
+  if (window.AgoraRTC) return Promise.resolve(window.AgoraRTC);
+  if (sdkPromise) return sdkPromise;
+
+  sdkPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = AGORA.sdkUrl;
+    script.async = true;
+    script.crossOrigin = "anonymous";
+
+    const timeout = setTimeout(() => {
+      reject(new Error("انتهت مهلة تحميل مكتبة Agora — تحقق من اتصال الإنترنت."));
+    }, 20000);
+
+    script.onload = () => {
+      clearTimeout(timeout);
+      if (window.AgoraRTC) {
+        try {
+          window.AgoraRTC.setLogLevel?.(3); // أخطاء فقط
+        } catch {
+          /* تجاهل */
+        }
+        resolve(window.AgoraRTC);
+      } else {
+        reject(new Error("تم تحميل ملف Agora لكن الكائن AgoraRTC غير متاح."));
+      }
+    };
+
+    script.onerror = () => {
+      clearTimeout(timeout);
+      sdkPromise = null;
+      reject(new Error("تعذّر تحميل مكتبة Agora RTC."));
+    };
+
+    document.head.appendChild(script);
+  });
+
+  return sdkPromise;
+}
+
+/* ------------------------------------------------------------
+ * 2) حالة وحدة المكالمات
+ * ---------------------------------------------------------- */
+const callState = {
+  ctx: null, // { supabase, getMe, getActiveConversation, notify, t }
+
+  client: null,
+  localAudioTrack: null,
+  localVideoTrack: null,
+  remoteUsers: new Map(),
+
+  // المكالمة الجارية
+  current: null, // { roomId, channel, callType, peer, direction, startedAt }
+  incoming: null, // دعوة واردة قيد العرض
+
+  signalChannel: null,
+  ringTimer: null,
+  durationTimer: null,
+  ringtoneEl: null,
+
+  micMuted: false,
+  cameraOff: false,
+  joining: false,
+};
+
+function t(key, fallback) {
+  const dict = callState.ctx?.t?.();
+  return (dict && dict[key]) || fallback;
+}
+
+function notify(message) {
+  try {
+    callState.ctx?.notify?.(message);
+  } catch {
+    console.warn("[calls]", message);
+  }
+}
+
+function uuid() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/** Agora UID رقمي مشتق بثبات من UUID المستخدم (يبقى ثابتاً لكل مستخدم) */
+function uidFromUserId(userId) {
+  const str = String(userId || "");
+  let hash = 0;
+  for (let i = 0; i < str.length; i += 1) {
+    hash = (hash << 5) - hash + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash) % 1000000000 || 1;
+}
+
+/* ------------------------------------------------------------
+ * 3) واجهة المكالمة (Overlay) — تُبنى مرة واحدة عند الحاجة
+ * ---------------------------------------------------------- */
+function ensureCallOverlay() {
+  let overlay = document.getElementById("call-overlay");
+  if (overlay) return overlay;
+
+  overlay = document.createElement("div");
+  overlay.id = "call-overlay";
+  overlay.className = "call-overlay hidden";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.innerHTML = `
+    <div class="call-stage">
+      <div id="call-remote-video" class="call-video call-video-remote"></div>
+      <div id="call-local-video" class="call-video call-video-local"></div>
+
+      <div class="call-peer-card" id="call-peer-card">
+        <div class="call-avatar"><img id="call-peer-avatar" src="" alt="" /></div>
+        <div class="call-peer-name" id="call-peer-name"></div>
+        <div class="call-status-text" id="call-status-text"></div>
+        <div class="call-timer" id="call-timer"></div>
+      </div>
+
+      <div class="call-controls" id="call-controls">
+        <button type="button" id="call-btn-mic" class="call-ctrl" title="كتم الصوت">🎙️</button>
+        <button type="button" id="call-btn-cam" class="call-ctrl" title="إيقاف الكاميرا">🎥</button>
+        <button type="button" id="call-btn-switch" class="call-ctrl" title="تبديل الكاميرا">🔄</button>
+        <button type="button" id="call-btn-end" class="call-ctrl call-ctrl-end" title="إنهاء">📵</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  overlay
+    .querySelector("#call-btn-mic")
+    ?.addEventListener("click", guard("call:mic", toggleMicrophone));
+  overlay
+    .querySelector("#call-btn-cam")
+    ?.addEventListener("click", guard("call:cam", toggleCamera));
+  overlay
+    .querySelector("#call-btn-switch")
+    ?.addEventListener("click", guard("call:switch", switchCamera));
+  overlay
+    .querySelector("#call-btn-end")
+    ?.addEventListener("click", guard("call:end", () => endCall("ended")));
+
+  return overlay;
+}
+
+function ensureIncomingDialog() {
+  let box = document.getElementById("incoming-call");
+  if (box) return box;
+
+  box = document.createElement("div");
+  box.id = "incoming-call";
+  box.className = "incoming-call hidden";
+  box.innerHTML = `
+    <div class="incoming-card">
+      <div class="call-avatar"><img id="incoming-avatar" src="" alt="" /></div>
+      <div class="incoming-name" id="incoming-name"></div>
+      <div class="incoming-sub" id="incoming-sub"></div>
+      <div class="incoming-actions">
+        <button type="button" id="incoming-decline" class="call-ctrl call-ctrl-end">📵</button>
+        <button type="button" id="incoming-accept" class="call-ctrl call-ctrl-accept">📞</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(box);
+
+  box
+    .querySelector("#incoming-accept")
+    ?.addEventListener("click", guard("call:accept", acceptIncomingCall));
+  box
+    .querySelector("#incoming-decline")
+    ?.addEventListener("click", guard("call:decline", declineIncomingCall));
+
+  return box;
+}
+
+function setOverlayVisible(visible) {
+  safeDom("call-overlay", () => {
+    const overlay = ensureCallOverlay();
+    overlay.classList.toggle("hidden", !visible);
+    document.body.classList.toggle("in-call", visible);
+  });
+}
+
+function setCallStatus(text) {
+  safeDom("call-status", () => {
+    const el = document.getElementById("call-status-text");
+    if (el) el.textContent = text || "";
+  });
+}
+
+function setPeerInfo(peer) {
+  safeDom("call-peer", () => {
+    const nameEl = document.getElementById("call-peer-name");
+    const avatarEl = document.getElementById("call-peer-avatar");
+    if (nameEl) nameEl.textContent = peer?.display_name || "مستخدم";
+    if (avatarEl) avatarEl.src = peer?.avatar_url || "./icons/icon.png";
+  });
+}
+
+function startDurationTimer() {
+  stopDurationTimer();
+  const startedAt = Date.now();
+  callState.durationTimer = setInterval(() => {
+    safeDom("call-timer", () => {
+      const el = document.getElementById("call-timer");
+      if (!el) return;
+      const secs = Math.floor((Date.now() - startedAt) / 1000);
+      const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+      const ss = String(secs % 60).padStart(2, "0");
+      el.textContent = `${mm}:${ss}`;
+    });
+  }, 1000);
+}
+
+function stopDurationTimer() {
+  if (callState.durationTimer) {
+    clearInterval(callState.durationTimer);
+    callState.durationTimer = null;
+  }
+}
+
+function playRingtone() {
+  safeDom("ringtone", () => {
+    const audio = document.getElementById("notification-sound");
+    if (!audio) return;
+    callState.ringtoneEl = audio;
+    audio.loop = true;
+    // play() قد يُرجع undefined في بيئات قديمة، وقد يُرفض بسبب سياسة التشغيل التلقائي
+    const p = audio.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  });
+}
+
+function stopRingtone() {
+  safeDom("ringtone-stop", () => {
+    const audio = callState.ringtoneEl || document.getElementById("notification-sound");
+    if (!audio) return;
+    audio.loop = false;
+    audio.pause();
+    audio.currentTime = 0;
+  });
+}
+
+/* ------------------------------------------------------------
+ * 4) الإشارات عبر Supabase Realtime
+ * ---------------------------------------------------------- */
+function signalChannelName(userId) {
+  return `calls:user:${userId}`;
+}
+
+async function sendSignal(targetUserId, event, payload) {
+  const supabase = callState.ctx?.supabase;
+  if (!supabase || !targetUserId) return false;
+
+  return (
+    await safeAsync(`calls:signal:${event}`, async () => {
+      const channel = supabase.channel(signalChannelName(targetUserId), {
+        config: { broadcast: { ack: true } },
+      });
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("مهلة الاشتراك بقناة الإشارة")), 8000);
+        channel.subscribe((status) => {
+          if (status === "SUBSCRIBED") {
+            clearTimeout(timer);
+            resolve();
+          } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+            clearTimeout(timer);
+            reject(new Error("تعذّر الاتصال بقناة الإشارة"));
+          }
+        });
+      });
+
+      await channel.send({ type: "broadcast", event, payload });
+      // أغلق القناة المؤقتة بعد الإرسال لتوفير الموارد
+      setTimeout(() => {
+        try {
+          supabase.removeChannel(channel);
+        } catch {
+          /* تجاهل */
+        }
+      }, 1500);
+
+      return true;
+    })
+  ).ok;
+}
+
+/** يشترك في قناة الإشارات الخاصة بالمستخدم الحالي لاستقبال المكالمات */
+export function subscribeToIncomingCalls() {
+  const supabase = callState.ctx?.supabase;
+  const me = callState.ctx?.getMe?.();
+  if (!supabase || !me?.id) return;
+
+  unsubscribeFromIncomingCalls();
+
+  callState.signalChannel = supabase
+    .channel(signalChannelName(me.id), { config: { broadcast: { self: false } } })
+    .on("broadcast", { event: "call:invite" }, ({ payload }) => {
+      handleIncomingInvite(payload).catch((e) => console.error("[calls] invite", e));
+    })
+    .on("broadcast", { event: "call:accept" }, ({ payload }) => {
+      handlePeerAccepted(payload);
+    })
+    .on("broadcast", { event: "call:decline" }, ({ payload }) => {
+      handlePeerDeclined(payload);
+    })
+    .on("broadcast", { event: "call:end" }, ({ payload }) => {
+      handlePeerEnded(payload);
+    })
+    .subscribe();
+}
+
+export function unsubscribeFromIncomingCalls() {
+  const supabase = callState.ctx?.supabase;
+  if (supabase && callState.signalChannel) {
+    try {
+      supabase.removeChannel(callState.signalChannel);
+    } catch {
+      /* تجاهل */
+    }
+  }
+  callState.signalChannel = null;
+}
+
+/* ------------------------------------------------------------
+ * 5) سجل المكالمات في قاعدة البيانات
+ * ---------------------------------------------------------- */
+async function persistCallRoom(room) {
+  const supabase = callState.ctx?.supabase;
+  if (!supabase) return;
+  await safeQuery("calls:insert-room", () =>
+    supabase.from("call_rooms").insert({
+      id: room.roomId,
+      conversation_id: room.conversationId,
+      channel_name: room.channel,
+      call_type: room.callType,
+      caller_id: room.callerId,
+      callee_id: room.calleeId,
+      status: "ringing",
+    })
+  );
+}
+
+async function updateCallRoom(roomId, patch) {
+  const supabase = callState.ctx?.supabase;
+  if (!supabase || !roomId) return;
+  await safeQuery("calls:update-room", () =>
+    supabase.from("call_rooms").update(patch).eq("id", roomId)
+  );
+}
+
+async function logCallEvent(roomId, event, meta = {}) {
+  const supabase = callState.ctx?.supabase;
+  const me = callState.ctx?.getMe?.();
+  if (!supabase || !roomId || !me?.id) return;
+  await safeQuery("calls:log", () =>
+    supabase.from("call_logs").insert({
+      room_id: roomId,
+      user_id: me.id,
+      event,
+      metadata: meta,
+    })
+  );
+}
+
+async function setCallPresence(status) {
+  const supabase = callState.ctx?.supabase;
+  const me = callState.ctx?.getMe?.();
+  if (!supabase || !me?.id) return;
+  await safeQuery("calls:presence", () =>
+    supabase
+      .from("profiles")
+      .update({ call_status: status, call_status_at: new Date().toISOString() })
+      .eq("id", me.id)
+  );
+}
+
+/* ------------------------------------------------------------
+ * 6) إدارة Agora RTC
+ * ---------------------------------------------------------- */
+async function fetchAgoraToken(channel, uid) {
+  if (!AGORA.tokenEndpoint) return null; // وضع Testing بدون شهادة
+
+  const result = await safeAsync("calls:token", async () => {
+    const res = await fetch(AGORA.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channelName: channel, uid }),
+    });
+    if (!res.ok) throw new Error(`خادم التوكن أعاد ${res.status}`);
+    const json = await res.json();
+    return json?.token || null;
+  });
+
+  return result.data;
+}
+
+function attachClientHandlers(client) {
+  client.on("user-published", async (user, mediaType) => {
+    await safeAsync("calls:subscribe-remote", async () => {
+      await client.subscribe(user, mediaType);
+      callState.remoteUsers.set(user.uid, user);
+
+      if (mediaType === "video") {
+        safeDom("remote-video", () => {
+          const container = document.getElementById("call-remote-video");
+          if (container) {
+            container.innerHTML = "";
+            user.videoTrack?.play(container, { fit: "cover" });
+            container.classList.add("has-video");
+            document.getElementById("call-peer-card")?.classList.add("compact");
+          }
+        });
+      }
+
+      if (mediaType === "audio") {
+        user.audioTrack?.play();
+      }
+    });
+  });
+
+  client.on("user-unpublished", (user, mediaType) => {
+    if (mediaType === "video") {
+      safeDom("remote-video-off", () => {
+        const container = document.getElementById("call-remote-video");
+        if (container) {
+          container.innerHTML = "";
+          container.classList.remove("has-video");
+          document.getElementById("call-peer-card")?.classList.remove("compact");
+        }
+      });
+    }
+  });
+
+  client.on("user-left", (user) => {
+    callState.remoteUsers.delete(user.uid);
+    if (callState.remoteUsers.size === 0 && callState.current) {
+      notify("انتهت المكالمة — غادر الطرف الآخر.");
+      endCall("ended", { silent: true });
+    }
+  });
+
+  client.on("connection-state-change", (curr) => {
+    if (curr === "DISCONNECTED" && callState.current) {
+      setCallStatus("انقطع الاتصال...");
+    } else if (curr === "RECONNECTING") {
+      setCallStatus("إعادة الاتصال...");
+    }
+  });
+
+  client.on("exception", (evt) => {
+    console.warn("[calls] Agora exception:", evt?.code, evt?.msg);
+  });
+}
+
+async function joinAgoraChannel({ channel, callType }) {
+  const AgoraRTC = await loadAgoraSdk();
+
+  const me = callState.ctx?.getMe?.();
+  const uid = uidFromUserId(me?.id);
+
+  const client = AgoraRTC.createClient({ mode: AGORA.mode, codec: AGORA.codec });
+  callState.client = client;
+  attachClientHandlers(client);
+
+  const token = await fetchAgoraToken(channel, uid);
+  await client.join(AGORA.appId, channel, token || null, uid);
+
+  // --- المسارات المحلية ---
+  const tracks = [];
+
+  const audioResult = await safeAsync("calls:mic-track", () =>
+    AgoraRTC.createMicrophoneAudioTrack({
+      encoderConfig: AGORA.audioProfile,
+      AEC: true, // إلغاء الصدى
+      ANS: true, // تقليل الضوضاء
+      AGC: true, // تحكم تلقائي بمستوى الصوت
+    })
+  );
+
+  if (audioResult.ok && audioResult.data) {
+    callState.localAudioTrack = audioResult.data;
+    tracks.push(audioResult.data);
+  } else {
+    notify("تعذّر الوصول إلى الميكروفون — تحقق من أذونات المتصفح.");
+  }
+
+  if (callType === "video") {
+    const videoResult = await safeAsync("calls:cam-track", () =>
+      AgoraRTC.createCameraVideoTrack({
+        encoderConfig: AGORA.videoProfile,
+        optimizationMode: "motion",
+      })
+    );
+
+    if (videoResult.ok && videoResult.data) {
+      callState.localVideoTrack = videoResult.data;
+      tracks.push(videoResult.data);
+
+      safeDom("local-video", () => {
+        const container = document.getElementById("call-local-video");
+        if (container) {
+          container.innerHTML = "";
+          container.classList.remove("hidden");
+          videoResult.data.play(container, { fit: "cover", mirror: true });
+        }
+      });
+    } else {
+      notify("تعذّر الوصول إلى الكاميرا — ستتم المتابعة بالصوت فقط.");
+    }
+  }
+
+  if (tracks.length) {
+    await safeAsync("calls:publish", () => client.publish(tracks));
+  }
+
+  return client;
+}
+
+async function releaseLocalTracks() {
+  for (const key of ["localAudioTrack", "localVideoTrack"]) {
+    const track = callState[key];
+    if (!track) continue;
+    try {
+      track.stop();
+      track.close();
+    } catch (err) {
+      console.warn("[calls] track release", err);
+    }
+    callState[key] = null;
+  }
+}
+
+async function leaveAgoraChannel() {
+  await releaseLocalTracks();
+
+  if (callState.client) {
+    await safeAsync("calls:leave", async () => {
+      callState.client.removeAllListeners?.();
+      await callState.client.leave();
+    });
+    callState.client = null;
+  }
+
+  callState.remoteUsers.clear();
+
+  safeDom("clear-videos", () => {
+    const remote = document.getElementById("call-remote-video");
+    const local = document.getElementById("call-local-video");
+    if (remote) {
+      remote.innerHTML = "";
+      remote.classList.remove("has-video");
+    }
+    if (local) {
+      local.innerHTML = "";
+      local.classList.add("hidden");
+    }
+    document.getElementById("call-peer-card")?.classList.remove("compact");
+  });
+}
+
+/* ------------------------------------------------------------
+ * 7) تدفق المكالمة الصادرة
+ * ---------------------------------------------------------- */
+export async function startCall(callType = "audio") {
+  if (callState.current || callState.joining) {
+    notify("هناك مكالمة جارية بالفعل.");
+    return;
+  }
+
+  if (!isAgoraConfigured()) {
+    notify("مكالمات Agora غير مهيّأة بعد — أضف App ID في js/config.js.");
+    return;
+  }
+
+  const me = callState.ctx?.getMe?.();
+  const conv = callState.ctx?.getActiveConversation?.();
+
+  if (!me?.id) {
+    notify("يجب تسجيل الدخول أولاً.");
+    return;
+  }
+
+  if (!conv?.id || !conv?.otherProfile?.id) {
+    notify("افتح محادثة أولاً لبدء مكالمة.");
+    return;
+  }
+
+  if (!navigator.onLine) {
+    notify("لا يمكن إجراء مكالمة بدون اتصال بالإنترنت.");
+    return;
+  }
+
+  callState.joining = true;
+
+  const roomId = uuid();
+  const channel = buildAgoraChannelName(conv.id);
+  const peer = conv.otherProfile;
+
+  callState.current = {
+    roomId,
+    channel,
+    callType,
+    peer,
+    conversationId: conv.id,
+    direction: "outgoing",
+    connected: false,
+  };
+
+  setPeerInfo(peer);
+  setCallStatus(callType === "video" ? "جارٍ الاتصال بالفيديو..." : "جارٍ الاتصال...");
+  setOverlayVisible(true);
+  updateControlsForType(callType);
+
+  await persistCallRoom({
+    roomId,
+    conversationId: conv.id,
+    channel,
+    callType,
+    callerId: me.id,
+    calleeId: peer.id,
+  });
+
+  await logCallEvent(roomId, "initiated", { call_type: callType });
+  await setCallPresence("in_call");
+
+  const delivered = await sendSignal(peer.id, "call:invite", {
+    roomId,
+    channel,
+    callType,
+    conversationId: conv.id,
+    caller: {
+      id: me.id,
+      display_name: me.display_name,
+      avatar_url: me.avatar_url || null,
+    },
+  });
+
+  if (!delivered) {
+    notify("تعذّر إرسال دعوة المكالمة — قد يكون الطرف الآخر غير متصل.");
+  }
+
+  // انضم للقناة مباشرة حتى يسمع/يرى فوراً عند قبول الطرف الآخر
+  const joined = await safeAsync("calls:join-outgoing", () =>
+    joinAgoraChannel({ channel, callType })
+  );
+
+  callState.joining = false;
+
+  if (!joined.ok) {
+    notify("تعذّر بدء المكالمة: " + (joined.error?.message || "خطأ غير معروف"));
+    await endCall("failed");
+    return;
+  }
+
+  // مهلة الرنين
+  clearTimeout(callState.ringTimer);
+  callState.ringTimer = setTimeout(() => {
+    if (callState.current && !callState.current.connected) {
+      notify("لم يرد الطرف الآخر على المكالمة.");
+      endCall("missed");
+    }
+  }, AGORA.ringTimeoutMs);
+}
+
+/* ------------------------------------------------------------
+ * 8) تدفق المكالمة الواردة
+ * ---------------------------------------------------------- */
+async function handleIncomingInvite(payload) {
+  if (!payload?.roomId || !payload?.channel) return;
+
+  // مشغول بمكالمة أخرى → ارفض تلقائياً
+  if (callState.current || callState.incoming) {
+    await sendSignal(payload.caller?.id, "call:decline", {
+      roomId: payload.roomId,
+      reason: "busy",
+    });
+    return;
+  }
+
+  callState.incoming = payload;
+
+  safeDom("incoming-show", () => {
+    const box = ensureIncomingDialog();
+    const nameEl = box.querySelector("#incoming-name");
+    const subEl = box.querySelector("#incoming-sub");
+    const avatarEl = box.querySelector("#incoming-avatar");
+
+    if (nameEl) nameEl.textContent = payload.caller?.display_name || "مكالمة واردة";
+    if (subEl) {
+      subEl.textContent =
+        payload.callType === "video" ? "مكالمة فيديو واردة..." : "مكالمة صوتية واردة...";
+    }
+    if (avatarEl) avatarEl.src = payload.caller?.avatar_url || "./icons/icon.png";
+
+    box.classList.remove("hidden");
+  });
+
+  playRingtone();
+
+  clearTimeout(callState.ringTimer);
+  callState.ringTimer = setTimeout(() => {
+    if (callState.incoming?.roomId === payload.roomId) {
+      hideIncomingDialog();
+      logCallEvent(payload.roomId, "missed", {});
+      callState.incoming = null;
+    }
+  }, AGORA.ringTimeoutMs);
+}
+
+function hideIncomingDialog() {
+  stopRingtone();
+  clearTimeout(callState.ringTimer);
+  safeDom("incoming-hide", () => {
+    document.getElementById("incoming-call")?.classList.add("hidden");
+  });
+}
+
+async function acceptIncomingCall() {
+  const invite = callState.incoming;
+  if (!invite) return;
+
+  callState.incoming = null;
+  hideIncomingDialog();
+
+  if (!isAgoraConfigured()) {
+    notify("مكالمات Agora غير مهيّأة على هذا الجهاز.");
+    return;
+  }
+
+  callState.current = {
+    roomId: invite.roomId,
+    channel: invite.channel,
+    callType: invite.callType,
+    peer: invite.caller,
+    conversationId: invite.conversationId,
+    direction: "incoming",
+    connected: true,
+  };
+
+  setPeerInfo(invite.caller);
+  setCallStatus("جارٍ الانضمام...");
+  setOverlayVisible(true);
+  updateControlsForType(invite.callType);
+
+  await sendSignal(invite.caller?.id, "call:accept", { roomId: invite.roomId });
+  await updateCallRoom(invite.roomId, {
+    status: "active",
+    answered_at: new Date().toISOString(),
+  });
+  await logCallEvent(invite.roomId, "answered", {});
+  await setCallPresence("in_call");
+
+  const joined = await safeAsync("calls:join-incoming", () =>
+    joinAgoraChannel({ channel: invite.channel, callType: invite.callType })
+  );
+
+  if (!joined.ok) {
+    notify("تعذّر الانضمام للمكالمة: " + (joined.error?.message || "خطأ غير معروف"));
+    await endCall("failed");
+    return;
+  }
+
+  setCallStatus("متصل");
+  startDurationTimer();
+}
+
+async function declineIncomingCall() {
+  const invite = callState.incoming;
+  callState.incoming = null;
+  hideIncomingDialog();
+
+  if (!invite) return;
+
+  await sendSignal(invite.caller?.id, "call:decline", {
+    roomId: invite.roomId,
+    reason: "declined",
+  });
+  await updateCallRoom(invite.roomId, {
+    status: "declined",
+    ended_at: new Date().toISOString(),
+  });
+  await logCallEvent(invite.roomId, "declined", {});
+}
+
+/* ------------------------------------------------------------
+ * 9) أحداث الطرف الآخر
+ * ---------------------------------------------------------- */
+function handlePeerAccepted(payload) {
+  if (!callState.current || callState.current.roomId !== payload?.roomId) return;
+  callState.current.connected = true;
+  clearTimeout(callState.ringTimer);
+  setCallStatus("متصل");
+  startDurationTimer();
+  updateCallRoom(payload.roomId, {
+    status: "active",
+    answered_at: new Date().toISOString(),
+  });
+}
+
+function handlePeerDeclined(payload) {
+  if (!callState.current || callState.current.roomId !== payload?.roomId) return;
+  notify(payload?.reason === "busy" ? "الطرف الآخر مشغول حالياً." : "تم رفض المكالمة.");
+  endCall("declined", { silent: true });
+}
+
+function handlePeerEnded(payload) {
+  if (callState.current && callState.current.roomId === payload?.roomId) {
+    endCall("ended", { silent: true });
+    return;
+  }
+  if (callState.incoming && callState.incoming.roomId === payload?.roomId) {
+    callState.incoming = null;
+    hideIncomingDialog();
+  }
+}
+
+/* ------------------------------------------------------------
+ * 10) إنهاء المكالمة وتنظيف الموارد
+ * ---------------------------------------------------------- */
+export async function endCall(reason = "ended", { silent = false } = {}) {
+  const call = callState.current;
+
+  clearTimeout(callState.ringTimer);
+  stopDurationTimer();
+  stopRingtone();
+  callState.joining = false;
+
+  await leaveAgoraChannel();
+
+  setOverlayVisible(false);
+  setCallStatus("");
+  safeDom("reset-timer", () => {
+    const el = document.getElementById("call-timer");
+    if (el) el.textContent = "";
+  });
+
+  callState.micMuted = false;
+  callState.cameraOff = false;
+  callState.current = null;
+
+  await setCallPresence("available");
+
+  if (!call) return;
+
+  if (!silent) {
+    await sendSignal(call.peer?.id, "call:end", { roomId: call.roomId });
+  }
+
+  await updateCallRoom(call.roomId, {
+    status: reason === "ended" ? "ended" : reason,
+    ended_at: new Date().toISOString(),
+  });
+  await logCallEvent(call.roomId, reason, { direction: call.direction });
+}
+
+/* ------------------------------------------------------------
+ * 11) ضوابط واجهة المكالمة
+ * ---------------------------------------------------------- */
+function updateControlsForType(callType) {
+  safeDom("call-controls", () => {
+    const isVideo = callType === "video";
+    document.getElementById("call-btn-cam")?.classList.toggle("hidden", !isVideo);
+    document.getElementById("call-btn-switch")?.classList.toggle("hidden", !isVideo);
+    document.getElementById("call-local-video")?.classList.toggle("hidden", !isVideo);
+  });
+}
+
+async function toggleMicrophone() {
+  const track = callState.localAudioTrack;
+  if (!track) return;
+
+  callState.micMuted = !callState.micMuted;
+  await safeAsync("calls:toggle-mic", () => track.setMuted(callState.micMuted));
+
+  safeDom("mic-btn", () => {
+    const btn = document.getElementById("call-btn-mic");
+    if (!btn) return;
+    btn.textContent = callState.micMuted ? "🔇" : "🎙️";
+    btn.classList.toggle("active", callState.micMuted);
+  });
+}
+
+async function toggleCamera() {
+  const track = callState.localVideoTrack;
+  if (!track) return;
+
+  callState.cameraOff = !callState.cameraOff;
+  await safeAsync("calls:toggle-cam", () => track.setMuted(callState.cameraOff));
+
+  safeDom("cam-btn", () => {
+    const btn = document.getElementById("call-btn-cam");
+    if (btn) {
+      btn.textContent = callState.cameraOff ? "🚫" : "🎥";
+      btn.classList.toggle("active", callState.cameraOff);
+    }
+    document.getElementById("call-local-video")?.classList.toggle("hidden", callState.cameraOff);
+  });
+}
+
+async function switchCamera() {
+  const track = callState.localVideoTrack;
+  if (!track) return;
+
+  await safeAsync("calls:switch-cam", async () => {
+    const AgoraRTC = await loadAgoraSdk();
+    const cameras = await AgoraRTC.getCameras();
+    if (!cameras || cameras.length < 2) {
+      notify("لا توجد كاميرا أخرى متاحة.");
+      return;
+    }
+    const currentLabel = track.getTrackLabel?.();
+    const next = cameras.find((c) => c.label !== currentLabel) || cameras[0];
+    await track.setDevice(next.deviceId);
+  });
+}
+
+/* ------------------------------------------------------------
+ * 12) التهيئة العامة + ربط أزرار الواجهة
+ * ---------------------------------------------------------- */
+export function initCalls(ctx) {
+  callState.ctx = ctx;
+
+  ensureCallOverlay();
+  ensureIncomingDialog();
+
+  // إنهاء آمن عند إغلاق التبويب حتى لا تبقى غرفة معلّقة
+  window.addEventListener("pagehide", () => {
+    if (callState.current) {
+      try {
+        navigator.sendBeacon?.("about:blank");
+      } catch {
+        /* تجاهل */
+      }
+      leaveAgoraChannel();
+    }
+  });
+
+  // Esc لإنهاء المكالمة
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && callState.current) endCall("ended");
+  });
+}
+
+/** يربط أزرار المكالمة في رأس المحادثة (تُستدعى بعد حقن الـ partial) */
+export function wireCallButtons() {
+  const audioBtn = document.getElementById("chat-call-audio");
+  const videoBtn = document.getElementById("chat-call-video");
+
+  if (audioBtn && !audioBtn.dataset.wired) {
+    audioBtn.dataset.wired = "1";
+    audioBtn.addEventListener("click", guard("call:start-audio", () => startCall("audio")));
+  }
+
+  if (videoBtn && !videoBtn.dataset.wired) {
+    videoBtn.dataset.wired = "1";
+    videoBtn.addEventListener("click", guard("call:start-video", () => startCall("video")));
+  }
+}
+
+export function isCallActive() {
+  return Boolean(callState.current);
+}

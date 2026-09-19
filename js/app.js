@@ -16,6 +16,22 @@ import {
   disablePushNotifications,
   listenForForegroundMessages,
 } from "./push.js";
+import {
+  initCalls,
+  wireCallButtons,
+  subscribeToIncomingCalls,
+  unsubscribeFromIncomingCalls,
+  isCallActive,
+  endCall,
+} from "./calls.js";
+import {
+  installGlobalErrorBoundary,
+  safeAsync,
+  safeQuery,
+  safeDom,
+  guard,
+} from "./safety.js";
+import { prepareFileForUpload, MEDIA_PRESETS, formatBytes } from "./media.js";
 const state = {
   me: null,
   t: null,
@@ -59,17 +75,35 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 
 async function boot() {
+  // حاجز الأخطاء العام: يمنع أي استثناء غير معالج من تجميد/إسقاط الواجهة
+  installGlobalErrorBoundary({ notify: (msg) => showAuthError(msg) });
+
   document.body.setAttribute("data-theme", state.theme);
 
-  setupPWAInstallPrompt();
+  safeDom("boot:pwa", () => setupPWAInstallPrompt());
 
-  await loadChatPanelPartial();
+  await safeAsync("boot:partial", () => loadChatPanelPartial(), { retries: 1 });
 
   state.t = applyLanguage(state.lang);
 
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
+  // تهيئة وحدة المكالمات مبكراً (دون تحميل SDK — يُحمَّل عند أول مكالمة)
+  safeDom("boot:calls", () =>
+    initCalls({
+      supabase,
+      getMe: () => state.me,
+      getActiveConversation: () => state.activeConversation,
+      notify: (msg) => showAuthError(msg),
+      t: () => state.t,
+    })
+  );
+
+  const sessionResult = await safeAsync("boot:session", async () => {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) throw error;
+    return data?.session || null;
+  });
+
+  const session = sessionResult.data;
 
   wireAuthForms();
   wireChrome();
@@ -77,7 +111,9 @@ async function boot() {
   $("#boot-loading")?.classList.add("hidden");
 
   if (session) {
-    await enterApp();
+    await safeAsync("boot:enterApp", () => enterApp(), {
+      onError: () => showAuthError("تعذّر تحميل التطبيق بالكامل — حاول تحديث الصفحة."),
+    });
   } else {
     showAuthScreen();
   }
@@ -85,6 +121,11 @@ async function boot() {
   supabase.auth.onAuthStateChange((event) => {
     if (event === "SIGNED_OUT") {
       state.me = null;
+      try {
+        unsubscribeFromIncomingCalls();
+      } catch (err) {
+        console.error("unsubscribeFromIncomingCalls failed:", err);
+      }
       showAuthScreen();
     }
   });
@@ -99,25 +140,42 @@ async function boot() {
   document.addEventListener("visibilitychange", async () => {
     if (!state.me) return;
 
-    if (document.visibilityState === "hidden") {
-      await touchLastSeen(false);
-    } else {
-      await touchLastSeen(true);
+    // لا تُغيّر حالة الاتصال أو تُعِد الاشتراك أثناء مكالمة جارية
+    if (isCallActive()) return;
+
+    await safeAsync("visibility", async () => {
+      if (document.visibilityState === "hidden") {
+        await touchLastSeen(false);
+      } else {
+        await touchLastSeen(true);
+        resubscribeRealtime();
+      }
+    });
+  });
+
+  window.addEventListener(
+    "online",
+    guard("net:online", () => {
+      state.isOnline = true;
+      updateOfflineBanner();
+      flushOutbox();
       resubscribeRealtime();
-    }
-  });
+    })
+  );
 
-  window.addEventListener("online", () => {
-    state.isOnline = true;
-    updateOfflineBanner();
-    flushOutbox();
-    resubscribeRealtime();
-  });
+  window.addEventListener(
+    "offline",
+    guard("net:offline", () => {
+      state.isOnline = false;
+      updateOfflineBanner();
 
-  window.addEventListener("offline", () => {
-    state.isOnline = false;
-    updateOfflineBanner();
-  });
+      // انقطاع الشبكة أثناء مكالمة → أنهِها بلطف بدل تركها معلّقة
+      if (isCallActive()) {
+        showAuthError("انقطع الاتصال بالإنترنت — تم إنهاء المكالمة.");
+        endCall("network_lost", { silent: true });
+      }
+    })
+  );
 
   updateOfflineBanner();
 
@@ -129,8 +187,10 @@ async function boot() {
 
   document.addEventListener("click", (e) => {
     if (e.target.closest("#back-to-list")) {
-      if (history.state && history.state.waChat) {
-        history.back();
+      const h = window.history;
+
+      if (h && h.state && h.state.waChat) {
+        h.back();
       } else {
         closeChatView();
       }
@@ -155,25 +215,19 @@ window.addEventListener('pagehide', () => {
 function openConversationUIState(conversationId) {
   document.body.classList.add("viewing-chat");
 
-  if (history.state && history.state.waChat) {
-    history.replaceState(
-      {
-        waChat: true,
-        conversationId,
-      },
-      "",
-      "#chat"
-    );
-  } else {
-    history.pushState(
-      {
-        waChat: true,
-        conversationId,
-      },
-      "",
-      "#chat"
-    );
-  }
+  // History API قد يكون محدوداً (iframe/sandbox) — لا تدع فشله يمنع فتح المحادثة
+  safeDom("history:push", () => {
+    const h = window.history;
+    if (!h || typeof h.pushState !== "function") return;
+
+    const entry = { waChat: true, conversationId };
+
+    if (h.state && h.state.waChat) {
+      h.replaceState(entry, "", "#chat");
+    } else {
+      h.pushState(entry, "", "#chat");
+    }
+  });
 }
 
 function closeChatView() {
@@ -181,18 +235,28 @@ function closeChatView() {
 
   $("#chat-panel")?.classList.remove("mobile-visible");
   $("#sidebar")?.classList.remove("mobile-hidden");
+
+  clearChatSearchHighlights();
+  document.querySelector("#chat-search-bar")?.classList.add("hidden");
 }
 
 function updateOfflineBanner() {
   const banner = $("#offline-banner");
 
-  if (!banner) return;
+  if (banner) {
+    banner.classList.toggle("hidden", state.isOnline);
+  }
 
-  banner.classList.toggle("hidden", state.isOnline);
+  updateCallButtonsState();
 }
 
 async function loadChatPanelPartial() {
-  const res = await fetch("./partials/chat-panel.html");
+  const res = await fetch("./partials/chat-panel.html", { cache: "no-cache" });
+
+  if (!res.ok) {
+    throw new Error(`تعذّر تحميل واجهة المحادثة (${res.status})`);
+  }
+
   const html = await res.text();
 
   const container = $("#chat-panel-container");
@@ -210,21 +274,34 @@ function showAuthScreen() {
 }
 
 async function enterApp() {
-  state.me = await getCurrentProfile();
+  const profileResult = await safeAsync("enterApp:profile", () => getCurrentProfile(), {
+    retries: 1,
+  });
+
+  state.me = profileResult.data;
 
   if (!state.me) {
     showAuthScreen();
+
+    if (!profileResult.ok) {
+      showAuthError("تعذّر جلب بيانات الحساب — تحقق من الاتصال ثم أعد المحاولة.");
+    }
+
     return;
   }
 
-  $("#auth-screen")?.classList.add("hidden");
-  $("#app-shell")?.classList.remove("hidden");
+  safeDom("enterApp:shell", () => {
+    $("#auth-screen")?.classList.add("hidden");
+    $("#app-shell")?.classList.remove("hidden");
 
-  $("#my-name").textContent = state.me.display_name;
+    const nameEl = $("#my-name");
+    if (nameEl) nameEl.textContent = state.me.display_name || "";
 
-  if (state.me.avatar_url) {
-    $("#my-avatar").src = state.me.avatar_url;
-  }
+    const avatarEl = $("#my-avatar");
+    if (avatarEl && state.me.avatar_url) {
+      avatarEl.src = state.me.avatar_url;
+    }
+  });
 
   applyThemeVars();
 
@@ -232,11 +309,14 @@ async function enterApp() {
 
   startHeartbeat();
 
-  await loadContacts();
+  await safeAsync("enterApp:contacts", () => loadContacts());
 
-  subscribeGlobalPresence();
-  subscribeInboxUpdates();
-  subscribeGlobalMessageWatch();
+  safeDom("enterApp:realtime", () => {
+    subscribeGlobalPresence();
+    subscribeInboxUpdates();
+    subscribeGlobalMessageWatch();
+    subscribeToIncomingCalls();
+  });
 
   if (!state.foregroundMessagesUnsub) {
     try {
@@ -257,22 +337,25 @@ async function enterApp() {
 }
 
 async function touchLastSeen(online) {
-  if (!state.me) return;
+  if (!state.me || !state.isOnline) return;
 
-  await supabase
-    .from("profiles")
-    .update({
-      is_online: online,
-      last_seen: new Date().toISOString(),
-    })
-    .eq("id", state.me.id);
+  await safeQuery("touchLastSeen", () =>
+    supabase
+      .from("profiles")
+      .update({
+        is_online: online,
+        last_seen: new Date().toISOString(),
+      })
+      .eq("id", state.me.id)
+  );
 }
 
 function startHeartbeat() {
   clearInterval(state.heartbeatInterval);
 
   state.heartbeatInterval = setInterval(() => {
-    if (document.visibilityState === "visible") {
+    // نبضة فقط عند ظهور الصفحة واتصال الشبكة — توفير للبطارية والحزمة
+    if (document.visibilityState === "visible" && state.isOnline && state.me) {
       touchLastSeen(true);
     }
   }, 25000);
@@ -427,8 +510,108 @@ function wireChrome() {
     }
   );
 
+  // حذف الصورة الشخصية / خلفية الدردشة (كانت الأزرار موجودة بلا ربط)
+  $("#btn-remove-avatar")?.addEventListener(
+    "click",
+    guard("settings:remove-avatar", () => removeProfileMedia("avatar_url"))
+  );
+
+  $("#btn-remove-wallpaper")?.addEventListener(
+    "click",
+    guard("settings:remove-wallpaper", () => removeProfileMedia("wallpaper_url"))
+  );
+
+  // بحث فوري في قائمة جهات الاتصال (كان الحقل بلا ربط)
+  $(".search-box input")?.addEventListener(
+    "input",
+    guard("sidebar:search", (e) => filterContactList(e.target.value))
+  );
+
+  // أغلق لوحة الإعدادات عند النقر خارجها
+  document.addEventListener("click", (e) => {
+    const panel = $("#settings-panel");
+    if (!panel || panel.classList.contains("hidden")) return;
+    if (e.target.closest("#settings-panel") || e.target.closest("#btn-settings")) return;
+    panel.classList.add("hidden");
+  });
+
   wireChatPanel();
   wireEmojiPicker();
+}
+
+/** يحذف الصورة الشخصية أو خلفية الدردشة من الملف الشخصي */
+async function removeProfileMedia(field) {
+  if (!state.me) return;
+
+  const label = field === "avatar_url" ? "الصورة الشخصية" : "خلفية الدردشة";
+
+  const { ok } = await safeQuery("profile:remove-media", () =>
+    supabase.from("profiles").update({ [field]: null }).eq("id", state.me.id)
+  );
+
+  if (!ok) {
+    showAuthError(`تعذّر حذف ${label} — حاول مرة أخرى.`);
+    return;
+  }
+
+  state.me[field] = null;
+
+  safeDom("profile:remove-media-ui", () => {
+    if (field === "avatar_url") {
+      const img = $("#my-avatar");
+      if (img) img.src = "";
+    } else {
+      const box = $("#chat-messages");
+      if (box) box.style.backgroundImage = "";
+    }
+  });
+
+  showAuthError(`تم حذف ${label} ✅`);
+}
+
+/** تصفية قائمة المحادثات حسب نص البحث */
+function filterContactList(rawQuery) {
+  const query = (rawQuery || "").trim().toLowerCase();
+
+  safeDom("sidebar:filter", () => {
+    let visible = 0;
+
+    document.querySelectorAll("#contact-list-wrap .contact-row").forEach((row) => {
+      const name = (row.querySelector(".contact-name")?.textContent || "").toLowerCase();
+      const sub = (row.querySelector(".contact-sub")?.textContent || "").toLowerCase();
+      const match = !query || name.includes(query) || sub.includes(query);
+
+      row.classList.toggle("hidden", !match);
+      if (match) visible += 1;
+    });
+
+    // أخفِ العناوين الفارغة أثناء البحث
+    ["#admins-section", "#users-section"].forEach((sel, idx) => {
+      const section = $(sel);
+      const heading = $(idx === 0 ? "#admins-heading" : "#users-heading");
+      if (!section || !heading || heading.dataset.forceHidden === "1") return;
+
+      const hasVisible = Boolean(
+        section.querySelector(".contact-row:not(.hidden)")
+      );
+      heading.classList.toggle("hidden", query ? !hasVisible : false);
+    });
+
+    let emptyEl = $("#contact-search-empty");
+
+    if (!visible && query) {
+      if (!emptyEl) {
+        emptyEl = document.createElement("div");
+        emptyEl.id = "contact-search-empty";
+        emptyEl.className = "contact-search-empty";
+        $("#contact-list-wrap")?.appendChild(emptyEl);
+      }
+      emptyEl.textContent = "لا توجد نتائج مطابقة";
+      emptyEl.classList.remove("hidden");
+    } else if (emptyEl) {
+      emptyEl.classList.add("hidden");
+    }
+  });
 }
 
 function toggleLanguage() {
@@ -513,6 +696,119 @@ function wireChatPanel() {
     "click",
     cancelRecording
   );
+
+  // أزرار المكالمات (صوتية/مرئية) بجانب زر البحث في رأس المحادثة
+  safeDom("wire:call-buttons", () => wireCallButtons());
+
+  // زر البحث داخل المحادثة
+  $("#chat-search-toggle")?.addEventListener(
+    "click",
+    guard("chat:search-toggle", toggleChatSearch)
+  );
+
+  updateCallButtonsState();
+}
+
+/* ------------------------------------------------------------
+ * البحث داخل الرسائل
+ * ---------------------------------------------------------- */
+function toggleChatSearch() {
+  const bar = ensureChatSearchBar();
+
+  const willShow = bar.classList.contains("hidden");
+
+  bar.classList.toggle("hidden", !willShow);
+
+  if (willShow) {
+    bar.querySelector("input")?.focus();
+  } else {
+    clearChatSearchHighlights();
+  }
+}
+
+function ensureChatSearchBar() {
+  let bar = document.querySelector("#chat-search-bar");
+
+  if (bar) return bar;
+
+  bar = document.createElement("div");
+  bar.id = "chat-search-bar";
+  bar.className = "chat-search-bar hidden";
+  bar.innerHTML = `
+    <input type="search" id="chat-search-input" placeholder="ابحث في الرسائل..." autocomplete="off" />
+    <span id="chat-search-count" class="chat-search-count"></span>
+    <button type="button" id="chat-search-close" aria-label="إغلاق">✕</button>
+  `;
+
+  const header = document.querySelector(".chat-header");
+  header?.insertAdjacentElement("afterend", bar);
+
+  bar
+    .querySelector("#chat-search-input")
+    ?.addEventListener("input", guard("chat:search", (e) => runChatSearch(e.target.value)));
+
+  bar.querySelector("#chat-search-close")?.addEventListener("click", () => {
+    bar.classList.add("hidden");
+    clearChatSearchHighlights();
+  });
+
+  return bar;
+}
+
+function clearChatSearchHighlights() {
+  safeDom("search:clear", () => {
+    document
+      .querySelectorAll(".bubble-row.search-hit, .bubble-row.search-dim")
+      .forEach((el) => el.classList.remove("search-hit", "search-dim"));
+
+    const count = document.querySelector("#chat-search-count");
+    if (count) count.textContent = "";
+  });
+}
+
+function runChatSearch(rawQuery) {
+  const query = (rawQuery || "").trim().toLowerCase();
+
+  if (!query) {
+    clearChatSearchHighlights();
+    return;
+  }
+
+  safeDom("search:run", () => {
+    const rows = document.querySelectorAll(".bubble-row");
+    let hits = 0;
+    let firstHit = null;
+
+    rows.forEach((row) => {
+      const text = (row.textContent || "").toLowerCase();
+      const match = text.includes(query);
+
+      row.classList.toggle("search-hit", match);
+      row.classList.toggle("search-dim", !match);
+
+      if (match) {
+        hits += 1;
+        if (!firstHit) firstHit = row;
+      }
+    });
+
+    const count = document.querySelector("#chat-search-count");
+    if (count) count.textContent = hits ? `${hits} نتيجة` : "لا نتائج";
+
+    firstHit?.scrollIntoView({ block: "center", behavior: "smooth" });
+  });
+}
+
+/** يُفعّل/يُعطّل أزرار المكالمة حسب وجود محادثة نشطة واتصال بالإنترنت */
+function updateCallButtonsState() {
+  safeDom("call-buttons-state", () => {
+    const enabled = Boolean(state.activeConversation?.otherProfile?.id) && state.isOnline;
+
+    ["#chat-call-audio", "#chat-call-video"].forEach((sel) => {
+      const btn = $(sel);
+      if (btn) btn.disabled = !enabled;
+    });
+  });
 }
 
 function applyThemeVars() {
@@ -526,28 +822,63 @@ function applyThemeVars() {
   }
 }
 
-async function loadContacts() {
-  if (!state.isOnline) {
-    const cached = await getCachedContacts();
+// يمنع تشغيل loadContacts عشرات المرات عند تدفّق أحداث الـ presence
+let loadContactsPending = null;
+let loadContactsTimer = null;
 
-    renderContactsFromCache(cached);
+async function loadContacts() {
+  // إزالة الارتداد (debounce): تجميع النداءات المتقاربة في نداء واحد
+  if (loadContactsTimer) clearTimeout(loadContactsTimer);
+
+  if (loadContactsPending) return loadContactsPending;
+
+  loadContactsPending = new Promise((resolve) => {
+    loadContactsTimer = setTimeout(async () => {
+      loadContactsTimer = null;
+      try {
+        await loadContactsInternal();
+      } finally {
+        loadContactsPending = null;
+        resolve();
+      }
+    }, 150);
+  });
+
+  return loadContactsPending;
+}
+
+async function loadContactsInternal() {
+  if (!state.me) return;
+
+  if (!state.isOnline) {
+    const cached = await safeAsync("contacts:cache", () => getCachedContacts(), {
+      fallback: [],
+    });
+
+    renderContactsFromCache(cached.data || []);
 
     return;
   }
 
-  try {
-    await loadContactsFromNetwork();
-  } catch (err) {
-    const cached = await getCachedContacts();
+  const result = await safeAsync("contacts:network", () => loadContactsFromNetwork());
 
-    renderContactsFromCache(cached);
+  if (!result.ok) {
+    const cached = await safeAsync("contacts:cache-fallback", () => getCachedContacts(), {
+      fallback: [],
+    });
+
+    renderContactsFromCache(cached.data || []);
   }
 }
 
 function renderContactsFromCache(cached) {
   state.contactRowsByConversation = {};
 
-  $("#contact-list").innerHTML = "";
+  const list = $("#contact-list");
+
+  if (!list) return;
+
+  list.innerHTML = "";
 
   $("#admins-heading")?.classList.add("hidden");
   $("#admins-section")?.classList.add("hidden");
@@ -555,13 +886,21 @@ function renderContactsFromCache(cached) {
   $("#users-heading")?.classList.add("hidden");
   $("#users-section")?.classList.add("hidden");
 
-  cached.forEach((c) => {
-    $("#contact-list").appendChild(
-      buildContactRow(c, {
-        withUnread: !!c._unread,
-      })
-    );
+  const fragment = document.createDocumentFragment();
+
+  (cached || []).forEach((c) => {
+    try {
+      fragment.appendChild(
+        buildContactRow(c, {
+          withUnread: !!c._unread,
+        })
+      );
+    } catch (err) {
+      console.error("buildContactRow failed:", c?.id, err);
+    }
   });
+
+  list.appendChild(fragment);
 }
 
 async function loadContactsFromNetwork() {
@@ -596,7 +935,7 @@ async function loadContactsFromNetwork() {
       );
     });
 
-    await cacheContacts(state.contacts);
+    await safeAsync("cacheContacts", () => cacheContacts(state.contacts));
   } else {
     $("#contact-list").innerHTML = "";
 
@@ -684,10 +1023,12 @@ async function loadContactsFromNetwork() {
       );
     });
 
-    await cacheContacts([
-      ...(otherAdmins || []),
-      ...userContacts,
-    ]);
+    await safeAsync("cacheContacts:admin", () =>
+      cacheContacts([
+        ...(otherAdmins || []),
+        ...userContacts,
+      ])
+    );
   }
 }
 
@@ -938,6 +1279,12 @@ async function openConversation(otherProfile) {
     clearUnreadBadge(
       conversationId
     );
+
+    // فعّل أزرار المكالمة الآن بعد توفّر محادثة نشطة
+    safeDom("open:call-buttons", () => {
+      wireCallButtons();
+      updateCallButtonsState();
+    });
   } catch (err) {
     console.error(
       "openConversation failed:",
@@ -956,15 +1303,17 @@ async function openConversation(otherProfile) {
 }
 
 async function loadMessages(conversationId) {
-  const cached =
-    await getCachedMessages(
-      conversationId
-    );
+  // 1) اعرض النسخة المخزّنة محلياً فوراً (تجربة سريعة + fallback عند الفشل)
+  const cachedResult = await safeAsync(
+    "loadMessages:cache",
+    () => getCachedMessages(conversationId),
+    { fallback: [] }
+  );
+
+  const cached = cachedResult.data || [];
 
   if (cached.length) {
-    state.messages =
-      cached;
-
+    state.messages = cached;
     renderMessages();
   }
 
@@ -972,32 +1321,37 @@ async function loadMessages(conversationId) {
     return;
   }
 
-  const {
-    data,
-    error,
-  } = await supabase
-    .from("messages")
-    .select("*")
-    .eq(
-      "conversation_id",
-      conversationId
-    )
-    .order("created_at", {
-      ascending: true,
-    });
+  // 2) ثم حدّث من الشبكة — أي فشل يُبقي النسخة المخزّنة معروضة
+  const { ok, data } = await safeQuery(
+    "loadMessages:network",
+    () =>
+      supabase
+        .from("messages")
+        .select("*")
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true })
+        .limit(500),
+    null
+  );
 
-  if (error) {
+  if (!ok || !Array.isArray(data)) {
+    if (!cached.length) {
+      showAuthError("تعذّر تحميل الرسائل — تحقق من الاتصال.");
+    }
     return;
   }
 
-  state.messages =
-    data || [];
+  // تجاهل الرد إن غُيّرت المحادثة أثناء انتظار الشبكة (سباق حالة)
+  if (state.activeConversation?.id !== conversationId) {
+    return;
+  }
+
+  state.messages = data;
 
   renderMessages();
 
-  await cacheMessages(
-    conversationId,
-    state.messages
+  await safeAsync("loadMessages:persist", () =>
+    cacheMessages(conversationId, state.messages)
   );
 }
 
@@ -1048,20 +1402,34 @@ function renderMessages() {
 
   if (!box) return;
 
+  // لا نرسم بدون ملف شخصي محمّل (يمنع قراءة state.me.id على null)
+  if (!state.me) return;
+
   box.innerHTML = "";
 
-  if (!state.messages.length) {
-    box.innerHTML =
-      `<div class="empty-chat">${state.t.no_messages}</div>`;
+  if (!Array.isArray(state.messages) || !state.messages.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-chat";
+    empty.textContent =
+      state.t?.no_messages || "لا توجد رسائل بعد. ابدأ المحادثة الآن.";
+    box.appendChild(empty);
 
     return;
   }
 
+  // الرسم عبر DocumentFragment: إعادة تدفّق (reflow) واحدة بدل واحدة لكل رسالة
+  const fragment = document.createDocumentFragment();
+
   state.messages.forEach((m) => {
-    box.appendChild(
-      buildMessageBubble(m)
-    );
+    try {
+      fragment.appendChild(buildMessageBubble(m));
+    } catch (err) {
+      // فقاعة تالفة يجب ألّا تُسقط المحادثة كلها
+      console.error("buildMessageBubble failed for message:", m?.id, err);
+    }
   });
+
+  box.appendChild(fragment);
 
   box.scrollTop =
     box.scrollHeight;
@@ -1831,10 +2199,37 @@ async function uploadMediaToSupabase(
     options.folder ||
     state.me.id;
 
+  // ---- ضغط/تحسين الوسائط قبل الرفع (يوفّر الحزمة والذاكرة والتخزين) ----
+  let uploadFile = file;
+  let forcedExtension = options.extension;
+
+  if (options.compress !== false) {
+    const prepared = await prepareFileForUpload(file, options.compressOptions || {});
+
+    uploadFile = prepared.file;
+
+    if (prepared.extension) {
+      forcedExtension = prepared.extension;
+    }
+
+    if (prepared.changed) {
+      const saved = prepared.originalSize - prepared.size;
+      const pct = prepared.originalSize
+        ? Math.round((saved / prepared.originalSize) * 100)
+        : 0;
+
+      console.info(
+        `[media] ضُغطت الصورة: ${formatBytes(prepared.originalSize)} → ${formatBytes(
+          prepared.size
+        )} (توفير ${pct}%)`
+      );
+    }
+  }
+
   const extension =
     getSafeFileExtension(
-      file,
-      options.extension
+      uploadFile,
+      forcedExtension
     );
 
   const uuid =
@@ -1844,7 +2239,7 @@ async function uploadMediaToSupabase(
     `${folder}/${uuid}.${extension}`;
 
   const contentType =
-    file.type ||
+    uploadFile.type ||
     options.contentType ||
     "application/octet-stream";
 
@@ -1855,10 +2250,11 @@ async function uploadMediaToSupabase(
     .from(bucket)
     .upload(
       storagePath,
-      file,
+      uploadFile,
       {
+        // الوسائط ثابتة المحتوى (اسم عشوائي فريد) → تخزين مؤقت طويل
         cacheControl:
-          "3600",
+          "31536000",
         contentType,
         upsert: false,
       }
@@ -1892,6 +2288,7 @@ async function uploadMediaToSupabase(
     publicUrl,
     contentType,
     extension,
+    size: uploadFile.size,
   };
 }
 
@@ -2056,20 +2453,27 @@ async function sendMessage({
 
     renderMessages();
 
-    await queueOutboxMessage({
-      conversation_id:
-        conv.id,
-      sender_id:
-        state.me.id,
-      content:
-        content || null,
-      attachment_url:
-        null,
-      attachment_type:
-        null,
-      reply_to_id:
-        replyToId,
-    });
+    const queued = await safeAsync("outbox:queue", () =>
+      queueOutboxMessage({
+        conversation_id: conv.id,
+        sender_id: state.me.id,
+        content: content || null,
+        attachment_url: null,
+        attachment_type: null,
+        reply_to_id: replyToId,
+      })
+    );
+
+    if (!queued.ok) {
+      // التخزين المحلي غير متاح → أبلغ المستخدم بدل الإيهام بالإرسال
+      optimistic.status = "failed";
+      optimistic._failed = true;
+      renderMessages();
+
+      showAuthError(
+        "تعذّر حفظ الرسالة للإرسال لاحقاً — أعد المحاولة بعد عودة الاتصال."
+      );
+    }
 
     clearReply();
 
@@ -2124,6 +2528,11 @@ async function sendMessage({
               attachmentExtension,
             contentType:
               attachmentFile.type,
+            // لا تضغط الرسائل الصوتية (مضغوطة أصلاً) — الصور فقط
+            compress:
+              attachmentType !== "audio",
+            compressOptions:
+              MEDIA_PRESETS.attachment,
           }
         );
 
@@ -2314,6 +2723,8 @@ async function handleAvatarUpload(e) {
             "avatars",
           folder:
             state.me.id,
+          compressOptions:
+            MEDIA_PRESETS.avatar,
         }
       );
 
@@ -2377,6 +2788,8 @@ async function handleWallpaperUpload(e) {
             "wallpapers",
           folder:
             state.me.id,
+          compressOptions:
+            MEDIA_PRESETS.wallpaper,
         }
       );
 
@@ -2663,8 +3076,11 @@ function resetRecordingUI() {
 }
 
 async function flushOutbox() {
-  const pending =
-    await getOutbox();
+  if (!state.me || !state.isOnline) return;
+
+  const result = await safeAsync("outbox:read", () => getOutbox(), { fallback: [] });
+
+  const pending = result.data || [];
 
   if (!pending.length) {
     return;
@@ -2687,9 +3103,7 @@ async function flushOutbox() {
       });
 
     if (!error) {
-      await removeFromOutbox(
-        local_id
-      );
+      await safeAsync("outbox:remove", () => removeFromOutbox(local_id));
 
       await supabase
         .from("conversations")
@@ -2998,9 +3412,10 @@ async function setTyping(
   const conv =
     state.activeConversation;
 
-  if (!conv) return;
+  if (!conv || !state.me || !state.isOnline) return;
 
-  await supabase
+  await safeQuery("setTyping", () =>
+    supabase
     .from("typing_status")
     .upsert(
       {
@@ -3017,7 +3432,8 @@ async function setTyping(
         onConflict:
           "conversation_id,user_id",
       }
-    );
+    )
+  );
 }
 
 function subscribeGlobalPresence() {
@@ -3288,9 +3704,22 @@ function playNotificationSound() {
   const audio =
     $("#notification-sound");
 
-  audio
-    ?.play()
-    .catch(() => {});
+  if (!audio) return;
+
+  try {
+    // لا تقطع نغمة رنين مكالمة جارية
+    if (audio.loop) return;
+
+    audio.currentTime = 0;
+
+    const promise = audio.play();
+
+    if (promise && typeof promise.catch === "function") {
+      promise.catch(() => {});
+    }
+  } catch (err) {
+    console.warn("playNotificationSound failed:", err);
+  }
 }
 
 function wireEmojiPicker() {
@@ -3815,7 +4244,32 @@ if (
   );
 }
 
-document.addEventListener(
-  "DOMContentLoaded",
-  boot
-);
+// إقلاع آمن: وحدات ES تُنفَّذ مؤجَّلة، وقد يكون DOMContentLoaded قد أُطلق
+// بالفعل (خصوصاً مع الـ Service Worker والتخزين المؤقت) فلا يُستدعى boot أبداً.
+// لذلك نتحقق من جاهزية المستند بدل الاعتماد على الحدث وحده.
+let bootStarted = false;
+
+function startApp() {
+  if (bootStarted) return;
+  bootStarted = true;
+
+  boot().catch((err) => {
+    console.error("Fatal boot error:", err);
+
+    // آخر خط دفاع: لا تترك المستخدم أمام شاشة تحميل لا تنتهي
+    document.querySelector("#boot-loading")?.classList.add("hidden");
+    document.querySelector("#auth-screen")?.classList.remove("hidden");
+
+    const el = document.querySelector("#auth-error");
+    if (el) {
+      el.textContent = "تعذّر تشغيل التطبيق — يرجى تحديث الصفحة.";
+      el.classList.remove("hidden");
+    }
+  });
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", startApp, { once: true });
+} else {
+  startApp();
+}
