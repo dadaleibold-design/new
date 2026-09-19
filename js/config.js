@@ -18,7 +18,7 @@ export const VAPID_PUBLIC_KEY = "BGKcsJH4YH7vV384UCmx_FKD0xGiWTNuMA7skLLUWzIodKX
 
 const AGORA_DEFAULTS = {
   // ضع App ID مشروعك من لوحة تحكم Agora (Console > Project Management)
-  appId: "",
+  appId: "c72cf98bdff64feebd17688f95764943",
 
   // نقطة نهاية آمنة تُرجع { token, uid, expiresAt } — اتركها فارغة في وضع Testing
   tokenEndpoint: "",
