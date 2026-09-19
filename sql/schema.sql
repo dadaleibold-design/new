@@ -128,10 +128,13 @@ create table if not exists public.push_subscriptions (
 
 alter table public.push_subscriptions enable row level security;
 
+drop policy if exists "push subs select own" on public.push_subscriptions;
 create policy "push subs select own" on public.push_subscriptions
   for select using (auth.uid() = user_id);
+drop policy if exists "push subs insert own" on public.push_subscriptions;
 create policy "push subs insert own" on public.push_subscriptions
   for insert with check (auth.uid() = user_id);
+drop policy if exists "push subs delete own" on public.push_subscriptions;
 create policy "push subs delete own" on public.push_subscriptions
   for delete using (auth.uid() = user_id);
 
@@ -145,26 +148,33 @@ alter table public.message_reactions enable row level security;
 alter table public.typing_status enable row level security;
 
 -- Profiles: everyone authenticated can read (needed for contact lists / names)
+drop policy if exists "profiles readable by authenticated" on public.profiles;
 create policy "profiles readable by authenticated" on public.profiles
   for select using (auth.role() = 'authenticated');
+drop policy if exists "profiles updatable by owner" on public.profiles;
 create policy "profiles updatable by owner" on public.profiles
   for update using (auth.uid() = id);
 
 -- Conversations: only the two participants can see/manage
+drop policy if exists "conversations select own" on public.conversations;
 create policy "conversations select own" on public.conversations
   for select using (auth.uid() = user_id or auth.uid() = admin_id);
+drop policy if exists "conversations insert own" on public.conversations;
 create policy "conversations insert own" on public.conversations
   for insert with check (auth.uid() = user_id or auth.uid() = admin_id);
+drop policy if exists "conversations update own" on public.conversations;
 create policy "conversations update own" on public.conversations
   for update using (auth.uid() = user_id or auth.uid() = admin_id);
 
 -- Messages: only participants of the parent conversation
+drop policy if exists "messages select in own conversation" on public.messages;
 create policy "messages select in own conversation" on public.messages
   for select using (
     exists (select 1 from public.conversations c
             where c.id = conversation_id
             and (c.user_id = auth.uid() or c.admin_id = auth.uid()))
   );
+drop policy if exists "messages insert in own conversation" on public.messages;
 create policy "messages insert in own conversation" on public.messages
   for insert with check (
     sender_id = auth.uid() and
@@ -172,6 +182,7 @@ create policy "messages insert in own conversation" on public.messages
             where c.id = conversation_id
             and (c.user_id = auth.uid() or c.admin_id = auth.uid()))
   );
+drop policy if exists "messages update in own conversation" on public.messages;
 create policy "messages update in own conversation" on public.messages
   for update using (
     exists (select 1 from public.conversations c
@@ -180,34 +191,50 @@ create policy "messages update in own conversation" on public.messages
   );
 
 -- Reactions
+drop policy if exists "reactions select in own conversation" on public.message_reactions;
 create policy "reactions select in own conversation" on public.message_reactions
   for select using (
     exists (select 1 from public.messages m join public.conversations c on c.id = m.conversation_id
             where m.id = message_id and (c.user_id = auth.uid() or c.admin_id = auth.uid()))
   );
+drop policy if exists "reactions insert own" on public.message_reactions;
 create policy "reactions insert own" on public.message_reactions
   for insert with check (user_id = auth.uid());
+drop policy if exists "reactions delete own" on public.message_reactions;
 create policy "reactions delete own" on public.message_reactions
   for delete using (user_id = auth.uid());
 
 -- Typing status
+drop policy if exists "typing select in own conversation" on public.typing_status;
 create policy "typing select in own conversation" on public.typing_status
   for select using (
     exists (select 1 from public.conversations c
             where c.id = conversation_id and (c.user_id = auth.uid() or c.admin_id = auth.uid()))
   );
+drop policy if exists "typing upsert own" on public.typing_status;
 create policy "typing upsert own" on public.typing_status
   for insert with check (user_id = auth.uid());
+drop policy if exists "typing update own" on public.typing_status;
 create policy "typing update own" on public.typing_status
   for update using (user_id = auth.uid());
 
 -- ------------------------------------------------------------
 -- REALTIME: enable replication on the tables the client listens to
 -- ------------------------------------------------------------
-alter publication supabase_realtime add table public.messages;
-alter publication supabase_realtime add table public.typing_status;
-alter publication supabase_realtime add table public.profiles;
-alter publication supabase_realtime add table public.message_reactions;
+do $$
+declare
+  v_table text;
+begin
+  foreach v_table in array array[
+    'messages', 'typing_status', 'profiles', 'message_reactions'
+  ] loop
+    begin
+      execute format('alter publication supabase_realtime add table public.%I', v_table);
+    exception when duplicate_object then null;
+    end;
+  end loop;
+end
+$$;
 
 -- ------------------------------------------------------------
 -- STORAGE BUCKETS (run once; Supabase Dashboard > Storage also works)
@@ -224,18 +251,24 @@ insert into storage.buckets (id, name, public)
 values ('wallpapers', 'wallpapers', true)
 on conflict (id) do nothing;
 
+drop policy if exists "avatar upload own" on storage.objects;
 create policy "avatar upload own" on storage.objects
   for insert with check (bucket_id = 'avatars' and auth.role() = 'authenticated');
+drop policy if exists "avatar public read" on storage.objects;
 create policy "avatar public read" on storage.objects
   for select using (bucket_id = 'avatars');
 
+drop policy if exists "attachments upload own" on storage.objects;
 create policy "attachments upload own" on storage.objects
   for insert with check (bucket_id = 'attachments' and auth.role() = 'authenticated');
+drop policy if exists "attachments public read" on storage.objects;
 create policy "attachments public read" on storage.objects
   for select using (bucket_id = 'attachments');
 
+drop policy if exists "wallpapers upload own" on storage.objects;
 create policy "wallpapers upload own" on storage.objects
   for insert with check (bucket_id = 'wallpapers' and auth.role() = 'authenticated');
+drop policy if exists "wallpapers public read" on storage.objects;
 create policy "wallpapers public read" on storage.objects
   for select using (bucket_id = 'wallpapers');
 
@@ -373,16 +406,27 @@ create table if not exists public.fcm_tokens (
 
 alter table public.fcm_tokens enable row level security;
 
+drop policy if exists "fcm tokens select own" on public.fcm_tokens;
 create policy "fcm tokens select own" on public.fcm_tokens
   for select using (auth.uid() = user_id);
+drop policy if exists "fcm tokens upsert own" on public.fcm_tokens;
 create policy "fcm tokens upsert own" on public.fcm_tokens
   for insert with check (auth.uid() = user_id);
+drop policy if exists "fcm tokens update own" on public.fcm_tokens;
 create policy "fcm tokens update own" on public.fcm_tokens
   for update using (auth.uid() = user_id);
+drop policy if exists "fcm tokens delete own" on public.fcm_tokens;
 create policy "fcm tokens delete own" on public.fcm_tokens
   for delete using (auth.uid() = user_id);
 
-alter publication supabase_realtime add table public.fcm_tokens;
+do $$
+begin
+  begin
+    alter publication supabase_realtime add table public.fcm_tokens;
+  exception when duplicate_object then null;
+  end;
+end
+$$;
 
 -- ------------------------------------------------------------
 -- 9. صلاحيات المشرف العام (Super Admin) — تحكم كامل بلا قيود
@@ -427,6 +471,7 @@ where email = 'almgawell17@gmail.com';
 -- 9.4 سياسات RLS إضافية (Permissive — تُضاف بجانب السياسات الحالية ولا تستبدلها):
 --     تمنح المشرف العام قراءة/كتابة كاملة على كل المحادثات والرسائل، بصرف
 --     النظر عن كونه طرفاً فيها أصلاً أم لا.
+drop policy if exists "conversations full access superadmin" on public.conversations;
 create policy "conversations full access superadmin" on public.conversations
   for all using (
     exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin)
@@ -435,6 +480,7 @@ create policy "conversations full access superadmin" on public.conversations
     exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin)
   );
 
+drop policy if exists "messages full access superadmin" on public.messages;
 create policy "messages full access superadmin" on public.messages
   for all using (
     exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin)
@@ -446,3 +492,363 @@ create policy "messages full access superadmin" on public.messages
 -- ملاحظة: جدول profiles مقروء بالفعل لكل مستخدم مسجَّل دخول (السياسة
 -- "profiles readable by authenticated" أعلاه)، لذلك لا حاجة لسياسة إضافية
 -- هنا كي يرى المشرف العام أسماء/بيانات كل المستخدمين والمشرفين.
+
+-- ============================================================
+-- 10. المكالمات الصوتية والمرئية عبر منصة Agora
+--     - call_rooms : غرفة/جلسة مكالمة واحدة (تُنشأ عند الطلب)
+--     - call_logs  : سجل تفصيلي لكل حدث داخل المكالمة (تدقيق وإحصاء)
+--     - profiles.call_status : حالة اتصال المستخدم الحالية
+-- ملاحظة: هذا القسم idempotent (يمكن إعادة تنفيذه بأمان).
+-- ============================================================
+
+-- 10.1 حالة الاتصال على مستوى المستخدم
+alter table public.profiles
+  add column if not exists call_status text not null default 'available';
+
+alter table public.profiles
+  add column if not exists call_status_at timestamptz default now();
+
+-- قيّد القيم المسموحة (احذف القيد القديم أولاً لضمان إعادة التنفيذ)
+alter table public.profiles drop constraint if exists profiles_call_status_check;
+alter table public.profiles
+  add constraint profiles_call_status_check
+  check (call_status in ('available', 'ringing', 'in_call', 'unavailable'));
+
+create index if not exists idx_profiles_call_status
+  on public.profiles(call_status)
+  where call_status <> 'available';
+
+-- 10.2 غرف المكالمات
+create table if not exists public.call_rooms (
+  id uuid primary key default uuid_generate_v4(),
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  channel_name text not null,
+  call_type text not null default 'audio',
+  caller_id uuid not null references public.profiles(id) on delete cascade,
+  callee_id uuid not null references public.profiles(id) on delete cascade,
+  status text not null default 'ringing',
+  started_at timestamptz not null default now(),
+  answered_at timestamptz,
+  ended_at timestamptz,
+  -- المدة بالثواني تُحسب تلقائياً (عمود مولَّد) لتقارير سريعة بلا حسابات في العميل
+  duration_seconds integer generated always as (
+    case
+      when answered_at is not null and ended_at is not null
+        then greatest(0, extract(epoch from (ended_at - answered_at))::integer)
+      else 0
+    end
+  ) stored,
+  created_at timestamptz not null default now()
+);
+
+alter table public.call_rooms drop constraint if exists call_rooms_call_type_check;
+alter table public.call_rooms
+  add constraint call_rooms_call_type_check check (call_type in ('audio', 'video'));
+
+alter table public.call_rooms drop constraint if exists call_rooms_status_check;
+alter table public.call_rooms
+  add constraint call_rooms_status_check check (
+    status in ('ringing', 'active', 'ended', 'declined', 'missed', 'failed', 'network_lost')
+  );
+
+alter table public.call_rooms drop constraint if exists call_rooms_distinct_parties;
+alter table public.call_rooms
+  add constraint call_rooms_distinct_parties check (caller_id <> callee_id);
+
+create index if not exists idx_call_rooms_conversation
+  on public.call_rooms(conversation_id, started_at desc);
+create index if not exists idx_call_rooms_caller  on public.call_rooms(caller_id, started_at desc);
+create index if not exists idx_call_rooms_callee  on public.call_rooms(callee_id, started_at desc);
+create index if not exists idx_call_rooms_channel on public.call_rooms(channel_name);
+
+-- منع أكثر من مكالمة نشطة واحدة على نفس المحادثة في آن واحد
+create unique index if not exists uq_call_rooms_active_conversation
+  on public.call_rooms(conversation_id)
+  where status in ('ringing', 'active');
+
+-- 10.3 سجل أحداث المكالمات
+create table if not exists public.call_logs (
+  id uuid primary key default uuid_generate_v4(),
+  room_id uuid not null references public.call_rooms(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  event text not null,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+alter table public.call_logs drop constraint if exists call_logs_event_check;
+alter table public.call_logs
+  add constraint call_logs_event_check check (
+    event in (
+      'initiated', 'ringing', 'answered', 'declined', 'missed',
+      'ended', 'failed', 'network_lost', 'muted', 'unmuted',
+      'camera_on', 'camera_off', 'reconnecting'
+    )
+  );
+
+create index if not exists idx_call_logs_room on public.call_logs(room_id, created_at);
+create index if not exists idx_call_logs_user on public.call_logs(user_id, created_at desc);
+
+-- 10.4 دالة مساعدة: هل المستخدم الحالي طرف في هذه الغرفة؟
+--      SECURITY DEFINER + search_path مثبّت لمنع أي التفاف على الصلاحيات.
+create or replace function public.is_call_participant(p_room_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.call_rooms r
+    where r.id = p_room_id
+      and (r.caller_id = auth.uid() or r.callee_id = auth.uid())
+  );
+$$;
+
+create or replace function public.is_conversation_participant(p_conversation_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.conversations c
+    where c.id = p_conversation_id
+      and (c.user_id = auth.uid() or c.admin_id = auth.uid())
+  );
+$$;
+
+-- 10.5 عند انتهاء المكالمة: أعد ضبط حالة اتصال الطرفين تلقائياً
+create or replace function public.reset_call_presence()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.status in ('ended', 'declined', 'missed', 'failed', 'network_lost')
+     and (old.status is distinct from new.status) then
+    update public.profiles
+    set call_status = 'available', call_status_at = now()
+    where id in (new.caller_id, new.callee_id);
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_call_room_finished on public.call_rooms;
+create trigger on_call_room_finished
+  after update on public.call_rooms
+  for each row execute procedure public.reset_call_presence();
+
+-- ------------------------------------------------------------
+-- 10.6 سياسات أمان الصفوف (RLS) للمكالمات
+-- ------------------------------------------------------------
+alter table public.call_rooms enable row level security;
+alter table public.call_logs  enable row level security;
+
+-- --- call_rooms ---
+drop policy if exists "call rooms select participants" on public.call_rooms;
+create policy "call rooms select participants" on public.call_rooms
+  for select using (
+    caller_id = auth.uid() or callee_id = auth.uid()
+  );
+
+-- الإدراج: المتصل هو المستخدم الحالي فقط، ويجب أن يكون طرفاً في المحادثة،
+-- وأن يكون المستقبل هو الطرف الآخر فعلاً (يمنع انتحال مكالمات لأطراف غريبة).
+drop policy if exists "call rooms insert own" on public.call_rooms;
+create policy "call rooms insert own" on public.call_rooms
+  for insert with check (
+    caller_id = auth.uid()
+    and caller_id <> callee_id
+    and public.is_conversation_participant(conversation_id)
+    and exists (
+      select 1 from public.conversations c
+      where c.id = conversation_id
+        and (c.user_id = callee_id or c.admin_id = callee_id)
+    )
+  );
+
+-- التحديث: الطرفان فقط، ولا يمكن تغيير هوية الأطراف أو المحادثة بعد الإنشاء.
+drop policy if exists "call rooms update participants" on public.call_rooms;
+create policy "call rooms update participants" on public.call_rooms
+  for update using (
+    caller_id = auth.uid() or callee_id = auth.uid()
+  )
+  with check (
+    caller_id = auth.uid() or callee_id = auth.uid()
+  );
+
+-- لا سياسة DELETE: سجل المكالمات لا يُحذف من العميل (يُحذف تتابعياً مع المحادثة فقط).
+
+-- المشرف العام: اطّلاع كامل على كل غرف المكالمات للتدقيق
+drop policy if exists "call rooms superadmin" on public.call_rooms;
+create policy "call rooms superadmin" on public.call_rooms
+  for all using (
+    exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin)
+  )
+  with check (
+    exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin)
+  );
+
+-- --- call_logs ---
+drop policy if exists "call logs select participants" on public.call_logs;
+create policy "call logs select participants" on public.call_logs
+  for select using (public.is_call_participant(room_id));
+
+-- كل مستخدم يكتب أحداثه هو فقط، وداخل غرفة هو طرف فيها.
+drop policy if exists "call logs insert own" on public.call_logs;
+create policy "call logs insert own" on public.call_logs
+  for insert with check (
+    user_id = auth.uid() and public.is_call_participant(room_id)
+  );
+
+-- السجلات غير قابلة للتعديل أو الحذف (append-only) لضمان نزاهة التدقيق.
+
+drop policy if exists "call logs superadmin" on public.call_logs;
+create policy "call logs superadmin" on public.call_logs
+  for select using (
+    exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin)
+  );
+
+-- ------------------------------------------------------------
+-- 10.7 تشديد سياسة تحديث profiles
+--      المستخدم يعدّل صفّه فقط (مع منع رفع صلاحياته بنفسه)
+-- ------------------------------------------------------------
+drop policy if exists "profiles updatable by owner" on public.profiles;
+create policy "profiles updatable by owner" on public.profiles
+  for update using (auth.uid() = id)
+  with check (auth.uid() = id);
+
+-- منع أي مستخدم من منح نفسه is_admin / is_super_admin عبر تحديث مباشر
+create or replace function public.protect_profile_privileges()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  -- الأدوار الخدمية (service_role) والمشرف العام مستثناة
+  if auth.role() = 'service_role' then
+    return new;
+  end if;
+
+  if exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin) then
+    return new;
+  end if;
+
+  new.is_admin       := old.is_admin;
+  new.is_super_admin := old.is_super_admin;
+  new.email          := old.email;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists on_profile_privilege_guard on public.profiles;
+create trigger on_profile_privilege_guard
+  before update on public.profiles
+  for each row execute procedure public.protect_profile_privileges();
+
+-- ------------------------------------------------------------
+-- 10.8 تشديد سياسات التخزين (Storage) — الرفع داخل مجلد المستخدم فقط
+--      المسار المستخدم في العميل: <user_id>/<uuid>.<ext>
+-- ------------------------------------------------------------
+drop policy if exists "avatar upload own"      on storage.objects;
+drop policy if exists "attachments upload own" on storage.objects;
+drop policy if exists "wallpapers upload own"  on storage.objects;
+
+drop policy if exists "avatar upload own" on storage.objects;
+create policy "avatar upload own" on storage.objects
+  for insert with check (
+    bucket_id = 'avatars'
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "attachments upload own" on storage.objects;
+create policy "attachments upload own" on storage.objects
+  for insert with check (
+    bucket_id = 'attachments'
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "wallpapers upload own" on storage.objects;
+create policy "wallpapers upload own" on storage.objects
+  for insert with check (
+    bucket_id = 'wallpapers'
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+-- السماح لصاحب الملف بحذف/استبدال ملفاته فقط
+drop policy if exists "media delete own" on storage.objects;
+create policy "media delete own" on storage.objects
+  for delete using (
+    bucket_id in ('avatars', 'attachments', 'wallpapers')
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "media update own" on storage.objects;
+create policy "media update own" on storage.objects
+  for update using (
+    bucket_id in ('avatars', 'attachments', 'wallpapers')
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+-- ------------------------------------------------------------
+-- 10.9 فهارس أداء إضافية على الجداول القائمة
+-- ------------------------------------------------------------
+create index if not exists idx_conversations_user  on public.conversations(user_id, last_message_at desc);
+create index if not exists idx_conversations_admin on public.conversations(admin_id, last_message_at desc);
+create index if not exists idx_messages_unread
+  on public.messages(conversation_id, sender_id)
+  where status <> 'read';
+create index if not exists idx_reactions_message on public.message_reactions(message_id);
+
+-- ------------------------------------------------------------
+-- 10.10 تفعيل Realtime على جداول المكالمات
+--       (داخل DO block حتى لا يفشل السكربت إن كانت مضافة مسبقاً)
+-- ------------------------------------------------------------
+do $$
+begin
+  begin
+    alter publication supabase_realtime add table public.call_rooms;
+  exception when duplicate_object then null;
+  end;
+
+  begin
+    alter publication supabase_realtime add table public.call_logs;
+  exception when duplicate_object then null;
+  end;
+end
+$$;
+
+-- ------------------------------------------------------------
+-- 10.11 تنظيف دوري: أنهِ الغرف العالقة في حالة "ringing" لأكثر من 5 دقائق
+--       (نفّذها يدوياً أو عبر pg_cron إن كان مفعّلاً)
+-- ------------------------------------------------------------
+create or replace function public.expire_stale_calls()
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count integer;
+begin
+  update public.call_rooms
+  set status = 'missed', ended_at = now()
+  where status = 'ringing'
+    and started_at < now() - interval '5 minutes';
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;

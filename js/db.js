@@ -8,11 +8,41 @@ const STORES = {
 };
 
 let dbPromise = null;
+let dbUnavailable = false;
+
+/**
+ * هل IndexedDB متاح فعلاً؟ (يُعطَّل في وضع التصفح الخاص ببعض المتصفحات،
+ * أو داخل iframe بقيود، أو عند امتلاء حصة التخزين)
+ */
+function isIndexedDbAvailable() {
+  try {
+    return typeof indexedDB !== "undefined" && indexedDB !== null;
+  } catch {
+    return false;
+  }
+}
 
 function openDb() {
+  if (dbUnavailable) return Promise.reject(new Error("IndexedDB غير متاح"));
   if (dbPromise) return dbPromise;
+
+  if (!isIndexedDbAvailable()) {
+    dbUnavailable = true;
+    return Promise.reject(new Error("IndexedDB غير متاح في هذا المتصفح"));
+  }
+
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    let req;
+    try {
+      req = indexedDB.open(DB_NAME, DB_VERSION);
+    } catch (err) {
+      dbUnavailable = true;
+      reject(err);
+      return;
+    }
+
+    // إن حُظرت الترقية بتبويب آخر مفتوح، لا تتجمّد للأبد
+    req.onblocked = () => reject(new Error("قاعدة البيانات المحلية محجوزة في تبويب آخر"));
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORES.messages)) {
@@ -30,12 +60,22 @@ function openDb() {
       }
     };
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onerror = () => {
+      dbUnavailable = true;
+      reject(req.error);
+    };
   });
+
+  // لا تُبقِ وعداً مرفوضاً مخزّناً — اسمح بإعادة المحاولة لاحقاً
+  dbPromise.catch(() => {
+    dbPromise = null;
+  });
+
   return dbPromise;
 }
 
 async function tx(storeName, mode, fn) {
+  if (!isIndexedDbAvailable()) return null;
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const t = db.transaction(storeName, mode);
@@ -54,6 +94,7 @@ export async function cacheMessages(conversationId, messages) {
 }
 
 export async function getCachedMessages(conversationId) {
+  if (!isIndexedDbAvailable()) return [];
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const t = db.transaction(STORES.messages, "readonly");
@@ -75,6 +116,7 @@ export async function cacheContacts(contacts) {
 }
 
 export async function getCachedContacts() {
+  if (!isIndexedDbAvailable()) return [];
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const t = db.transaction(STORES.contacts, "readonly");
@@ -89,6 +131,7 @@ export async function queueOutboxMessage(msg) {
 }
 
 export async function getOutbox() {
+  if (!isIndexedDbAvailable()) return [];
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const t = db.transaction(STORES.outbox, "readonly");
@@ -115,4 +158,9 @@ export async function clearAllCache() {
         })
     )
   );
+}
+
+/** هل التخزين المحلي متاح؟ (تستخدمه الواجهة لتعطيل الوضع دون اتصال) */
+export function isOfflineCacheAvailable() {
+  return isIndexedDbAvailable() && !dbUnavailable;
 }
