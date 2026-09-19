@@ -1,0 +1,20 @@
+{
+  "short_name": "فريق الدعم",
+  "name": "خدمة تواصل - فريق الدعم",
+  "icons": [
+    {
+      "src": "icons/icon.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "icons/icon1.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "/index.html",
+  "background_color": "#0d3b66",
+  "display": "standalone",
+  "theme_color": "#0d3b66"
+}

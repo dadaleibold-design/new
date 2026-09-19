@@ -1,0 +1,55 @@
+<!-- =========================================================
+     partials/chat-panel.html
+     واجهة المحادثة مفصولة في ملفها الخاص، ويتم حقنها داخل
+     #chat-panel-container في index.html عبر fetch() من app.js
+     ========================================================= -->
+<section id="chat-panel" class="chat-panel">
+  <!-- شاشة فارغة تظهر عندما لا توجد محادثة مفتوحة (سطح المكتب) -->
+  <div id="chat-empty-state" class="chat-empty-state">
+    <div class="chat-empty-icon">💬</div>
+    <p data-i18n="pick_a_chat">اختر محادثة لبدء المراسلة</p>
+  </div>
+
+  <div id="chat-active" class="chat-active hidden">
+    <header class="chat-header">
+      <button id="back-to-list" class="back-btn" type="button">←</button>
+      <div class="avatar"><img id="chat-header-avatar" src="" alt="" /></div>
+      <div class="chat-header-info">
+        <div id="chat-header-name" class="chat-header-name"></div>
+        <div id="chat-header-status" class="chat-header-status"></div>
+        <div id="typing-indicator" class="typing-indicator hidden" data-i18n="typing">يكتب الآن...</div>
+      </div>
+      <div class="chat-header-actions">
+        <button id="chat-search-toggle" type="button" title="بحث">🔍</button>
+      </div>
+    </header>
+
+    <div id="chat-messages" class="chat-messages"></div>
+
+    <!-- شريط معاينة الرد -->
+    <div id="reply-preview-bar" class="reply-preview-bar hidden">
+      <div class="reply-preview-content">
+        <div class="reply-preview-label" data-i18n="reply">رد</div>
+        <div id="reply-preview-text" class="reply-preview-text"></div>
+      </div>
+      <button id="reply-preview-cancel" type="button">✕</button>
+    </div>
+
+    <!-- شريط تسجيل الصوت -->
+    <div id="recording-bar" class="recording-bar hidden">
+      <span class="recording-dot"></span>
+      <span id="recording-timer">00:00</span>
+      <span class="recording-hint" data-i18n="recording_hint">جاري التسجيل...</span>
+      <button id="recording-cancel" type="button">🗑️</button>
+    </div>
+
+    <form id="composer-form" class="composer">
+      <button type="button" id="emoji-toggle">😊</button>
+      <div id="emoji-panel" class="emoji-panel hidden"></div>
+      <label class="attach-btn">📎<input id="attach-input" type="file" hidden /></label>
+      <input id="composer-input" type="text" autocomplete="off" data-i18n-placeholder="type_message" placeholder="اكتب رسالة" />
+      <button type="button" id="mic-btn" class="mic-btn" title="رسالة صوتية">🎤</button>
+      <button type="submit" id="send-btn" class="send-btn">➤</button>
+    </form>
+  </div>
+</section>

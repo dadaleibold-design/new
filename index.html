@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>محادثات</title>
+
+  <!-- Open Graph / معاينة المشاركة -->
+  <meta property="og:title" content="محادثات فريق الدعم" />
+  <meta property="og:description" content="تطبيق محادثات ودردشة فورية كافه موظفون المؤسسة" />
+  <!-- الرابط الكامل للصورة داخل مجلد icons -->
+  <meta property="og:image" content="https://whatsapp-web-app-gules.vercel.app/icons/icon.png" />
+  <meta property="og:url" content="https://whatsapp-web-app-gules.vercel.app/" />
+  <meta property="og:type" content="website" />
+
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" type="image/x-icon" href="./icons/icon.png">
+  <meta name="theme-color" content="#111b21" />
+  <link rel="stylesheet" href="./css/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+
+<body data-theme="dark">
+
+<!-- شاشة تحميل أولية: تمنع ظهور شاشة الدخول للحظة قبل التحقق من الجلسة المخزنة -->
+<div id="boot-loading" class="boot-loading">
+  <div class="boot-spinner"></div>
+</div>
+
+<!-- ================= AUTH SCREEN ================= -->
+<div id="auth-screen" class="auth-screen hidden">
+  <div class="auth-top-actions">
+    <button id="auth-lang-toggle" type="button" title="Language">🌐</button>
+    <button id="auth-theme-toggle" type="button" title="Theme">🌓</button>
+  </div>
+  <div class="auth-card">
+    <h1 class="auth-logo">💬 <span data-i18n="app_name">محادثات</span></h1>
+
+    <div class="auth-tabs">
+      <button id="tab-login" class="active" data-i18n="login">تسجيل الدخول</button>
+      <button id="tab-signup" data-i18n="signup">إنشاء حساب</button>
+    </div>
+
+    <p id="auth-error" class="auth-error hidden"></p>
+
+    <form id="login-form" class="auth-form">
+      <input id="login-email" type="email" required data-i18n-placeholder="email" placeholder="البريد الإلكتروني" />
+      <input id="login-password" type="password" required data-i18n-placeholder="password" placeholder="كلمة المرور" />
+      <button type="submit" data-i18n="login_btn">دخول</button>
+    </form>
+
+    <form id="signup-form" class="auth-form hidden">
+      <input id="signup-name" type="text" required data-i18n-placeholder="display_name" placeholder="اسم المستخدم" />
+      <input id="signup-email" type="email" required data-i18n-placeholder="email" placeholder="البريد الإلكتروني" />
+      <input id="signup-phone" type="tel" data-i18n-placeholder="phone" placeholder="رقم الهاتف (اختياري)" />
+      <input id="signup-password" type="password" required minlength="6" data-i18n-placeholder="password" placeholder="كلمة المرور" />
+      <button type="submit" data-i18n="signup_btn">إنشاء الحساب</button>
+    </form>
+  </div>
+</div>
+
+<!-- ================= APP SHELL ================= -->
+<div id="app-shell" class="app-shell hidden">
+  <div id="offline-banner" class="offline-banner hidden" data-i18n="offline_notice">
+    لا يوجد اتصال بالإنترنت — سيتم إرسال رسائلك عند عودة الاتصال
+  </div>
+
+
+  <!-- Sidebar: contact / chat list -->
+  <aside id="sidebar" class="sidebar">
+    <header class="sidebar-header">
+      <div class="me">
+        <div class="avatar"><img id="my-avatar" src="" alt="" /></div>
+        <span id="my-name"></span>
+      </div>
+      <div class="sidebar-actions">
+        <button id="lang-toggle" title="Language">🌐</button>
+        <button id="theme-toggle" title="Theme">🌓</button>
+        <button id="btn-settings" title="Settings">⚙️</button>
+      </div>
+    </header>
+
+    <div id="settings-panel" class="settings-panel hidden">
+      <label data-i18n="profile_picture">الصورة الشخصية</label>
+      <input id="avatar-input" type="file" accept="image/*" />
+      <button id="btn-remove-avatar" class="settings-danger" type="button">حذف الصورة الشخصية</button>
+      <label data-i18n="wallpaper">خلفية الدردشة</label>
+      <input id="wallpaper-input" type="file" accept="image/*" />
+      <button id="btn-remove-wallpaper" class="settings-danger" type="button">حذف خلفية الدردشة</button>
+      <button id="btn-enable-push" type="button" data-i18n="enable_push">تفعيل إشعارات الجهاز</button>
+      <button id="btn-logout" class="logout-btn" data-i18n="logout">تسجيل الخروج</button>
+    </div>
+
+    <div class="search-box">
+      <input type="text" data-i18n-placeholder="search" placeholder="بحث" />
+    </div>
+
+    <div id="contact-list-wrap">
+      <!-- المستخدم العادي: قائمة مسطحة -->
+      <div id="contact-list"></div>
+
+      <!-- المشرف: قسمان -->
+      <div id="admins-heading" class="section-heading" data-i18n="admins">المشرفون</div>
+      <div id="admins-section"></div>
+      <div id="users-heading" class="section-heading" data-i18n="chats">المحادثات</div>
+      <div id="users-section"></div>
+    </div>
+  </aside>
+
+  <!-- Chat panel: يُحقن من partials/chat-panel.html عبر app.js -->
+  <div id="chat-panel-container"></div>
+</div>
+
+<audio id="notification-sound" src="./icons/notify.mp3" preload="auto"></audio>
+<div id="global-toast" class="global-toast hidden"></div>
+
+<script type="module" src="./js/app.js"></script>
+
+</body>
+</html>

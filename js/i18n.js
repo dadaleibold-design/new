@@ -1,0 +1,101 @@
+export const STR = {
+  ar: {
+    dir: "rtl",
+    app_name: "محادثات",
+    login: "تسجيل الدخول",
+    signup: "إنشاء حساب",
+    email: "البريد الإلكتروني",
+    password: "كلمة المرور",
+    display_name: "اسم المستخدم",
+    phone: "رقم الهاتف (اختياري)",
+    login_btn: "دخول",
+    signup_btn: "إنشاء الحساب",
+    switch_to_signup: "ليس لديك حساب؟ إنشاء حساب جديد",
+    switch_to_login: "لديك حساب بالفعل؟ تسجيل الدخول",
+    chats: "المحادثات",
+    admins_list: "تواصل مع أحد المشرفين",
+    search: "بحث",
+    online: "متصل الآن",
+    last_seen: "آخر ظهور",
+    typing: "يكتب الآن...",
+    type_message: "اكتب رسالة",
+    settings: "الإعدادات",
+    logout: "تسجيل الخروج",
+    language: "اللغة",
+    theme: "المظهر",
+    dark: "داكن",
+    light: "فاتح",
+    wallpaper: "خلفية الدردشة",
+    profile_picture: "الصورة الشخصية",
+    no_messages: "لا توجد رسائل بعد. ابدأ المحادثة الآن.",
+    error_generic: "حدث خطأ ما، حاول مرة أخرى.",
+    reply: "رد",
+    delivered: "وصلت",
+    read: "قُرئت",
+    sent: "أُرسلت",
+    attach: "إرفاق",
+    admins: "المشرفون",
+    pick_a_chat: "اختر محادثة لبدء المراسلة",
+    recording_hint: "جاري التسجيل...",
+    offline_notice: "لا يوجد اتصال بالإنترنت — سيتم إرسال رسائلك عند عودة الاتصال",
+    enable_push: "تفعيل إشعارات الجهاز",
+    pending: "قيد الإرسال",
+  },
+  en: {
+    dir: "ltr",
+    app_name: "Chats",
+    login: "Log in",
+    signup: "Sign up",
+    email: "Email",
+    password: "Password",
+    display_name: "Username",
+    phone: "Phone (optional)",
+    login_btn: "Log in",
+    signup_btn: "Create account",
+    switch_to_signup: "Don't have an account? Sign up",
+    switch_to_login: "Already have an account? Log in",
+    chats: "Chats",
+    admins_list: "Message a supervisor",
+    search: "Search",
+    online: "Online",
+    last_seen: "Last seen",
+    typing: "typing...",
+    type_message: "Type a message",
+    settings: "Settings",
+    logout: "Log out",
+    language: "Language",
+    theme: "Theme",
+    dark: "Dark",
+    light: "Light",
+    wallpaper: "Chat wallpaper",
+    profile_picture: "Profile picture",
+    no_messages: "No messages yet. Say hello!",
+    error_generic: "Something went wrong, please try again.",
+    reply: "Reply",
+    delivered: "Delivered",
+    read: "Read",
+    sent: "Sent",
+    attach: "Attach",
+    admins: "Supervisors",
+    pick_a_chat: "Pick a chat to start messaging",
+    recording_hint: "Recording...",
+    offline_notice: "No internet connection — your messages will send once you're back online",
+    enable_push: "Enable device notifications",
+    pending: "Pending",
+  },
+};
+
+export function applyLanguage(lang) {
+  const t = STR[lang] || STR.ar;
+  document.documentElement.lang = lang;
+  document.documentElement.dir = t.dir;
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    const key = el.getAttribute("data-i18n");
+    if (t[key]) el.textContent = t[key];
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    const key = el.getAttribute("data-i18n-placeholder");
+    if (t[key]) el.placeholder = t[key];
+  });
+  return t;
+}
