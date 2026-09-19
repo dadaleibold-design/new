@@ -19,41 +19,103 @@ import { safeAsync, safeQuery, safeDom, guard } from "./safety.js";
  * ---------------------------------------------------------- */
 let sdkPromise = null;
 
-function loadAgoraSdk() {
-  if (window.AgoraRTC) return Promise.resolve(window.AgoraRTC);
-  if (sdkPromise) return sdkPromise;
-
-  sdkPromise = new Promise((resolve, reject) => {
+/**
+ * يحمّل ملف SDK واحداً عبر وسم <script>.
+ *
+ * ⚠️ مهم: لا نضبط script.crossOrigin إطلاقاً. وسم <script> العادي يُحمَّل
+ * عبر الأصول دون قيود، لكن ضبط crossOrigin يُفعّل فحص CORS فيرفض المتصفح
+ * الملف ما لم يُرسل الخادم Access-Control-Allow-Origin — وهو ما لا يفعله
+ * download.agora.io، فكان ذلك سبب خطأ "blocked by CORS policy".
+ */
+function loadSdkFrom(url, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = AGORA.sdkUrl;
+    script.src = url;
     script.async = true;
-    script.crossOrigin = "anonymous";
 
-    const timeout = setTimeout(() => {
-      reject(new Error("انتهت مهلة تحميل مكتبة Agora — تحقق من اتصال الإنترنت."));
-    }, 20000);
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      script.onload = null;
+      script.onerror = null;
+    };
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // أزل الوسم الفاشل حتى لا يتراكم في <head>
+      try {
+        script.remove();
+      } catch {
+        /* تجاهل */
+      }
+      reject(err);
+    };
+
+    const timer = setTimeout(
+      () => fail(new Error(`انتهت مهلة تحميل مكتبة Agora من ${url}`)),
+      timeoutMs
+    );
 
     script.onload = () => {
-      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      cleanup();
+
       if (window.AgoraRTC) {
-        try {
-          window.AgoraRTC.setLogLevel?.(3); // أخطاء فقط
-        } catch {
-          /* تجاهل */
-        }
         resolve(window.AgoraRTC);
       } else {
         reject(new Error("تم تحميل ملف Agora لكن الكائن AgoraRTC غير متاح."));
       }
     };
 
-    script.onerror = () => {
-      clearTimeout(timeout);
-      sdkPromise = null;
-      reject(new Error("تعذّر تحميل مكتبة Agora RTC."));
-    };
+    script.onerror = () =>
+      fail(new Error(`تعذّر تحميل مكتبة Agora RTC من ${url}`));
 
     document.head.appendChild(script);
+  });
+}
+
+/**
+ * يحمّل Agora SDK مع التنقّل بين عدة مصادر (CDN mirrors) بالتتابع،
+ * فلا يُسقط مصدرٌ واحد معطّل (503) ميزة المكالمات بالكامل.
+ */
+function loadAgoraSdk() {
+  if (window.AgoraRTC) return Promise.resolve(window.AgoraRTC);
+  if (sdkPromise) return sdkPromise;
+
+  const urls = AGORA.sdkUrls;
+
+  sdkPromise = (async () => {
+    const failures = [];
+
+    for (const url of urls) {
+      try {
+        const sdk = await loadSdkFrom(url);
+
+        try {
+          sdk.setLogLevel?.(3); // أخطاء فقط
+        } catch {
+          /* تجاهل */
+        }
+
+        return sdk;
+      } catch (err) {
+        failures.push(`${url} → ${err.message}`);
+        console.warn("[calls] فشل مصدر SDK، جارٍ تجربة التالي:", url, err.message);
+      }
+    }
+
+    throw new Error(
+      "تعذّر تحميل مكتبة Agora RTC من جميع المصادر. التفاصيل: " + failures.join(" | ")
+    );
+  })();
+
+  // اسمح بإعادة المحاولة في المكالمة التالية بدل تخزين وعد مرفوض للأبد
+  sdkPromise.catch(() => {
+    sdkPromise = null;
   });
 
   return sdkPromise;
@@ -272,38 +334,90 @@ function signalChannelName(userId) {
   return `calls:user:${userId}`;
 }
 
+/**
+ * قنوات الإرسال المُعاد استخدامها، مفتاحها اسم القناة.
+ *
+ * سبب الوجود: إنشاء قناة جديدة لكل إشارة ثم إزالتها بعد 1.5 ثانية كان
+ * يُحدث تسابقاً — إرسال إشارتين متتاليتين لنفس الموضوع (مثل invite ثم end
+ * عند فشل الاتصال) يُنشئ قناة ثانية بنفس الـ topic بينما الأولى قيد
+ * الانضمام/الإزالة، فلا تصل الثانية أبداً إلى SUBSCRIBED وتنتهي بمهلة.
+ */
+const outboundChannels = new Map();
+
+function getOutboundChannel(channelName) {
+  const supabase = callState.ctx?.supabase;
+
+  const existing = outboundChannels.get(channelName);
+  if (existing) return existing;
+
+  const channel = supabase.channel(channelName, {
+    config: { broadcast: { ack: true, self: false } },
+  });
+
+  // وعد انضمام واحد مشترك بين كل المُرسِلين لنفس القناة
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("مهلة الاشتراك بقناة الإشارة")),
+      10000
+    );
+
+    channel.subscribe((status) => {
+      if (status === "SUBSCRIBED") {
+        clearTimeout(timer);
+        resolve(channel);
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        clearTimeout(timer);
+        reject(new Error("تعذّر الاتصال بقناة الإشارة"));
+      }
+    });
+  });
+
+  const entry = { channel, ready };
+  outboundChannels.set(channelName, entry);
+
+  // عند الفشل، أزل القيد ليُعاد بناؤه نظيفاً في المحاولة التالية
+  ready.catch(() => {
+    outboundChannels.delete(channelName);
+    try {
+      supabase.removeChannel(channel);
+    } catch {
+      /* تجاهل */
+    }
+  });
+
+  return entry;
+}
+
+/** يغلق كل قنوات الإرسال المؤقتة (يُستدعى عند انتهاء المكالمة) */
+function closeOutboundChannels() {
+  const supabase = callState.ctx?.supabase;
+
+  outboundChannels.forEach(({ channel }) => {
+    try {
+      supabase?.removeChannel(channel);
+    } catch {
+      /* تجاهل */
+    }
+  });
+
+  outboundChannels.clear();
+}
+
 async function sendSignal(targetUserId, event, payload) {
   const supabase = callState.ctx?.supabase;
   if (!supabase || !targetUserId) return false;
 
   return (
     await safeAsync(`calls:signal:${event}`, async () => {
-      const channel = supabase.channel(signalChannelName(targetUserId), {
-        config: { broadcast: { ack: true } },
-      });
+      const { channel, ready } = getOutboundChannel(signalChannelName(targetUserId));
 
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("مهلة الاشتراك بقناة الإشارة")), 8000);
-        channel.subscribe((status) => {
-          if (status === "SUBSCRIBED") {
-            clearTimeout(timer);
-            resolve();
-          } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-            clearTimeout(timer);
-            reject(new Error("تعذّر الاتصال بقناة الإشارة"));
-          }
-        });
-      });
+      await ready;
 
-      await channel.send({ type: "broadcast", event, payload });
-      // أغلق القناة المؤقتة بعد الإرسال لتوفير الموارد
-      setTimeout(() => {
-        try {
-          supabase.removeChannel(channel);
-        } catch {
-          /* تجاهل */
-        }
-      }, 1500);
+      const result = await channel.send({ type: "broadcast", event, payload });
+
+      if (result === "timed out" || result === "error") {
+        throw new Error(`تعذّر إرسال إشارة ${event} (${result})`);
+      }
 
       return true;
     })
@@ -584,6 +698,30 @@ async function leaveAgoraChannel() {
   });
 }
 
+/** يحوّل أخطاء الانضمام التقنية إلى رسالة مفهومة وقابلة للتصرّف */
+function describeJoinFailure(error) {
+  const msg = String(error?.message || "");
+
+  if (/Agora RTC|مكتبة Agora|AgoraRTC/i.test(msg)) {
+    return "تعذّر تحميل مكتبة المكالمات — تحقق من الاتصال أو من حاجب الإعلانات ثم أعد المحاولة.";
+  }
+
+  // أخطاء أذونات الأجهزة من Agora
+  if (/PERMISSION_DENIED|NotAllowedError/i.test(msg)) {
+    return "تم رفض إذن الكاميرا/الميكروفون — فعّله من إعدادات المتصفح.";
+  }
+
+  if (/NotFoundError|DEVICE_NOT_FOUND/i.test(msg)) {
+    return "لم يُعثر على كاميرا أو ميكروفون متصل بالجهاز.";
+  }
+
+  if (/INVALID_VENDOR_KEY|CAN_NOT_GET_GATEWAY_SERVER|invalid token|dynamic key/i.test(msg)) {
+    return "إعدادات Agora غير صحيحة (App ID أو التوكن) — راجع js/config.js.";
+  }
+
+  return "تعذّر بدء المكالمة: " + (msg || "خطأ غير معروف");
+}
+
 /* ------------------------------------------------------------
  * 7) تدفق المكالمة الصادرة
  * ---------------------------------------------------------- */
@@ -673,7 +811,7 @@ export async function startCall(callType = "audio") {
   callState.joining = false;
 
   if (!joined.ok) {
-    notify("تعذّر بدء المكالمة: " + (joined.error?.message || "خطأ غير معروف"));
+    notify(describeJoinFailure(joined.error));
     await endCall("failed");
     return;
   }
@@ -781,7 +919,7 @@ async function acceptIncomingCall() {
   );
 
   if (!joined.ok) {
-    notify("تعذّر الانضمام للمكالمة: " + (joined.error?.message || "خطأ غير معروف"));
+    notify(describeJoinFailure(joined.error));
     await endCall("failed");
     return;
   }
@@ -877,6 +1015,9 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
     ended_at: new Date().toISOString(),
   });
   await logCallEvent(call.roomId, reason, { direction: call.direction });
+
+  // حرّر قنوات الإشارة بعد اكتمال إرسال call:end
+  closeOutboundChannels();
 }
 
 /* ------------------------------------------------------------

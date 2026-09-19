@@ -119,6 +119,14 @@ true, is_admin = true where email = '...';` من قسم 9 بالبريد الج�
    localStorage.setItem("agora_app_id", "APP_ID_HERE");
    ```
 
+> **تحميل المكتبة:** يُحمَّل SDK من عدة مصادر بالتتابع
+> (jsdelivr ← unpkg ← download.agora.io)، فلا يُعطّل مصدرٌ واحد فاشل (503) الميزة.
+> لتثبيت مصدر محدد: `localStorage.setItem("agora_sdk_url", "https://...")`.
+>
+> ⚠️ لا تضبط `crossOrigin` على وسم `<script>` الخاص بالـ SDK — الوسم العادي
+> لا يخضع لـ CORS أصلاً، وضبط الخاصية يُفعّل فحص CORS فيرفض المتصفح الملف
+> لأن `download.agora.io` لا يُرسل `Access-Control-Allow-Origin`.
+
 ### ب) وضع الأمان (مهم جداً)
 | الوضع | App Certificate | ما تحتاجه |
 |---|---|---|

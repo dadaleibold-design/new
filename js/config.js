@@ -23,8 +23,15 @@ const AGORA_DEFAULTS = {
   // نقطة نهاية آمنة تُرجع { token, uid, expiresAt } — اتركها فارغة في وضع Testing
   tokenEndpoint: "",
 
-  // نسخة SDK المحمّلة بشكل كسول (Lazy) عند أول مكالمة فقط لتوفير الأداء
-  sdkUrl: "https://download.agora.io/sdk/release/AgoraRTC_N-4.20.2.js",
+  // مصادر SDK مرتّبة حسب الأفضلية، تُحمَّل بشكل كسول عند أول مكالمة فقط.
+  // ملاحظة: وسم <script> العادي لا يخضع لسياسة CORS إطلاقاً، لذا يجب
+  // عدم ضبط crossOrigin عليه (ضبطه يُفعّل فحص CORS ويُفشل التحميل).
+  // نضع مرايا npm أولاً لأن download.agora.io يعطي 503 أحياناً.
+  sdkUrls: [
+    "https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.20.2/AgoraRTC_N-production.js",
+    "https://unpkg.com/agora-rtc-sdk-ng@4.20.2/AgoraRTC_N-production.js",
+    "https://download.agora.io/sdk/release/AgoraRTC_N-4.20.2.js",
+  ],
 
   // بادئة أسماء القنوات لتفادي التعارض بين المشاريع على نفس الـ App ID
   channelPrefix: "wa",
@@ -66,8 +73,13 @@ export const AGORA = {
       AGORA_DEFAULTS.tokenEndpoint
     );
   },
-  get sdkUrl() {
-    return readAgoraOverride("sdkUrl", "agora_sdk_url") || AGORA_DEFAULTS.sdkUrl;
+  /** قائمة مصادر SDK للمحاولة بالتتابع (التجاوز اليدوي يتصدّر القائمة) */
+  get sdkUrls() {
+    const override = readAgoraOverride("sdkUrl", "agora_sdk_url");
+    const list = [...AGORA_DEFAULTS.sdkUrls];
+    if (override) list.unshift(override);
+    // أزل التكرار مع الحفاظ على الترتيب
+    return [...new Set(list)];
   },
   channelPrefix: AGORA_DEFAULTS.channelPrefix,
   ringTimeoutMs: AGORA_DEFAULTS.ringTimeoutMs,
