@@ -518,18 +518,34 @@ async function setCallPresence(status) {
  * 6) إدارة Agora RTC
  * ---------------------------------------------------------- */
 async function fetchAgoraToken(channel, uid) {
-  if (!AGORA.tokenEndpoint) return null; // وضع Testing بدون شهادة
+  if (!AGORA.tokenEndpoint) {
+    // A secured Agora project rejects tokenless joins with
+    // CAN_NOT_GET_GATEWAY_SERVER / dynamic use static key. Fail before join
+    // so the user gets an actionable message instead of a noisy SDK error.
+    throw new Error(
+      "Agora يحتاج إلى توكن أمان. فعّل نقطة AGORA_TOKEN_ENDPOINT أو عطّل App Certificate في Agora Console (Testing)."
+    );
+  }
 
   const result = await safeAsync("calls:token", async () => {
+    const authResult = await callState.ctx?.supabase?.auth?.getSession?.();
+    const accessToken = authResult?.data?.session?.access_token;
+    const headers = { "Content-Type": "application/json" };
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+
     const res = await fetch(AGORA.tokenEndpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ channelName: channel, uid }),
     });
     if (!res.ok) throw new Error(`خادم التوكن أعاد ${res.status}`);
     const json = await res.json();
     return json?.token || null;
   });
+
+  if (!result.ok || !result.data) {
+    throw result.error || new Error("لم يُرجع خادم Agora توكناً صالحاً.");
+  }
 
   return result.data;
 }
@@ -715,8 +731,12 @@ function describeJoinFailure(error) {
     return "لم يُعثر على كاميرا أو ميكروفون متصل بالجهاز.";
   }
 
-  if (/INVALID_VENDOR_KEY|CAN_NOT_GET_GATEWAY_SERVER|invalid token|dynamic key/i.test(msg)) {
-    return "إعدادات Agora غير صحيحة (App ID أو التوكن) — راجع js/config.js.";
+  if (/AGORA يحتاج إلى توكن|CAN_NOT_GET_GATEWAY_SERVER|dynamic use static key|invalid token|INVALID_TOKEN/i.test(msg)) {
+    return "تعذّر اتصال Agora لأن المشروع يستخدم App Certificate بدون توكن. اضبط AGORA_TOKEN_ENDPOINT أو عطّل الشهادة من Agora Console للاختبار.";
+  }
+
+  if (/INVALID_VENDOR_KEY/i.test(msg)) {
+    return "معرّف مشروع Agora غير صحيح — راجع App ID في js/config.js.";
   }
 
   return "تعذّر بدء المكالمة: " + (msg || "خطأ غير معروف");

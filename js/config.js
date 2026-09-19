@@ -21,7 +21,7 @@ const AGORA_DEFAULTS = {
   appId: "c72cf98bdff64feebd17688f95764943",
 
   // نقطة نهاية آمنة تُرجع { token, uid, expiresAt } — اتركها فارغة في وضع Testing
-  tokenEndpoint: "",
+  tokenEndpoint: "https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/agora-token",
 
   // مصادر SDK مرتّبة حسب الأفضلية، تُحمَّل بشكل كسول عند أول مكالمة فقط.
   // ملاحظة: وسم <script> العادي لا يخضع لسياسة CORS إطلاقاً، لذا يجب
