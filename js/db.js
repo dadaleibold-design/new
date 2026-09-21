@@ -1,10 +1,11 @@
 const DB_NAME = "wa_clone_db";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORES = {
   messages: "messages",
   conversations: "conversations",
   contacts: "contacts",
   outbox: "outbox",
+  readStates: "read_states",
 };
 
 let dbPromise = null;
@@ -57,6 +58,9 @@ function openDb() {
       }
       if (!db.objectStoreNames.contains(STORES.outbox)) {
         db.createObjectStore(STORES.outbox, { keyPath: "local_id", autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains(STORES.readStates)) {
+        db.createObjectStore(STORES.readStates, { keyPath: "conversation_id" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -143,6 +147,28 @@ export async function getOutbox() {
 
 export async function removeFromOutbox(localId) {
   return tx(STORES.outbox, "readwrite", (store) => store.delete(localId));
+}
+
+export async function saveReadState(conversationId, state = {}) {
+  if (!conversationId) return null;
+  return tx(STORES.readStates, "readwrite", (store) =>
+    store.put({
+      conversation_id: conversationId,
+      ...state,
+      updated_at: new Date().toISOString(),
+    })
+  );
+}
+
+export async function getReadState(conversationId) {
+  if (!conversationId || !isIndexedDbAvailable()) return null;
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(STORES.readStates, "readonly");
+    const req = t.objectStore(STORES.readStates).get(conversationId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
 }
 
 export async function clearAllCache() {

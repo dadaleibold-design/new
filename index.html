@@ -44,15 +44,15 @@
     <p id="auth-error" class="auth-error hidden"></p>
 
     <form id="login-form" class="auth-form">
-      <input id="login-email" type="email" required data-i18n-placeholder="email" placeholder="البريد الإلكتروني" />
+      <input id="login-identity" type="text" required autocomplete="username" data-i18n-placeholder="login_identity" placeholder="رقم الهاتف أو بريد المشرف" />
       <input id="login-password" type="password" required data-i18n-placeholder="password" placeholder="كلمة المرور" />
       <button type="submit" data-i18n="login_btn">دخول</button>
     </form>
 
     <form id="signup-form" class="auth-form hidden">
       <input id="signup-name" type="text" required data-i18n-placeholder="display_name" placeholder="اسم المستخدم" />
-      <input id="signup-email" type="email" required data-i18n-placeholder="email" placeholder="البريد الإلكتروني" />
-      <input id="signup-phone" type="tel" data-i18n-placeholder="phone" placeholder="رقم الهاتف (اختياري)" />
+      <input id="signup-email" type="email" data-i18n-placeholder="admin_email_optional" placeholder="بريد المشرف (اختياري)" />
+      <input id="signup-phone" type="tel" required data-i18n-placeholder="phone" placeholder="رقم الهاتف" />
       <input id="signup-password" type="password" required minlength="6" data-i18n-placeholder="password" placeholder="كلمة المرور" />
       <button type="submit" data-i18n="signup_btn">إنشاء الحساب</button>
     </form>
@@ -74,6 +74,7 @@
         <span id="my-name"></span>
       </div>
       <div class="sidebar-actions">
+        <button id="btn-call-history" title="سجل المكالمات" aria-label="سجل المكالمات">🕘</button>
         <button id="lang-toggle" title="Language">🌐</button>
         <button id="theme-toggle" title="Theme">🌓</button>
         <button id="btn-settings" title="Settings">⚙️</button>
@@ -88,6 +89,7 @@
       <input id="wallpaper-input" type="file" accept="image/*" />
       <button id="btn-remove-wallpaper" class="settings-danger" type="button">حذف خلفية الدردشة</button>
       <button id="btn-enable-push" type="button" data-i18n="enable_push">تفعيل إشعارات الجهاز</button>
+      <button id="btn-background-help" type="button">إعداد العمل في الخلفية</button>
       <button id="btn-logout" class="logout-btn" data-i18n="logout">تسجيل الخروج</button>
     </div>
 
@@ -109,6 +111,16 @@
 
   <!-- Chat panel: يُحقن من partials/chat-panel.html عبر app.js -->
   <div id="chat-panel-container"></div>
+</div>
+
+<div id="call-history-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="call-history-title">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h2 id="call-history-title">سجل المكالمات</h2>
+      <button id="close-call-history" type="button" aria-label="إغلاق">✕</button>
+    </div>
+    <div id="call-history-list" class="call-history-list"></div>
+  </div>
 </div>
 
 <audio id="notification-sound" src="./icons/notify.mp3" preload="auto"></audio>

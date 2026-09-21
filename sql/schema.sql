@@ -11,7 +11,7 @@ create extension if not exists "uuid-ossp";
 -- ------------------------------------------------------------
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
-  email text unique not null,
+  email text unique,
   phone text,
   display_name text not null,
   avatar_url text,
@@ -22,6 +22,10 @@ create table if not exists public.profiles (
   theme text default 'dark',        -- 'dark' | 'light'
   last_seen timestamptz default now(),
   is_online boolean default false,
+  is_blocked boolean not null default false,
+  blocked_at timestamptz,
+  call_status text default 'available',
+  call_status_at timestamptz,
   created_at timestamptz default now()
 );
 
@@ -43,11 +47,12 @@ $$;
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer as $$
 begin
-  insert into public.profiles (id, email, display_name, is_admin)
+  insert into public.profiles (id, email, phone, display_name, is_admin)
   values (
     new.id,
     new.email,
-    coalesce(new.raw_user_meta_data->>'display_name', split_part(new.email,'@',1)),
+    new.phone,
+    coalesce(new.raw_user_meta_data->>'display_name', split_part(coalesce(new.email, new.phone), '@', 1)),
     public.is_admin_email(new.email)
   )
   on conflict (id) do nothing;
@@ -89,6 +94,13 @@ create table if not exists public.messages (
 );
 
 create index if not exists idx_messages_conversation on public.messages(conversation_id, created_at);
+
+alter table public.messages add column if not exists message_type text not null default 'text';
+alter table public.messages add column if not exists call_id uuid;
+alter table public.messages add column if not exists call_duration_seconds integer;
+alter table public.profiles alter column email drop not null;
+alter table public.profiles add column if not exists is_blocked boolean not null default false;
+alter table public.profiles add column if not exists blocked_at timestamptz;
 
 -- ------------------------------------------------------------
 -- 4. MESSAGE REACTIONS
@@ -146,6 +158,13 @@ alter table public.conversations enable row level security;
 alter table public.messages enable row level security;
 alter table public.message_reactions enable row level security;
 alter table public.typing_status enable row level security;
+alter table public.call_rooms enable row level security;
+alter table public.call_logs enable row level security;
+
+create or replace function public.is_admin_user(p_user_id uuid default auth.uid())
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.profiles where id = p_user_id and is_admin = true);
+$$;
 
 -- Profiles: everyone authenticated can read (needed for contact lists / names)
 drop policy if exists "profiles readable by authenticated" on public.profiles;
@@ -153,7 +172,14 @@ create policy "profiles readable by authenticated" on public.profiles
   for select using (auth.role() = 'authenticated');
 drop policy if exists "profiles updatable by owner" on public.profiles;
 create policy "profiles updatable by owner" on public.profiles
-  for update using (auth.uid() = id);
+  for update using (auth.uid() = id)
+  with check (auth.uid() = id and is_admin = (select is_admin from public.profiles where id = auth.uid()));
+drop policy if exists "profiles admin manage users" on public.profiles;
+create policy "profiles admin manage users" on public.profiles
+  for update using (public.is_admin_user()) with check (public.is_admin_user());
+drop policy if exists "profiles admin delete users" on public.profiles;
+create policy "profiles admin delete users" on public.profiles
+  for delete using (public.is_admin_user());
 
 -- Conversations: only the two participants can see/manage
 drop policy if exists "conversations select own" on public.conversations;
@@ -189,6 +215,9 @@ create policy "messages update in own conversation" on public.messages
             where c.id = conversation_id
             and (c.user_id = auth.uid() or c.admin_id = auth.uid()))
   );
+drop policy if exists "messages delete admins only" on public.messages;
+create policy "messages delete admins only" on public.messages
+  for delete using (public.is_admin_user());
 
 -- Reactions
 drop policy if exists "reactions select in own conversation" on public.message_reactions;

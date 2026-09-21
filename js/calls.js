@@ -502,6 +502,26 @@ async function logCallEvent(roomId, event, meta = {}) {
   );
 }
 
+async function writeCallMessage(call, status, durationSeconds = 0) {
+  const supabase = callState.ctx?.supabase;
+  const me = callState.ctx?.getMe?.();
+  if (!supabase || !call?.conversationId || !me?.id) return;
+  const isMissed = status === "missed";
+  const label = isMissed ? "مكالمة فائتة" : call.callType === "video" ? "مكالمة فيديو" : "مكالمة صوتية";
+  const duration = durationSeconds ? ` · المدة ${Math.floor(durationSeconds / 60)}:${String(durationSeconds % 60).padStart(2, "0")}` : "";
+  await safeQuery("calls:chat-message", () =>
+    supabase.from("messages").insert({
+      conversation_id: call.conversationId,
+      sender_id: me.id,
+      content: `${label}${duration}`,
+      message_type: "call",
+      call_id: call.roomId,
+      call_duration_seconds: durationSeconds || null,
+      status: "sent",
+    })
+  );
+}
+
 async function setCallPresence(status) {
   const supabase = callState.ctx?.supabase;
   const me = callState.ctx?.getMe?.();
@@ -886,6 +906,11 @@ async function handleIncomingInvite(payload) {
     if (callState.incoming?.roomId === payload.roomId) {
       hideIncomingDialog();
       logCallEvent(payload.roomId, "missed", {});
+      writeCallMessage({
+        roomId: payload.roomId,
+        conversationId: payload.conversationId,
+        callType: payload.callType,
+      }, "missed");
       callState.incoming = null;
     }
   }, AGORA.ringTimeoutMs);
@@ -919,6 +944,7 @@ async function acceptIncomingCall() {
     conversationId: invite.conversationId,
     direction: "incoming",
     connected: true,
+    startedAt: Date.now(),
   };
 
   setPeerInfo(invite.caller);
@@ -972,6 +998,7 @@ async function declineIncomingCall() {
 function handlePeerAccepted(payload) {
   if (!callState.current || callState.current.roomId !== payload?.roomId) return;
   callState.current.connected = true;
+  callState.current.startedAt = Date.now();
   clearTimeout(callState.ringTimer);
   setCallStatus("متصل");
   startDurationTimer();
@@ -1035,6 +1062,10 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
     ended_at: new Date().toISOString(),
   });
   await logCallEvent(call.roomId, reason, { direction: call.direction });
+  const durationSeconds = call.connected && call.startedAt
+    ? Math.max(1, Math.floor((Date.now() - call.startedAt) / 1000))
+    : 0;
+  await writeCallMessage(call, reason === "missed" ? "missed" : "ended", durationSeconds);
 
   // حرّر قنوات الإشارة بعد اكتمال إرسال call:end
   closeOutboundChannels();

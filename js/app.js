@@ -10,6 +10,8 @@ import {
   queueOutboxMessage,
   getOutbox,
   removeFromOutbox,
+  saveReadState,
+  getReadState,
 } from "./db.js";
 import {
   enablePushNotifications,
@@ -374,12 +376,12 @@ function wireAuthForms() {
   $("#login-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
 
-    const email = $("#login-email").value.trim();
+    const identity = $("#login-identity").value.trim();
     const password = $("#login-password").value;
 
     try {
       await signIn({
-        email,
+        identity,
         password,
       });
 
@@ -406,7 +408,7 @@ function wireAuthForms() {
       });
 
       await signIn({
-        email,
+        identity: email || phone,
         password,
       });
 
@@ -511,6 +513,12 @@ function wireChrome() {
     }
   );
 
+  $("#btn-call-history")?.addEventListener("click", openCallHistory);
+  $("#close-call-history")?.addEventListener("click", closeCallHistory);
+  $("#btn-background-help")?.addEventListener("click", () =>
+    showAuthError("لضمان وصول الإشعارات: اسمح بالإشعارات، عطّل تحسين البطارية للتطبيق/المتصفح، واسمح له بالعمل في الخلفية من إعدادات النظام.")
+  );
+
   // حذف الصورة الشخصية / خلفية الدردشة (كانت الأزرار موجودة بلا ربط)
   $("#btn-remove-avatar")?.addEventListener(
     "click",
@@ -538,6 +546,36 @@ function wireChrome() {
 
   wireChatPanel();
   wireEmojiPicker();
+}
+
+function closeCallHistory() {
+  $("#call-history-modal")?.classList.add("hidden");
+}
+
+async function openCallHistory() {
+  if (!state.me) return;
+  const modal = $("#call-history-modal");
+  const list = $("#call-history-list");
+  modal?.classList.remove("hidden");
+  if (!list) return;
+  list.textContent = "جارٍ تحميل سجل المكالمات...";
+
+  const { data, error } = await supabase
+    .from("call_rooms")
+    .select("*, caller:profiles!call_rooms_caller_id_fkey(display_name), callee:profiles!call_rooms_callee_id_fkey(display_name)")
+    .or(`caller_id.eq.${state.me.id},callee_id.eq.${state.me.id}`)
+    .order("created_at", { ascending: false })
+    .limit(100);
+  if (error) {
+    list.textContent = "تعذّر تحميل سجل المكالمات.";
+    return;
+  }
+  list.innerHTML = (data || []).map((call) => {
+    const peer = call.caller_id === state.me.id ? call.callee?.display_name : call.caller?.display_name;
+    const date = new Date(call.created_at).toLocaleString(state.lang === "ar" ? "ar-SA" : "en-US");
+    const status = call.status === "missed" ? "مكالمة فائتة" : call.status === "declined" ? "مرفوضة" : call.status === "active" || call.status === "ended" ? "مكتملة" : call.status;
+    return `<div class="call-history-row"><strong>${escapeHtml(peer || "مستخدم")}</strong><span>${call.call_type === "video" ? "فيديو" : "صوت"} · ${escapeHtml(status)}</span><time>${escapeHtml(date)}</time></div>`;
+  }).join("") || "لا توجد مكالمات بعد.";
 }
 
 /** يحذف الصورة الشخصية أو خلفية الدردشة من الملف الشخصي */
@@ -1083,7 +1121,25 @@ function buildContactRow(c, opts) {
         ? `<div class="unread-badge">${c._unread}</div>`
         : ""
     }
+    ${state.me.is_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="حظر المستخدم">⛔</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
   `;
+
+  row.querySelectorAll("[data-admin-action]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      if (!state.me.is_admin) return;
+      const action = button.dataset.adminAction;
+      if (action === "block") {
+        const { error } = await supabase.from("profiles").update({ is_blocked: true, blocked_at: new Date().toISOString() }).eq("id", c.id);
+        if (!error) button.disabled = true;
+        return;
+      }
+      if (action === "delete" && window.confirm("حذف المستخدم وجميع محادثاته؟")) {
+        await supabase.from("profiles").delete().eq("id", c.id);
+        row.remove();
+      }
+    });
+  });
 
   row.addEventListener("click", () => {
     openConversation(c);
@@ -1312,10 +1368,18 @@ async function loadMessages(conversationId) {
   );
 
   const cached = cachedResult.data || [];
+  const readStateResult = await safeAsync(
+    "loadMessages:read-state",
+    () => getReadState(conversationId),
+    { fallback: null }
+  );
 
   if (cached.length) {
     state.messages = cached;
     renderMessages();
+    if (typeof readStateResult.data?.scroll_top === "number") {
+      $("#chat-messages").scrollTop = readStateResult.data.scroll_top;
+    }
   }
 
   if (!state.isOnline) {
@@ -1353,6 +1417,13 @@ async function loadMessages(conversationId) {
 
   await safeAsync("loadMessages:persist", () =>
     cacheMessages(conversationId, state.messages)
+  );
+  await safeAsync("loadMessages:save-state", () =>
+    saveReadState(conversationId, {
+      last_message_id: state.messages.at(-1)?.id || readStateResult.data?.last_message_id || null,
+      last_message_at: state.messages.at(-1)?.created_at || readStateResult.data?.last_message_at || null,
+      scroll_top: $("#chat-messages")?.scrollTop || 0,
+    })
   );
 }
 
@@ -1690,6 +1761,7 @@ function buildMessageBubble(m) {
         >
           😊
         </button>
+        ${state.me.is_admin ? '<button class="bubble-action-delete" title="حذف الرسالة" type="button">🗑️</button>' : ""}
       </div>
 
       ${quotedHtml}
@@ -1761,6 +1833,17 @@ function buildMessageBubble(m) {
         setReplyTarget(m);
       }
     );
+
+  div.querySelector(".bubble-action-delete")?.addEventListener("click", async () => {
+    if (!state.me.is_admin || !window.confirm("حذف الرسالة؟")) return;
+    const { error } = await supabase.from("messages").delete().eq("id", m.id);
+    if (error) {
+      showAuthError("لا يمكن حذف الرسالة.");
+      return;
+    }
+    state.messages = state.messages.filter((message) => message.id !== m.id);
+    renderMessages();
+  });
 
   const reactBtn =
     div.querySelector(

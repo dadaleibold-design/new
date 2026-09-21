@@ -75,3 +75,11 @@ body[data-theme="light"] .chat-search-bar{background:var(--wa-panel-light)}
 .bubble-row.search-dim{opacity:.32;transition:opacity .15s ease}
 .bubble-row.search-hit .bubble{outline:2px solid var(--wa-green);outline-offset:2px;border-radius:8px}
 .contact-search-empty{padding:24px 16px;color:var(--wa-text-secondary);text-align:center;font-size:13.5px}
+.modal{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,0,0,.55)}
+.modal-card{width:min(520px,100%);max-height:min(680px,90vh);overflow:auto;border-radius:12px;background:var(--wa-panel-dark);color:var(--wa-text-primary);box-shadow:0 18px 60px rgba(0,0,0,.4)}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:16px;border-bottom:1px solid rgba(134,150,160,.16)}
+.modal-header h2{margin:0;font-size:18px}.modal-header button{border:0;background:transparent;color:inherit;font-size:18px}
+.call-history-row{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:14px 16px;border-bottom:1px solid rgba(134,150,160,.1)}
+.call-history-row span,.call-history-row time{color:var(--wa-text-secondary);font-size:12px}.call-history-row time{grid-column:1/-1}
+.admin-user-actions{display:flex;gap:2px;margin-inline-start:auto}.admin-user-actions button{border:0;background:transparent;color:var(--wa-text-secondary);font-size:13px;padding:4px}.admin-user-actions button:hover{color:#e64c4c}
+body[data-theme="light"] .modal-card{background:var(--wa-panel-light);color:#111b21}
