@@ -786,6 +786,8 @@ function wireChrome() {
             log(false, "لم يصل رد من send-push خلال 10 ثوانٍ (timeout) — تحقق أن الرابط في Vault صحيح");
           } else if (res.status_code === 200) {
             log(true, `قاعدة البيانات وصلت إلى send-push بنجاح (200): ${res.response || ""}`);
+          } else if (res.status_code === 401 && /NO_AUTH_HEADER|Missing authorization/i.test(res.response || "")) {
+            log(false, "401 من بوابة Supabase (وليس من الدالة): انشر الدالة بـ --no-verify-jwt ونفّذ migration v2.4 (يضيف ترويسة Authorization)");
           } else if (res.status_code === 401) {
             log(false, "401 من send-push: قيمة SEND_PUSH_SECRET في Vault لا تطابق سر الدالة — وحّدهما ثم أعد النشر");
           } else if (res.status_code === 404) {
