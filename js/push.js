@@ -11,11 +11,11 @@ const firebaseConfig = {
   projectId: "studio-6422025604-b97aa",
   storageBucket: "studio-6422025604-b97aa.firebasestorage.app",
   messagingSenderId: "599267399266",
-  appId: "1:599267399266:web:329e49e24298af60f5e33b"
+  appId: "1:599267399266:web:4cd19dbf69068019f5e33b",
+  measurementId: "G-FFX14GZB51"
 };
-
 const VAPID_KEY =
-  "BAxTu3HSXPEgeTyTRPoXvpkLQWu8llJQfsPEoUr0MDjHKRJ0VSzPFcJw5RFv-s6BTnZYeWEHW8NSQzAjfOxoJfo";
+  "BGKcsJH4YH7vV384UCmx_FKD0xGiWTNuMA7skLLUWzIodKXTSFLRleq1K0ttPMnXZfzQO42bQig8nSKTSIw1jts";
 
 let firebaseApp = null;
 let messaging = null;
