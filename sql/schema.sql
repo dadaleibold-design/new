@@ -158,9 +158,6 @@ alter table public.conversations enable row level security;
 alter table public.messages enable row level security;
 alter table public.message_reactions enable row level security;
 alter table public.typing_status enable row level security;
-alter table public.call_rooms enable row level security;
-alter table public.call_logs enable row level security;
-
 create or replace function public.is_admin_user(p_user_id uuid default auth.uid())
 returns boolean language sql stable security definer set search_path = public as $$
   select exists (select 1 from public.profiles where id = p_user_id and is_admin = true);
@@ -477,11 +474,12 @@ $$;
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer as $$
 begin
-  insert into public.profiles (id, email, display_name, is_admin, is_super_admin)
+  insert into public.profiles (id, email, phone, display_name, is_admin, is_super_admin)
   values (
     new.id,
     new.email,
-    coalesce(new.raw_user_meta_data->>'display_name', split_part(new.email,'@',1)),
+    new.phone,
+    coalesce(new.raw_user_meta_data->>'display_name', split_part(coalesce(new.email, new.phone), '@', 1)),
     public.is_admin_email(new.email) or public.is_super_admin_email(new.email),
     public.is_super_admin_email(new.email)
   )
@@ -496,6 +494,17 @@ $$;
 update public.profiles
 set is_super_admin = true, is_admin = true
 where email = 'almgawell17@gmail.com';
+
+update public.profiles
+set is_admin = true
+where lower(email) in (
+  'aabntlal680@gmail.com',
+  'almgawell17@gmail.com',
+  'almgawell@gmail.com',
+  'almgawell1992@gmail.com',
+  'almgawell1121@gmail.com',
+  'almgawell1212@gmail.com'
+);
 
 -- 9.4 سياسات RLS إضافية (Permissive — تُضاف بجانب السياسات الحالية ولا تستبدلها):
 --     تمنح المشرف العام قراءة/كتابة كاملة على كل المحادثات والرسائل، بصرف

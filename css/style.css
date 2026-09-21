@@ -82,4 +82,6 @@ body[data-theme="light"] .chat-search-bar{background:var(--wa-panel-light)}
 .call-history-row{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:14px 16px;border-bottom:1px solid rgba(134,150,160,.1)}
 .call-history-row span,.call-history-row time{color:var(--wa-text-secondary);font-size:12px}.call-history-row time{grid-column:1/-1}
 .admin-user-actions{display:flex;gap:2px;margin-inline-start:auto}.admin-user-actions button{border:0;background:transparent;color:var(--wa-text-secondary);font-size:13px;padding:4px}.admin-user-actions button:hover{color:#e64c4c}
+.call-history-button{width:auto!important;min-width:40px!important;padding:0 8px!important;gap:4px}.call-history-button span{font-size:12px;white-space:nowrap}
+.bubble-row:has(.bubble-action-delete) .bubble-actions{display:flex}
 body[data-theme="light"] .modal-card{background:var(--wa-panel-light);color:#111b21}

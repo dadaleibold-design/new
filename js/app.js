@@ -206,6 +206,7 @@ async function boot() {
 window.addEventListener('pageshow', (event) => {
   if (event.persisted && supabase) {
     supabase.realtime.connect();
+    if (state.me) resubscribeRealtime();
   }
 });
 
@@ -282,6 +283,9 @@ async function enterApp() {
   });
 
   state.me = profileResult.data;
+  if (state.me?.email && ADMINS.some((admin) => admin.email.toLowerCase() === state.me.email.toLowerCase())) {
+    state.me.is_admin = true;
+  }
 
   if (!state.me) {
     showAuthScreen();

@@ -409,6 +409,9 @@ async function sendSignal(targetUserId, event, payload) {
 
   return (
     await safeAsync(`calls:signal:${event}`, async () => {
+      if (supabase.realtime.connectionState?.() === "disconnected") {
+        supabase.realtime.connect();
+      }
       const { channel, ready } = getOutboundChannel(signalChannelName(targetUserId));
 
       await ready;
@@ -420,7 +423,7 @@ async function sendSignal(targetUserId, event, payload) {
       }
 
       return true;
-    })
+    }, { retries: 1, delayMs: 700 })
   ).ok;
 }
 
@@ -466,8 +469,23 @@ export function unsubscribeFromIncomingCalls() {
  * ---------------------------------------------------------- */
 async function persistCallRoom(room) {
   const supabase = callState.ctx?.supabase;
-  if (!supabase) return;
-  await safeQuery("calls:insert-room", () =>
+  if (!supabase) return false;
+  const activeRoom = await supabase
+    .from("call_rooms")
+    .select("id,status")
+    .eq("conversation_id", room.conversationId)
+    .in("status", ["ringing", "active"])
+    .limit(1)
+    .maybeSingle();
+  if (activeRoom.error) {
+    notify("تعذّر التحقق من حالة المكالمة. طبّق سياسات RLS الخاصة بالمكالمات.");
+    return false;
+  }
+  if (activeRoom.data) {
+    notify("توجد مكالمة جارية في هذه المحادثة.");
+    return false;
+  }
+  const result = await safeQuery("calls:insert-room", () =>
     supabase.from("call_rooms").insert({
       id: room.roomId,
       conversation_id: room.conversationId,
@@ -478,6 +496,14 @@ async function persistCallRoom(room) {
       status: "ringing",
     })
   );
+  if (!result.ok) {
+    if (result.error?.code === "23505") {
+      notify("توجد مكالمة جارية في هذه المحادثة.");
+    } else {
+      notify("تعذّر إنشاء غرفة المكالمة. طبّق schema.sql ثم أعد المحاولة.");
+    }
+  }
+  return result.ok;
 }
 
 async function updateCallRoom(roomId, patch) {
@@ -491,8 +517,8 @@ async function updateCallRoom(roomId, patch) {
 async function logCallEvent(roomId, event, meta = {}) {
   const supabase = callState.ctx?.supabase;
   const me = callState.ctx?.getMe?.();
-  if (!supabase || !roomId || !me?.id) return;
-  await safeQuery("calls:log", () =>
+  if (!supabase || !roomId || !me?.id) return false;
+  const result = await safeQuery("calls:log", () =>
     supabase.from("call_logs").insert({
       room_id: roomId,
       user_id: me.id,
@@ -500,6 +526,7 @@ async function logCallEvent(roomId, event, meta = {}) {
       metadata: meta,
     })
   );
+  return result.ok;
 }
 
 async function writeCallMessage(call, status, durationSeconds = 0) {
@@ -624,6 +651,7 @@ function attachClientHandlers(client) {
   });
 
   client.on("exception", (evt) => {
+    if (evt?.code === 1003 || evt?.code === 3003) return;
     console.warn("[calls] Agora exception:", evt?.code, evt?.msg);
   });
 }
@@ -815,7 +843,7 @@ export async function startCall(callType = "audio") {
   setOverlayVisible(true);
   updateControlsForType(callType);
 
-  await persistCallRoom({
+  const roomCreated = await persistCallRoom({
     roomId,
     conversationId: conv.id,
     channel,
@@ -823,6 +851,12 @@ export async function startCall(callType = "audio") {
     callerId: me.id,
     calleeId: peer.id,
   });
+  if (!roomCreated) {
+    callState.current = null;
+    callState.joining = false;
+    setOverlayVisible(false);
+    return;
+  }
 
   await logCallEvent(roomId, "initiated", { call_type: callType });
   await setCallPresence("in_call");

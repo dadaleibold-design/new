@@ -103,8 +103,6 @@ export async function enablePushNotifications(userId = null) {
       return false;
     }
 
-    console.log("[FCM] FCM Token:", token);
-
     localStorage.setItem(
       "fcm_token",
       token
