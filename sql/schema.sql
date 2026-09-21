@@ -326,31 +326,88 @@ create policy "wallpapers public read" on storage.objects
 -- عمود لتخزين الأزرار التفاعلية المرفقة برسالة (مصفوفة JSON: [{label, value}, ...])
 alter table public.messages add column if not exists buttons jsonb;
 
--- 7.1 عند إنشاء أي محادثة جديدة (عميل يبدأ التواصل لأول مرة مع مشرف)
---     تُرسَل تلقائياً رسالة ترحيبية من طرف المشرف تحتوي على زرّين تفاعليين
+-- 7.1 الرسالة الترحيبية تُرسل عند **أول رسالة فعلية من العميل** — لا بمجرد
+--     فتحه لصفحة المشرف أو إنشاء صفّ المحادثة. النص يتضمّن الترحيب والتنبيه
+--     الإداري المطلوب، والأزرار التفاعلية الأصلية دون أي تغيير.
 create or replace function public.send_welcome_message()
-returns trigger language plpgsql security definer as $$
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
 declare
-  v_welcome_text text := 'مرحباً بك! 👋 نحن سعداء بتواصلك معنا. كيف يمكننا مساعدتك اليوم؟';
+  v_welcome_text text := 'مرحباً بك! 👋 نحن سعداء بتواصلك معنا.' || chr(10) ||
+    '⚠️ تنبيه مهم: التواصل مع العديد من المكاتب قد يعرّضك للحظر، ونرجو الالتزام بالتعليمات وعدم الفوضى مع فريق العمل.' || chr(10) ||
+    'كيف يمكننا مساعدتك اليوم؟';
+  -- ⚠️ الأزرار التفاعلية الأصلية — بلا أي تغيير
   v_buttons jsonb := '[
     {"label":"الاستفسار عن الخدمات","value":"الاستفسار عن الخدمات"},
     {"label":"الشكاوى والمقترحات","value":"الشكاوى والمقترحات"}
   ]'::jsonb;
+  v_conv record;
+  v_previous integer := 0;
 begin
+  select user_id, admin_id into v_conv
+  from public.conversations where id = new.conversation_id;
+
+  -- FOUND أدقّ من اختبار السجل عند عدم وجود المحادثة (وتفادياً لأي اختلاف بين الإصدارات)
+  if not found then
+    return new;
+  end if;
+
+  -- رسائل العميل فقط (الطرف user_id)
+  if new.sender_id is distinct from v_conv.user_id then
+    return new;
+  end if;
+
+  if coalesce(new.message_type, 'text') = 'call' then
+    return new;
+  end if;
+
+  if new.content is null or btrim(new.content) = '' then
+    return new;
+  end if;
+
+  -- هل سبق أن أرسل العميل رسالة فعلية؟ (نتجاهل الحالية ورسائل المكالمات)
+  select count(*) into v_previous
+  from public.messages m
+  where m.conversation_id = new.conversation_id
+    and m.sender_id = v_conv.user_id
+    and m.id <> new.id
+    and coalesce(m.message_type, 'text') <> 'call';
+
+  if v_previous > 0 then
+    return new;
+  end if;
+
+  -- حارس ضد التكرار
+  if exists (
+    select 1 from public.messages m
+    where m.conversation_id = new.conversation_id
+      and m.sender_id = v_conv.admin_id
+      and m.buttons is not null
+  ) then
+    return new;
+  end if;
+
   insert into public.messages (conversation_id, sender_id, content, buttons, status)
-  values (new.id, new.admin_id, v_welcome_text, v_buttons, 'sent');
+  values (new.conversation_id, v_conv.admin_id, v_welcome_text, v_buttons, 'sent');
 
   update public.conversations
-  set last_message = v_welcome_text, last_message_at = now()
-  where id = new.id;
+     set last_message = v_welcome_text, last_message_at = now()
+   where id = new.conversation_id;
 
   return new;
 end;
 $$;
 
+-- لا مُشغِّل على conversations: الترحيب مرتبط بأول رسالة من العميل
 drop trigger if exists on_conversation_created on public.conversations;
-create trigger on_conversation_created
-  after insert on public.conversations
+
+-- الاسم يُشغَّل أبجدياً قبل on_message_keyword_autoreply فيصل الترحيب أولاً
+drop trigger if exists on_message_first_welcome on public.messages;
+create trigger on_message_first_welcome
+  after insert on public.messages
   for each row execute procedure public.send_welcome_message();
 
 -- 7.2 عند وصول رسالة من العميل (سواء بالنقر على أحد الزرين أو كتابة الكلمة يدوياً)
@@ -1095,7 +1152,12 @@ begin
   update public.profiles
   set is_blocked = p_blocked,
       blocked_at = case when p_blocked then now() else null end,
-      is_online = case when p_blocked then false else is_online end
+      -- المستخدم العادي: الحظر يقطعه. المشرف: يبقى "متصل الآن" دائماً.
+      is_online = case
+                    when (is_admin or is_super_admin) then true
+                    when p_blocked then false
+                    else is_online
+                  end
   where id = p_user_id;
 end;
 $$;
@@ -1195,6 +1257,14 @@ create policy "profiles updatable by owner" on public.profiles
 create or replace function public.protect_profile_privileges()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
+  -- (1) حضور المشرف ثابت: "متصل الآن" دائماً للمستخدم العادي، ولا تقطعه
+  --     نبضات الخروج/السكون التي يُرسلها متصفح المشرف عند إخفاء التطبيق.
+  if coalesce(new.is_admin, old.is_admin, false)
+     or public.is_admin_email(coalesce(old.email, new.email)) then
+    new.is_online := true;
+    new.last_seen := coalesce(new.last_seen, now());
+  end if;
+
   if auth.role() = 'service_role' then
     return new;
   end if;
@@ -1217,6 +1287,28 @@ drop trigger if exists on_profile_privilege_guard on public.profiles;
 create trigger on_profile_privilege_guard
   before update on public.profiles
   for each row execute procedure public.protect_profile_privileges();
+
+-- نفس القاعدة عند إنشاء الملف الشخصي (تسجيل مشرف جديد)
+create or replace function public.force_admin_presence_online()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if coalesce(new.is_admin, false) or public.is_admin_email(new.email) then
+    new.is_online := true;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists on_profile_admin_presence on public.profiles;
+create trigger on_profile_admin_presence
+  before insert on public.profiles
+  for each row execute procedure public.force_admin_presence_online();
+
+-- تصحيح الحالة القائمة
+update public.profiles p
+   set is_online = true,
+       last_seen = coalesce(p.last_seen, now())
+ where p.is_admin = true
+    or public.is_admin_email(p.email);
 
 -- المحظور لا يبدأ محادثات ولا مكالمات
 drop policy if exists "conversations insert own" on public.conversations;
@@ -1563,6 +1655,58 @@ end;
 $$;
 grant execute on function public.mark_conversation_read(uuid) to authenticated;
 
+-- "تم التسليم" (✓✓ رمادي): يثبّتها جهاز المستقبِل عند وصول الرسالة إليه فعلاً
+-- (Realtime / مزامنة العودة / وصول الإشعار)، ويثبّتها كذلك Edge Function
+-- send-push بعد نجاح إرسال الإشعار — فيظهر الصحّان حتى لو كان المستقبِل مغلقاً.
+create or replace function public.mark_messages_delivered(p_conversation_id uuid)
+returns integer
+language plpgsql security invoker set search_path = public as $$
+declare
+  v_count integer := 0;
+begin
+  if auth.uid() is null then
+    raise exception 'not authenticated';
+  end if;
+
+  update public.messages m
+     set status = 'delivered'
+   where m.conversation_id = p_conversation_id
+     and m.sender_id <> auth.uid()
+     and m.status = 'sent';
+
+  get diagnostics v_count = row_count;
+  return coalesce(v_count, 0);
+end;
+$$;
+grant execute on function public.mark_messages_delivered(uuid) to authenticated;
+
+-- وتصحيح جماعي عند عودة التطبيق: كل الرسائل الواردة المعلّقة → "مُسلَّمة"
+create or replace function public.mark_all_messages_delivered()
+returns integer
+language plpgsql security invoker set search_path = public as $$
+declare
+  v_count integer := 0;
+begin
+  if auth.uid() is null then
+    raise exception 'not authenticated';
+  end if;
+
+  update public.messages m
+     set status = 'delivered'
+   where m.sender_id <> auth.uid()
+     and m.status = 'sent'
+     and exists (
+       select 1 from public.conversations c
+       where c.id = m.conversation_id
+         and (c.user_id = auth.uid() or c.admin_id = auth.uid())
+     );
+
+  get diagnostics v_count = row_count;
+  return coalesce(v_count, 0);
+end;
+$$;
+grant execute on function public.mark_all_messages_delivered() to authenticated;
+
 -- (ج) --------------------------------------------------------
 -- أي رسالة جديدة (نص/مرفق/مكالمة) تحدّث آخر تفاعل للمحادثة، حتى إن لم يحدّثها العميل
 create or replace function public.touch_conversation_on_message()
@@ -1731,7 +1875,29 @@ begin
     'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted'),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify'),
+    'trigger_first_welcome', exists (select 1 from pg_trigger where tgname = 'on_message_first_welcome'),
+    'trigger_keyword_bot', exists (select 1 from pg_trigger where tgname = 'on_message_keyword_autoreply'),
+    'trigger_admin_presence', exists (select 1 from pg_trigger where tgname = 'on_profile_admin_presence'),
+    'unread_counts_rpc', exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'unread_counts'),
+    'mark_read_rpc', exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'mark_conversation_read'),
+    'mark_delivered_rpc', exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'mark_messages_delivered'),
     'my_tokens', (select count(*) from public.fcm_tokens where user_id = auth.uid()),
+    'my_unread_total', (
+      select count(*) from public.messages m
+      join public.conversations c on c.id = m.conversation_id
+      where (c.user_id = auth.uid() or c.admin_id = auth.uid())
+        and m.sender_id <> auth.uid() and m.status <> 'read'
+    ),
+    'my_messages_by_status', (
+      select coalesce(jsonb_object_agg(s.status, s.n), '{}'::jsonb)
+      from (
+        select coalesce(m.status, 'null') as status, count(*) as n
+        from public.messages m
+        join public.conversations c on c.id = m.conversation_id
+        where (c.user_id = auth.uid() or c.admin_id = auth.uid()) and m.sender_id = auth.uid()
+        group by 1
+      ) s
+    ),
     'last_log', (select jsonb_agg(l) from (select kind, note, request_id, created_at from public.push_delivery_log where recipient_id = auth.uid() or public.is_admin_user() order by id desc limit 5) l)
   ) into v;
   return v;

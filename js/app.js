@@ -215,7 +215,8 @@ async function boot() {
   window.addEventListener("beforeunload", () => {
     // لا يمكن انتظار طلب شبكة هنا؛ نُرسل نبضة keepalive حتى لا يبدو
     // المستخدم "متاحاً" بعد إغلاق التطبيق.
-    if (!state.me) return;
+    // (لا تُرسل للمشرف: حضوره ثابت ودائم بالتصميم.)
+    if (!state.me || state.me.is_admin) return;
     safeDom("beforeunload:offline", () => updatePresenceOfflineBeacon());
   });
 
@@ -337,7 +338,10 @@ window.addEventListener('pageshow', (event) => {
 //   persisted === false → خروج فعلي → نقطع الاتصال ونُعلن عدم الاتصال.
 window.addEventListener('pagehide', (event) => {
   if (event.persisted) return;
-  safeAsync("pagehide:last-seen", () => touchLastSeen(false));
+  // المشرف يبقى "متصل الآن" دائماً حتى عند الخروج (حضور ثابت بالتصميم)
+  if (!state.me?.is_admin) {
+    safeAsync("pagehide:last-seen", () => touchLastSeen(false));
+  }
   if (supabase?.realtime) supabase.realtime.disconnect();
 });
 
@@ -495,7 +499,11 @@ async function enterApp() {
         // تُسقط الإشعار كلياً متى كان التبويب غير مرئي).
         shouldSuppress: ({ viewingThread }) => viewingThread,
         getActiveConversationId: () => state.activeConversation?.id || null,
-        onNotification: () => {
+        onNotification: ({ data }) => {
+          // وصول إشعار FCM لجهازنا = الرسالة وصلتنا ⇒ ✓✓ رمادي عند المرسل
+          const conversationId =
+            data?.conversationId || data?.conversation_id || state.activeConversation?.id || null;
+          if (conversationId) markMessagesDelivered(conversationId);
           loadContacts();
         },
       });
@@ -530,13 +538,25 @@ async function enterApp() {
 
   if (state.isOnline) {
     flushOutbox();
+
+    // تصحيح جماعي لعلامات التسليم عند كل دخول: أي رسالة وصلت أثناء إغلاق
+    // التطبيق تنتقل من ✓ إلى ✓✓ حتى لو تأخّر/فُقد إشعارها.
+    safeAsync("enterApp:delivered-sweep", () => sweepDeliveredMessages({ force: true }));
   }
 
   updateUnreadTotals();
 }
 
+/**
+ * نبضة "آخر ظهور" الخاصة بي.
+ *
+ * ملاحظة مهمة: للمشرفين لا تُرسَل حالة "غير متصل" إطلاقاً — حضور المشرف
+ * ثابت في الواجهة وفي قاعدة البيانات (يُفرض بمُشغِّل على الجدول أيضاً)،
+ * فلا يقطع "متصل الآن" عند المستخدم العادي بسبب سكون متصفح المشرف.
+ */
 async function touchLastSeen(online) {
   if (!state.me || !state.isOnline) return;
+  if (!online && state.me.is_admin) return;
 
   await safeQuery("touchLastSeen", () =>
     supabase
@@ -575,6 +595,10 @@ function startContactsRefreshLoop() {
     // الخلفية أصلاً إلى نبضة/دقيقة، والاستعلام الثقيل كل 3 ثوانٍ هناك كان
     // يستهلك البطارية ويزيد احتمال تجميد التبويب من قِبَل المتصفح).
     state.contactsRefreshInterval = setTimeout(tick, hidden ? 60000 : 5000);
+
+    // أثناء الخفاء: أعد تثبيت حضور المشرفين دورياً حتى تبقى الحالة صحيحة
+    // عند أي إعادة رسم أو مزامنة تحدث في الخلفية.
+    if (hidden) noteAdminPresenceOnline();
 
     if (!state.me || !state.isOnline || state.contactsRefreshInFlight) return;
     // أثناء مكالمة جارية لا نُثقل الشبكة/المعالج بمزامنة غير ضرورية
@@ -662,6 +686,8 @@ async function runCatchUpSync(reason = "resume", { force = false, light = false 
 
   await safeAsync(`catchup:${reason}`, async () => {
     await flushPendingReads();
+    // علّم كل ما وصل إلينا فعلاً كـ"مُسلَّم" (✓✓ رمادي عند المرسل)
+    await sweepDeliveredMessages();
 
     // تحقّق من تحديثات Service Worker (بما فيها worker الإشعارات) — مرة/ساعة
     refreshServiceWorker();
@@ -679,7 +705,11 @@ async function runCatchUpSync(reason = "resume", { force = false, light = false 
     if (state.activeConversation) {
       const id = state.activeConversation.id;
       await loadMessages(id, { silent: true });
-      await markConversationRead(id, { force: true });
+      // ما وصل أثناء الانقطاع يُثبَّت كـ"مُسلَّم"، والقراءة فقط إن كانت الشاشة مرئية
+      await markMessagesDelivered(id, { force: true });
+      if (document.visibilityState === "visible") {
+        await markConversationRead(id, { force: true });
+      }
     }
 
     await loadContacts();
@@ -690,6 +720,9 @@ async function runCatchUpSync(reason = "resume", { force = false, light = false 
 /** نبضة keepalive عند إغلاق الصفحة — تُبقي "آخر ظهور" صحيحاً */
 function updatePresenceOfflineBeacon() {
   try {
+    // المشرف لا يُعلَن "غير متصل" أبداً
+    if (state.me?.is_admin) return;
+
     const session = JSON.parse(localStorage.getItem("wa_browser_session") || "null");
     const token = session?.access_token;
     if (!token || !state.me?.id) return;
@@ -1452,6 +1485,48 @@ function handleDeepLinks() {
   if (peekPendingRoute()) flushPendingRoutes();
 }
 
+/**
+ * هل هذا الطرف مشرف؟ يُستخدم لتثبيت حالة "متصل الآن" وإظهارها دائماً.
+ *
+ * الشرط يشمل أكثر من مسار حتى لا تعتمد النتيجة على اكتمال حقل واحد:
+ *   • البريد مطابق لقائمة المشرفين الثابتة في js/config.js (ADMINS)
+ *   • أو حقل is_admin / is_super_admin في الملف الشخصي
+ *   • أو بيانات المحادثة القائمة (نفس الحقول)
+ */
+function isAdminContact(id, profile = null) {
+  const candidate = profile || state.contacts?.find((c) => c.id === id) || null;
+  const email = String(candidate?.email || "").toLowerCase().trim();
+
+  if (email && ADMINS.some((a) => String(a.email).toLowerCase() === email)) return true;
+  if (candidate?.is_admin || candidate?.is_super_admin) return true;
+
+  const known = state.contacts?.find((c) => c.id === id);
+  if (known?.is_admin || known?.is_super_admin) return true;
+  if (!candidate && !known && !id) return false;
+
+  // المشرفون في هذا التطبيق هم أصحاب الحسابات المعلَّمة في قاعدة البيانات؛
+  // إن غاب الحقل تماماً نعتبره مشرفاً إن كان ضمن قسم المشرفين المعروض.
+  if (candidate && (candidate._isAdminSection || candidate._adminSection)) return true;
+  if (id && state.adminContacts?.some?.((c) => c.id === id)) return true;
+
+  return false;
+}
+
+/**
+ * تثبيت حضور المشرفين في خريطة الحضور الحالية.
+ * يُستدعى قبل كل رسم/مزامنة حتى لا تُسقط أي مزامنة (تحديث دوري، عودة من
+ * الخلفية، إعادة اتصال) حالة "متصل الآن" التي يراها المستخدم العادي.
+ */
+function noteAdminPresenceOnline() {
+  (state.contacts || []).forEach((c) => {
+    if (c?.id && isAdminContact(c.id, c)) state.onlineMap[c.id] = true;
+  });
+  if (state.activeConversation?.otherProfile) {
+    const peer = state.activeConversation.otherProfile;
+    if (peer?.id && isAdminContact(peer.id, peer)) state.onlineMap[peer.id] = true;
+  }
+}
+
 /** يحذف الصورة الشخصية أو خلفية الدردشة من الملف الشخصي */
 async function removeProfileMedia(field) {
   if (!state.me) return;
@@ -1959,6 +2034,9 @@ async function loadContactsFromNetwork() {
     // المشرفون الذين يملكون محادثات المستخدمين في وضع السوبر أدمن قد يتكرّرون — لا مشكلة، القائمة منفصلة
     userContacts.sort(sortByLatestInteraction);
 
+    // قبل أي رسم: ثبّت حضور المشرفين، فلا تُسقط أي مزامنة "متصل الآن"
+    noteAdminPresenceOnline();
+
     $("#admins-section").innerHTML = "";
     const adminsFrag = document.createDocumentFragment();
     adminContacts.forEach((c) => {
@@ -2206,9 +2284,14 @@ function buildContactRow(c, opts) {
       .trim()
       .charAt(0);
 
+  // المشرف يظهر "متصل الآن" دائماً وثابتاً (نقطة خضراء) — لا يعتمد على
+  // نجاح نبضة الحضور ولا على ظهوره في قناة الحضور.
+  const adminPeer = isAdminContact(c.id, c);
+  if (adminPeer && c.id) state.onlineMap[c.id] = true;
+
   const online =
-    c.id &&
-    state.onlineMap[c.id];
+    Boolean(c.id) &&
+    Boolean(adminPeer || state.onlineMap[c.id]);
 
   row.innerHTML = `
     <div class="avatar">
@@ -3015,10 +3098,12 @@ function buildMessageBubble(m) {
       }
     );
 
+  // الحالات: pending = محفوظة محلياً (✓) | sent/delivered = وصلت السيرفر أو
+  // وصل إشعارها (✓✓ رمادي) | read = قُرئت فعلاً (✓✓ أزرق) | failed = فشل الإرسال
   const ticks =
     mine
-      ? m._pending
-        ? '<span class="ticks">🕓</span>'
+      ? m._failed || m.status === "failed"
+        ? '<span class="ticks ticks-failed" title="تعذّر الإرسال">⚠</span>'
         : renderTicks(m.status)
       : "";
 
@@ -3526,25 +3611,43 @@ function wireSwipeToReply(
   );
 }
 
+/**
+ * علامات حالة الرسالة (Ticks) — القاعدة المعتمدة:
+ *
+ *   ✓   صح واحد        : الرسالة حُفظت محلياً فقط — التطبيق أوفلاين أو في
+ *                        الخلفية بلا ارتباط (لم يستلمها السيرفر بعد).
+ *   ✓✓  صحّان رماديان  : السيرفر استلم الرسالة، أو وصل الإشعار لجهاز المستقبِل.
+ *   ✓✓  صحّان أزرقان   : الطرف الآخر فتح المحادثة وقرأ الرسالة فعلاً.
+ *
+ * الحالات التي تصل من قاعدة البيانات: sent | delivered | read
+ * والحالة المحلية الوحيدة قبل الإرسال الفعلي: pending (صندوق الصادر).
+ */
 function renderTicks(status) {
-  if (status === "read") {
+  const normalized = String(status || "").toLowerCase();
+
+  // ✓✓ أزرق: قرأها الطرف الآخر فعلاً
+  if (normalized === "read") {
     return `
-      <span class="ticks ticks-read">
+      <span class="ticks ticks-read" title="تم القراءة">
         ✓✓
       </span>
     `;
   }
 
-  if (status === "delivered") {
+  // ✓✓ رمادي: وصلت السيرفر أو وصل إشعارها إلى جهاز المستقبِل
+  if (normalized === "delivered" || normalized === "sent") {
     return `
-      <span class="ticks">
+      <span class="ticks ticks-delivered" title="${
+        normalized === "delivered" ? "تم التسليم" : "أُرسلت"
+      }">
         ✓✓
       </span>
     `;
   }
 
+  // ✓ واحد: محفوظة محلياً (أوفلاين / في الخلفية) ولم يصلها السيرفر بعد
   return `
-    <span class="ticks">
+    <span class="ticks ticks-pending" title="في انتظار الإرسال">
       ✓
     </span>
   `;
@@ -4860,8 +4963,14 @@ function subscribeToConversation(
           if (payload.new.sender_id !== state.me.id) {
             if (payload.new.message_type !== "call") playNotificationSound();
 
-            // فتح المحادثة = قراءة: صفّر العدّاد فوراً وثبّتها على الخادم
-            await markConversationRead(conversationId);
+            if (document.visibilityState === "visible") {
+              // فتح المحادثة = قراءة: صفّر العدّاد فوراً وثبّتها على الخادم
+              await markConversationRead(conversationId);
+            } else {
+              // التبويب مخفي: وصلت الرسالة إلينا فعلاً ⇒ "تم التسليم" فقط،
+              // ولا نعلن القراءة قبل أن يرى المستخدم الشاشة.
+              await markMessagesDelivered(conversationId);
+            }
           }
         },
       },
@@ -5092,6 +5201,79 @@ async function markConversationRead(conversationId, { force = false } = {}) {
   return task;
 }
 
+/**
+ * ✓✓ رمادي (تم التسليم): يثبّت أن رسائل هذه المحادثة الواردة إلينا وصلت
+ * فعلاً إلى هذا الجهاز (Realtime، أو مزامنة العودة، أو وصول إشعار FCM).
+ *
+ * لماذا نثبّتها على السيرفر؟ لأن المرسل يرى العلامات من قاعدة البيانات؛
+ * فبدون هذا التحديث تبقى رسائله على ✓ واحد رغم وصولها فعلاً.
+ */
+const deliveredRequestsInFlight = new Map();
+
+async function markMessagesDelivered(conversationId, { force = false } = {}) {
+  if (!conversationId || !state.me || !state.isOnline) return false;
+  if (!force && deliveredRequestsInFlight.has(conversationId)) {
+    return deliveredRequestsInFlight.get(conversationId);
+  }
+
+  const task = (async () => {
+    // المسار المفضّل: دالة واحدة ذرّية (migration v2.4)
+    const rpc = await safeQuery("delivered:rpc", () =>
+      supabase.rpc("mark_messages_delivered", { p_conversation_id: conversationId })
+    );
+
+    if (rpc.ok && rpc.data !== null && rpc.data !== undefined) return true;
+
+    // مسار احتياطي: تحديث مباشر لا يمسّ إلا الرسائل الواردة غير المسلَّمة
+    const { ok, error } = await safeQuery("delivered:update", () =>
+      supabase
+        .from("messages")
+        .update({ status: "delivered" })
+        .eq("conversation_id", conversationId)
+        .neq("sender_id", state.me.id)
+        .eq("status", "sent")
+    );
+
+    if (!ok) {
+      console.warn("[status] تعذّر تثبيت حالة التسليم:", error?.message || error);
+      return false;
+    }
+    return true;
+  })()
+    .catch(() => false)
+    .finally(() => {
+      // امنع تكرار الطلب لنفس المحادثة خلال 10 ثوانٍ (كل رسالة تُطلق الطلب)
+      setTimeout(() => deliveredRequestsInFlight.delete(conversationId), 10000);
+    });
+
+  deliveredRequestsInFlight.set(conversationId, task);
+  return task;
+}
+
+/**
+ * تصحيح جماعي لعلامات التسليم بعد أي انقطاع/سكون: أي رسالة واردة إلينا
+ * وبقيت على ✓ واحد تُعلَّم ✓✓. تُستدعى عند الدخول وعند كل مزامنة عودة.
+ */
+let lastDeliveredSweepAt = 0;
+
+async function sweepDeliveredMessages({ force = false } = {}) {
+  if (!state.me || !state.isOnline) return false;
+  if (!force && Date.now() - lastDeliveredSweepAt < 60000) return false;
+  lastDeliveredSweepAt = Date.now();
+
+  const rpc = await safeQuery("delivered:sweep", () =>
+    supabase.rpc("mark_all_messages_delivered")
+  );
+  if (rpc.ok) return true;
+
+  // مسار احتياطي (قبل تنفيذ الترقية): لكل محادثة معروفة على حدة
+  const ids = Object.keys(state.contactRowsByConversation || {});
+  for (const id of ids.slice(0, 20)) {
+    await markMessagesDelivered(id, { force: true });
+  }
+  return false;
+}
+
 /** ينفّذ عمليات القراءة المؤجّلة (بعد عودة الشبكة أو العودة للمقدمة) */
 async function flushPendingReads() {
   if (!state.me || !state.isOnline) return 0;
@@ -5179,6 +5361,16 @@ function subscribeGlobalPresence() {
             state.onlineMap[id] = true;
           });
 
+          // حضور المشرفين ثابت: نُثبّته هنا فيبقى "متصل الآن" ظاهراً عند
+          // المستخدم العادي حتى لو خرج المشرف من قناة الحضور (سكون/خلفية).
+          (state.contacts || []).forEach((c) => {
+            if (c?.id && isAdminContact(c.id, c)) state.onlineMap[c.id] = true;
+          });
+          if (state.activeConversation?.otherProfile?.id) {
+            const peer = state.activeConversation.otherProfile;
+            if (isAdminContact(peer.id, peer)) state.onlineMap[peer.id] = true;
+          }
+
           loadContacts();
           if (state.activeConversation) {
             refreshPresenceLabel(state.activeConversation.otherProfile.id);
@@ -5193,7 +5385,16 @@ function subscribeGlobalPresence() {
 
           const leftIds = leftPresences.map((presence) => presence.key).filter(Boolean);
 
-          if (leftIds.includes(state.activeConversation.otherProfile.id)) {
+          // مغادرة مشرف لقناة الحضور لا تعني أنه غير متصل: تُهمَل ولا تُغيّر
+          // الحالة الظاهرة للمستخدم العادي.
+          leftIds.forEach((id) => {
+            if (isAdminContact(id)) state.onlineMap[id] = true;
+          });
+
+          if (
+            leftIds.includes(state.activeConversation.otherProfile.id) &&
+            !isAdminContact(state.activeConversation.otherProfile.id)
+          ) {
             await refreshPresenceLabel(state.activeConversation.otherProfile.id);
           }
         },
@@ -5226,6 +5427,19 @@ async function refreshPresenceLabel(
     $("#chat-header-status");
 
   if (!label) return;
+
+  // "متصل الآن" ثابت ودائم لكل مشرف — لا يعتمد على قناة الحضور وحدها (قد
+  // تتأخر أو تُقطع نبضتها عند سكون متصفح المشرف) بل على كونه مشرفاً.
+  const peer =
+    state.activeConversation?.otherProfile ||
+    state.contacts?.find((c) => c.id === otherId) ||
+    null;
+
+  if (isAdminContact(otherId, peer)) {
+    state.onlineMap[otherId] = true;
+    label.textContent = state.t?.online || "متصل الآن";
+    return;
+  }
 
   if (
     state.onlineMap[
@@ -5354,6 +5568,9 @@ function subscribeGlobalMessageWatch() {
             state.activeConversation &&
             msg.conversation_id === state.activeConversation.id &&
             document.visibilityState === "visible";
+
+          // وصلتنا الرسالة فعلاً عبر Realtime ⇒ ✓✓ رمادي عند المرسل
+          markMessagesDelivered(msg.conversation_id);
 
           if (viewingThisThread) {
             // المستخدم يقرأ المحادثة الآن → لا شارة ولا إزعاج
@@ -6086,6 +6303,13 @@ window.__waDiagnostics = () => ({
   background: {
     watchdogRunning: Boolean(state.realtimeWatchdog),
     hiddenCatchUpRunning: Boolean(state.hiddenCatchUpTimer),
+  },
+  // حالة الحضور الظاهرة (المشرفون مثبَّتون على "متصل الآن" دائماً)
+  presence: {
+    onlineIds: Object.keys(state.onlineMap || {}),
+    adminPresenceForced: (state.contacts || [])
+      .filter((c) => isAdminContact(c.id, c))
+      .map((c) => c.id),
   },
 });
 

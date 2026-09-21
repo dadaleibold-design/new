@@ -342,7 +342,27 @@ Deno.serve(async (req) => {
       return { tokenId: row.id, ok: result.ok, status: result.status, removed: invalid };
     }));
 
-    return json({ sent: results.filter((item) => item.ok).length, total: results.length, results });
+    // ✓✓ رمادي (تم التسليم): نجاح إرسال الإشعار من السيرفر يعني أن الرسالة
+    // وصلت إلى جهاز المستلم عبر جهة الدفع — حتى لو كان التطبيق مغلقاً تماماً
+    // (وهذا هو المسار الوحيد المعروف في هذه الحالة، إذ لا يستطيع Service Worker
+    //  الكتابة في قاعدة البيانات بلا جلسة مصادقة). يبقى التحديث محصوراً في
+    // الحالة 'sent' فلا يُنقص أبداً حالة 'read' أو 'delivered' أحدث.
+    const delivered = results.some((item) => item.ok);
+    if (delivered) {
+      const { error: deliveredError } = await supabase
+        .from("messages")
+        .update({ status: "delivered" })
+        .eq("id", messageId)
+        .eq("status", "sent");
+      if (deliveredError) console.warn("mark delivered failed:", deliveredError.message);
+    }
+
+    return json({
+      sent: results.filter((item) => item.ok).length,
+      total: results.length,
+      delivered,
+      results,
+    });
   } catch (error) {
     console.error("send-push failed", error);
     return json({ error: error instanceof Error ? error.message : String(error) }, 500);
