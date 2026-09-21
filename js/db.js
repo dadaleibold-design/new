@@ -1,5 +1,5 @@
 const DB_NAME = "wa_clone_db";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORES = {
   messages: "messages",
   conversations: "conversations",
@@ -95,6 +95,11 @@ export async function cacheMessages(conversationId, messages) {
   return tx(STORES.messages, "readwrite", (store) => {
     messages.forEach((m) => store.put(m));
   });
+}
+
+export async function removeCachedMessage(messageId) {
+  if (!messageId) return null;
+  return tx(STORES.messages, "readwrite", (store) => store.delete(messageId));
 }
 
 export async function getCachedMessages(conversationId) {

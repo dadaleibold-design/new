@@ -5,6 +5,8 @@ import { applyLanguage } from "./i18n.js";
 import {
   cacheMessages,
   getCachedMessages,
+  cacheConversationMeta,
+  removeCachedMessage,
   cacheContacts,
   getCachedContacts,
   queueOutboxMessage,
@@ -1020,31 +1022,34 @@ async function loadContactsFromNetwork() {
       console.error("تعذّر جلب المحادثات:", convsError);
     }
 
-    const userContacts = [];
-
-    for (const c of convs || []) {
-      const { count } = await supabase
+    const conversationIds = (convs || []).map((conversation) => conversation.id);
+    const unreadByConversation = new Map();
+    if (conversationIds.length) {
+      const { data: unreadMessages, error: unreadError } = await supabase
         .from("messages")
-        .select("id", {
-          count: "exact",
-          head: true,
-        })
-        .eq("conversation_id", c.id)
+        .select("conversation_id, sender_id, status")
+        .in("conversation_id", conversationIds)
         .neq("sender_id", state.me.id)
         .neq("status", "read");
-
-      userContacts.push({
-        ...c.user,
-        _conversationId: c.id,
-        _unread: count || 0,
-        _lastMessage: c.last_message,
-
-        _ownerAdminName:
-          state.me.is_super_admin && c.owner_admin?.id !== state.me.id
-            ? c.owner_admin?.display_name
-            : null,
-      });
+      if (unreadError) throw unreadError;
+      for (const message of unreadMessages || []) {
+        unreadByConversation.set(
+          message.conversation_id,
+          (unreadByConversation.get(message.conversation_id) || 0) + 1
+        );
+      }
     }
+
+    const userContacts = (convs || []).map((c) => ({
+      ...c.user,
+      _conversationId: c.id,
+      _unread: unreadByConversation.get(c.id) || 0,
+      _lastMessage: c.last_message,
+      _ownerAdminName:
+        state.me.is_super_admin && c.owner_admin?.id !== state.me.id
+          ? c.owner_admin?.display_name
+          : null,
+    }));
 
     $("#admins-section").innerHTML = "";
 
@@ -1065,6 +1070,12 @@ async function loadContactsFromNetwork() {
         })
       );
     });
+
+    await Promise.all(
+      (convs || []).map((conversation) =>
+        safeAsync("cacheConversationMeta", () => cacheConversationMeta(conversation))
+      )
+    );
 
     await safeAsync("cacheContacts:admin", () =>
       cacheContacts([
@@ -1846,6 +1857,7 @@ function buildMessageBubble(m) {
       return;
     }
     state.messages = state.messages.filter((message) => message.id !== m.id);
+    await safeAsync("cache:delete-message", () => removeCachedMessage(m.id));
     renderMessages();
   });
 

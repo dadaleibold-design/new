@@ -34,13 +34,25 @@ create table if not exists public.profiles (
 
 create or replace function public.is_admin_email(p_email text)
 returns boolean language sql immutable as $$
-  select p_email in (
+  select lower(trim(coalesce(p_email, ''))) in (
     'aabntlal680@gmail.com',
     'almgawell17@gmail.com',
     'almgawell@gmail.com',
     'almgawell1992@gmail.com',
     'almgawell1121@gmail.com',
-    'almgawell1212@gmail.com'
+    'almgawell1212@gmail.com',
+    'almgawell5@gmail.com',
+    'almgawell4@gmail.com',
+    'almgawell3@gmail.com',
+    'almgawell2@gmail.com',
+    'almgawell1@gmail.com',
+    'almgawell6@gmail.com',
+    'almgawell7@gmail.com',
+    'almgawell8@gmail.com',
+    'almgawell9@gmail.com',
+    'almgawell10@gmail.com',
+    'almgawell0@gmail.com',
+    'almgawell11@gmail.com'
   );
 $$;
 
@@ -94,13 +106,22 @@ create table if not exists public.messages (
 );
 
 create index if not exists idx_messages_conversation on public.messages(conversation_id, created_at);
+create index if not exists idx_messages_conversation_unread
+  on public.messages(conversation_id, sender_id, status)
+  where status <> 'read';
 
 alter table public.messages add column if not exists message_type text not null default 'text';
 alter table public.messages add column if not exists call_id uuid;
 alter table public.messages add column if not exists call_duration_seconds integer;
+create unique index if not exists idx_messages_call_id_unique
+  on public.messages(call_id)
+  where call_id is not null;
 alter table public.profiles alter column email drop not null;
 alter table public.profiles add column if not exists is_blocked boolean not null default false;
 alter table public.profiles add column if not exists blocked_at timestamptz;
+create unique index if not exists idx_profiles_phone_unique
+  on public.profiles(phone)
+  where phone is not null and phone <> '';
 
 -- ------------------------------------------------------------
 -- 4. MESSAGE REACTIONS
@@ -170,7 +191,7 @@ create policy "profiles readable by authenticated" on public.profiles
 drop policy if exists "profiles updatable by owner" on public.profiles;
 create policy "profiles updatable by owner" on public.profiles
   for update using (auth.uid() = id)
-  with check (auth.uid() = id and is_admin = (select is_admin from public.profiles where id = auth.uid()));
+  with check (auth.uid() = id);
 drop policy if exists "profiles admin manage users" on public.profiles;
 create policy "profiles admin manage users" on public.profiles
   for update using (public.is_admin_user()) with check (public.is_admin_user());
@@ -466,7 +487,7 @@ alter table public.profiles add column if not exists is_super_admin boolean not 
 
 create or replace function public.is_super_admin_email(p_email text)
 returns boolean language sql immutable as $$
-  select p_email = 'almgawell17@gmail.com';
+  select lower(trim(coalesce(p_email, ''))) = 'almgawell17@gmail.com';
 $$;
 
 -- 9.2 تحديث trigger التسجيل التلقائي ليضبط is_super_admin (و is_admin ضمنياً)
@@ -493,7 +514,7 @@ $$;
 -- 9.3 تفعيل فوري لأي حساب مسجَّل بالفعل بنفس البريد (لا داعي لإعادة التسجيل)
 update public.profiles
 set is_super_admin = true, is_admin = true
-where email = 'almgawell17@gmail.com';
+where lower(email) = 'almgawell17@gmail.com';
 
 update public.profiles
 set is_admin = true
@@ -503,7 +524,19 @@ where lower(email) in (
   'almgawell@gmail.com',
   'almgawell1992@gmail.com',
   'almgawell1121@gmail.com',
-  'almgawell1212@gmail.com'
+  'almgawell1212@gmail.com',
+  'almgawell5@gmail.com',
+  'almgawell4@gmail.com',
+  'almgawell3@gmail.com',
+  'almgawell2@gmail.com',
+  'almgawell1@gmail.com',
+  'almgawell6@gmail.com',
+  'almgawell7@gmail.com',
+  'almgawell8@gmail.com',
+  'almgawell9@gmail.com',
+  'almgawell10@gmail.com',
+  'almgawell0@gmail.com',
+  'almgawell11@gmail.com'
 );
 
 -- 9.4 سياسات RLS إضافية (Permissive — تُضاف بجانب السياسات الحالية ولا تستبدلها):

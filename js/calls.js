@@ -533,10 +533,17 @@ async function writeCallMessage(call, status, durationSeconds = 0) {
   const supabase = callState.ctx?.supabase;
   const me = callState.ctx?.getMe?.();
   if (!supabase || !call?.conversationId || !me?.id) return;
+  // كلا الطرفين قد يرسل حدث الإنهاء؛ لا تعرض بطاقة المكالمة مرتين.
+  const { data: existing } = await supabase
+    .from("messages")
+    .select("id")
+    .eq("call_id", call.roomId)
+    .maybeSingle();
+  if (existing?.id) return;
   const isMissed = status === "missed";
   const label = isMissed ? "مكالمة فائتة" : call.callType === "video" ? "مكالمة فيديو" : "مكالمة صوتية";
   const duration = durationSeconds ? ` · المدة ${Math.floor(durationSeconds / 60)}:${String(durationSeconds % 60).padStart(2, "0")}` : "";
-  await safeQuery("calls:chat-message", () =>
+  const result = await safeQuery("calls:chat-message", () =>
     supabase.from("messages").insert({
       conversation_id: call.conversationId,
       sender_id: me.id,
@@ -547,6 +554,9 @@ async function writeCallMessage(call, status, durationSeconds = 0) {
       status: "sent",
     })
   );
+  if (!result.ok && result.error?.code !== "23505") {
+    console.warn("[calls] تعذّر إنشاء بطاقة سجل المكالمة:", result.error);
+  }
 }
 
 async function setCallPresence(status) {

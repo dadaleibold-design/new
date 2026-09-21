@@ -5,8 +5,8 @@ export async function signUp({ email, password, displayName, phone }) {
   const normalizedEmail = email?.trim().toLowerCase() || "";
   const normalizedPhone = phone?.trim() || "";
 
-  if (!normalizedPhone && !normalizedEmail) {
-    throw new Error("أدخل رقم الهاتف للتسجيل، أو بريد مشرف معتمد.");
+  if (!normalizedPhone) {
+    throw new Error("رقم الهاتف مطلوب لإنشاء حساب مستخدم.");
   }
   if (normalizedEmail && !isAdminEmail(normalizedEmail)) {
     throw new Error("البريد الإلكتروني مخصص للمشرفين المعتمدين فقط.");
