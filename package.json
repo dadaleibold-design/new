@@ -3,5 +3,11 @@
     "agora-rtc-sdk-ng": "^4.24.8",
     "eslint": "^9.39.5",
     "jsdom": "^24.1.3"
+  },
+  "scripts": {
+    "test": "node tests/smoke.mjs user && node tests/smoke.mjs admin && node tests/smoke.mjs super && node tests/notification-flow.mjs",
+    "test:flow": "node tests/notification-flow.mjs",
+    "lint": "eslint --config tests/eslint.config.mjs js/ *.js",
+    "check": "bash tests/check-app.sh && npm run lint"
   }
 }

@@ -1538,6 +1538,31 @@ language sql stable security invoker set search_path = public as $$
 $$;
 grant execute on function public.unread_counts(uuid[]) to authenticated;
 
+-- تصفير "غير المقروء" لمحادثة كاملة في طلب واحد (تُستخدم عند فتح المحادثة
+-- فوراً من نقرة إشعار). تُعيد عدد الرسائل التي تحوّلت إلى مقروءة — تثبيت
+-- ذرّي أدق من UPDATE من العميل، ويسهّل تشخيص فشل RLS.
+create or replace function public.mark_conversation_read(p_conversation_id uuid)
+returns integer
+language plpgsql security invoker set search_path = public as $$
+declare
+  v_count integer := 0;
+begin
+  if auth.uid() is null then
+    raise exception 'not authenticated';
+  end if;
+
+  update public.messages m
+     set status = 'read'
+   where m.conversation_id = p_conversation_id
+     and m.sender_id <> auth.uid()
+     and (m.status is null or m.status <> 'read');
+
+  get diagnostics v_count = row_count;
+  return coalesce(v_count, 0);
+end;
+$$;
+grant execute on function public.mark_conversation_read(uuid) to authenticated;
+
 -- (ج) --------------------------------------------------------
 -- أي رسالة جديدة (نص/مرفق/مكالمة) تحدّث آخر تفاعل للمحادثة، حتى إن لم يحدّثها العميل
 create or replace function public.touch_conversation_on_message()
