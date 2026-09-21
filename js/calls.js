@@ -852,6 +852,8 @@ export async function startCall(callType = "audio") {
   setCallStatus(callType === "video" ? "جارٍ الاتصال بالفيديو..." : "جارٍ الاتصال...");
   setOverlayVisible(true);
   updateControlsForType(callType);
+  // تبدأ المكالمة من نقرة مستخدم، لذلك يسمح المتصفح بتشغيل النغمة هنا.
+  playRingtone();
 
   const roomCreated = await persistCallRoom({
     roomId,
@@ -1044,6 +1046,7 @@ function handlePeerAccepted(payload) {
   callState.current.connected = true;
   callState.current.startedAt = Date.now();
   clearTimeout(callState.ringTimer);
+  stopRingtone();
   setCallStatus("متصل");
   startDurationTimer();
   updateCallRoom(payload.roomId, {

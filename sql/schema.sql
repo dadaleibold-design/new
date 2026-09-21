@@ -660,6 +660,24 @@ alter table public.call_logs
 create index if not exists idx_call_logs_room on public.call_logs(room_id, created_at);
 create index if not exists idx_call_logs_user on public.call_logs(user_id, created_at desc);
 
+-- 10.3.1 إخفاء سجل المكالمة لكل مستخدم دون حذف السجل المشترك للطرف الآخر
+create table if not exists public.call_history_hidden (
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  room_id uuid not null references public.call_rooms(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, room_id)
+);
+alter table public.call_history_hidden enable row level security;
+drop policy if exists "call history hidden own select" on public.call_history_hidden;
+create policy "call history hidden own select" on public.call_history_hidden
+  for select using (user_id = auth.uid());
+drop policy if exists "call history hidden own insert" on public.call_history_hidden;
+create policy "call history hidden own insert" on public.call_history_hidden
+  for insert with check (user_id = auth.uid());
+drop policy if exists "call history hidden own delete" on public.call_history_hidden;
+create policy "call history hidden own delete" on public.call_history_hidden
+  for delete using (user_id = auth.uid());
+
 -- 10.4 دالة مساعدة: هل المستخدم الحالي طرف في هذه الغرفة؟
 --      SECURITY DEFINER + search_path مثبّت لمنع أي التفاف على الصلاحيات.
 create or replace function public.is_call_participant(p_room_id uuid)

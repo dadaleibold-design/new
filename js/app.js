@@ -576,12 +576,46 @@ async function openCallHistory() {
     list.textContent = "تعذّر تحميل سجل المكالمات.";
     return;
   }
-  list.innerHTML = (data || []).map((call) => {
+  const { data: hiddenRows, error: hiddenError } = await supabase
+    .from("call_history_hidden")
+    .select("room_id")
+    .eq("user_id", state.me.id);
+  if (hiddenError) {
+    list.textContent = "تعذّر تحميل إعدادات سجل المكالمات.";
+    return;
+  }
+  const hiddenIds = new Set((hiddenRows || []).map((row) => row.room_id));
+  const visibleCalls = (data || []).filter((call) => !hiddenIds.has(call.id));
+  list.innerHTML = visibleCalls.map((call) => {
     const peer = call.caller_id === state.me.id ? call.callee?.display_name : call.caller?.display_name;
     const date = new Date(call.created_at).toLocaleString(state.lang === "ar" ? "ar-SA" : "en-US");
     const status = call.status === "missed" ? "مكالمة فائتة" : call.status === "declined" ? "مرفوضة" : call.status === "active" || call.status === "ended" ? "مكتملة" : call.status;
-    return `<div class="call-history-row"><strong>${escapeHtml(peer || "مستخدم")}</strong><span>${call.call_type === "video" ? "فيديو" : "صوت"} · ${escapeHtml(status)}</span><time>${escapeHtml(date)}</time></div>`;
+    const duration = Number(call.duration_seconds || 0);
+    const durationLabel = duration ? ` · ${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, "0")}` : "";
+    const statusClass = call.status === "missed" ? "missed" : call.status === "declined" ? "declined" : "completed";
+    return `<div class="call-history-row ${statusClass}" data-call-row="${escapeHtml(call.id)}">
+      <div class="call-history-main"><strong>${escapeHtml(peer || "مستخدم")}</strong><span>${call.call_type === "video" ? "فيديو" : "صوت"} · ${escapeHtml(status)}${durationLabel}</span></div>
+      <button class="call-history-delete" type="button" data-call-delete="${escapeHtml(call.id)}" title="حذف من سجلي" aria-label="حذف المكالمة">🗑️</button>
+      <time>${escapeHtml(date)}</time>
+    </div>`;
   }).join("") || "لا توجد مكالمات بعد.";
+  list.querySelectorAll("[data-call-delete]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const roomId = button.dataset.callDelete;
+      if (!roomId || !window.confirm("حذف هذه المكالمة من سجلك؟")) return;
+      button.disabled = true;
+      const { error: deleteError } = await supabase
+        .from("call_history_hidden")
+        .insert({ user_id: state.me.id, room_id: roomId });
+      if (deleteError && deleteError.code !== "23505") {
+        button.disabled = false;
+        showAuthError("تعذّر حذف المكالمة من السجل.");
+        return;
+      }
+      button.closest("[data-call-row]")?.remove();
+      if (!list.querySelector("[data-call-row]")) list.textContent = "لا توجد مكالمات بعد.";
+    });
+  });
 }
 
 /** يحذف الصورة الشخصية أو خلفية الدردشة من الملف الشخصي */
