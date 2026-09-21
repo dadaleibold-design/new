@@ -1626,10 +1626,15 @@ begin
   from public.conversations where user_id = p_user_id or admin_id = p_user_id;
 
   -- 1) ملفات التخزين (صور/صوتيات/مرفقات/أفاتار/خلفيات) المخزّنة تحت مجلد المستخدم
-  delete from storage.objects
-  where bucket_id in ('attachments', 'avatars', 'wallpapers')
-    and (owner = p_user_id or name like p_user_id::text || '/%');
-  get diagnostics v_n = row_count; v_counts := v_counts || jsonb_build_object('storage_objects', v_n);
+  --    (داخل كتلة محمية: نقص صلاحية على storage لا يجب أن يُفشل حذف الحساب)
+  begin
+    delete from storage.objects
+    where bucket_id in ('attachments', 'avatars', 'wallpapers')
+      and (owner = p_user_id or name like p_user_id::text || '/%');
+    get diagnostics v_n = row_count; v_counts := v_counts || jsonb_build_object('storage_objects', v_n);
+  exception when others then
+    v_counts := v_counts || jsonb_build_object('storage_objects', 0, 'storage_warning', sqlerrm);
+  end;
 
   -- 2) بيانات المحادثات (تفاعلات ← رسائل ← كتابة ← غرف/سجلات مكالمات ← محادثات)
   delete from public.message_reactions where user_id = p_user_id
@@ -1657,17 +1662,26 @@ begin
 
   -- 4) الملف الشخصي ثم حساب المصادقة (يمنع تسجيل الدخول مجدداً)
   delete from public.profiles where id = p_user_id;
-  delete from auth.users where id = p_user_id;
-  get diagnostics v_n = row_count; v_counts := v_counts || jsonb_build_object('auth_user', v_n);
+  begin
+    delete from auth.users where id = p_user_id;
+    get diagnostics v_n = row_count; v_counts := v_counts || jsonb_build_object('auth_user', v_n);
+  exception when others then
+    -- نقص صلاحية على auth.users: الحساب حُذف من التطبيق لكن يبقى في Auth؛ احذفه من لوحة Supabase
+    v_counts := v_counts || jsonb_build_object('auth_user', 0, 'auth_warning', sqlerrm);
+  end;
 
   return v_counts;
 end;
 $$;
 revoke all on function public.admin_delete_user(uuid) from public, anon;
 grant execute on function public.admin_delete_user(uuid) to authenticated;
--- مالك الدالة (postgres) يملك صلاحية auth.users و storage.objects في Supabase؛
--- إن ظهر خطأ permission denied for table users نفّذ:
---   grant delete on auth.users to postgres;  (أو شغّل السكربت من SQL Editor كمالك)
+-- تأكد من صلاحيات مالك الدالة (postgres) على auth.users و storage.objects
+do $$
+begin
+  begin execute 'grant delete, select on auth.users to postgres'; exception when others then null; end;
+  begin execute 'grant delete, select on storage.objects to postgres'; exception when others then null; end;
+end $$;
+alter function public.admin_delete_user(uuid) owner to postgres;
 
 -- سياسات الحذف على المستوى المباشر (المشرفون فقط) — تكميلية للدالة
 drop policy if exists "messages delete by admins" on public.messages;

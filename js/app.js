@@ -1774,7 +1774,13 @@ function buildContactRow(c, opts) {
           showAuthError(`تم الحذف: ${deleted.messages ?? 0} رسالة، ${deleted.conversations ?? 0} محادثة، ${deleted.call_rooms ?? 0} مكالمة، ${deleted.storage_objects ?? 0} ملف`);
         }
         if (error) {
-          showAuthError("تعذّر حذف المستخدم — تأكد من تطبيق sql/schema.sql وصلاحيات المشرف.");
+          console.error("admin_delete_user failed:", error);
+          const detail = error.message || error.details || error.code || "";
+          showAuthError(
+            /PGRST202|schema cache/i.test(detail)
+              ? "دالة admin_delete_user غير موجودة — نفّذ sql/migrations/2026-09-21_v2_2_admin_delete_push.sql"
+              : `تعذّر حذف المستخدم: ${detail}`
+          );
           return;
         }
         row.remove();
