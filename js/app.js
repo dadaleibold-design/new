@@ -762,8 +762,20 @@ function wireChrome() {
       log(null, "١) المسار المباشر: التطبيق → send-push → FCM…");
       const r = await sendTestNotification();
       log(r.sent > 0, `السيرفر أرسل إلى ${r.sent}/${r.total} جهاز عبر FCM`);
-      const dead = (r.results || []).filter((x) => !x.ok).length;
-      if (dead) log(null, `حُذف ${dead} توكن قديم/ميت تلقائياً`);
+      const failed = (r.results || []).filter((x) => !x.ok);
+      if (r.sent > 0 && failed.length) log(null, `حُذف ${failed.length} توكن قديم/ميت تلقائياً`);
+      if (r.sent === 0 && failed.length) {
+        const e = failed[0].error || "";
+        if (/SENDER_ID_MISMATCH|mismatched/i.test(e)) {
+          log(false, "FCM: SENDER_ID_MISMATCH — مفتاح VAPID أو appId في push.js لا يخص مشروع Firebase الذي يملك Service Account في send-push");
+        } else if (/INVALID_ARGUMENT|not a valid FCM/i.test(e)) {
+          log(false, "FCM: التوكن غير صالح — غالباً مفتاح VAPID (Web Push certificate) لا يطابق مشروع Firebase؛ انسخه من Cloud Messaging → Web configuration");
+        } else if (/UNREGISTERED/i.test(e)) {
+          log(false, "FCM: التوكن ملغى — اضغط «تفعيل إشعارات الجهاز» لإصدار توكن جديد ثم أعد الاختبار");
+        } else {
+          log(false, `FCM: ${e.slice(0, 200)}`);
+        }
+      }
 
       log(null, "٢) مسار الخلفية: قاعدة البيانات → pg_net → send-push (نفس مسار الرسائل الحقيقية)…");
       try {
@@ -786,7 +798,7 @@ function wireChrome() {
             log(false, "لم يصل رد من send-push خلال 10 ثوانٍ (timeout) — تحقق أن الرابط في Vault صحيح");
           } else if (res.status_code === 200) {
             log(true, `قاعدة البيانات وصلت إلى send-push بنجاح (200): ${res.response || ""}`);
-          } else if (res.status_code === 401 && /NO_AUTH_HEADER|Missing authorization/i.test(res.response || "")) {
+          } else if (res.status_code === 401 && /NO_AUTH_HEADER|Missing authorization|INVALID_JWT_FORMAT|Bearer/i.test(res.response || "")) {
             log(false, "401 من بوابة Supabase (وليس من الدالة): انشر الدالة بـ --no-verify-jwt ونفّذ migration v2.4 (يضيف ترويسة Authorization)");
           } else if (res.status_code === 401) {
             log(false, "401 من send-push: قيمة SEND_PUSH_SECRET في Vault لا تطابق سر الدالة — وحّدهما ثم أعد النشر");

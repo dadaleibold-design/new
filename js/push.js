@@ -350,7 +350,10 @@ export async function sendTestNotification() {
     body: JSON.stringify({ type: "test" }),
   });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const detail = json?.error || json?.results?.find?.((r) => !r.ok)?.error || json?.message || "";
+    throw new Error(`HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
+  }
   return json;
 }
 

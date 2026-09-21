@@ -1806,7 +1806,11 @@ begin
   if coalesce(v_auth, '') = '' then
     select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_SERVICE_ROLE_KEY' limit 1;
   end if;
-  if coalesce(v_auth, '') = '' then v_auth := v_secret; end if;
+  -- احتياط أخير: مفتاح anon الخاص بالمشروع (عام بطبيعته) — يجب أن يكون JWT صالحاً
+  -- وإلا ترفضه البوابة بـ UNAUTHORIZED_INVALID_JWT_FORMAT
+  if coalesce(v_auth, '') = '' or v_auth !~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' then
+    v_auth := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdxb2NhdnZoaGZ3Z2t6c2Nyam1zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2MzE2MDMsImV4cCI6MjEwNDIwNzYwM30.x4HxOcAiusptsdflVje61wY8t9IfMOAGsCdUg3pIGaQ';
+  end if;
 
   if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
     insert into public.push_delivery_log(kind, ref_id, recipient_id, note)

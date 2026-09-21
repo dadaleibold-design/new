@@ -161,7 +161,8 @@ Deno.serve(async (req) => {
         return { ok: result.ok, status: result.status, removed: invalid, error: result.ok ? undefined : errorText.slice(0, 300) };
       }));
       const sent = results.filter((r) => r.ok).length;
-      return json({ sent, total: results.length, results }, sent ? 200 : 502);
+      const firstError = results.find((r) => !r.ok)?.error;
+      return json({ sent, total: results.length, results, error: sent ? undefined : `FCM رفض كل التوكنات: ${firstError || "unknown"}` }, 200);
     }
 
     if (!isAuthorized(req)) return json({ error: "Unauthorized: x-send-push-secret does not match SEND_PUSH_SECRET" }, 401);
