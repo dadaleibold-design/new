@@ -752,16 +752,52 @@ function wireChrome() {
           log(!!diag.trigger_messages, "Trigger الرسائل " + (diag.trigger_messages ? "موجود" : "مفقود"));
           log(Number(diag.my_tokens) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag.my_tokens}`);
           const last = (diag.last_log || [])[0];
-          if (last?.note) log(false, "آخر محاولة إرسال: " + last.note);
+          if (last?.note) log(false, "آخر محاولة إرسال من الـ Trigger: " + last.note);
+          else if (last?.status_code && last.status_code !== 200) log(false, `آخر رد لـ send-push على الـ Trigger: HTTP ${last.status_code} ${last.response || ""}`);
+          else if (last?.status_code === 200) log(true, "آخر استدعاء للـ Trigger نجح (200)");
         }
       } catch {
         /* تجاهل */
       }
-      log(null, "استدعاء دالة send-push على السيرفر…");
+      log(null, "١) المسار المباشر: التطبيق → send-push → FCM…");
       const r = await sendTestNotification();
       log(r.sent > 0, `السيرفر أرسل إلى ${r.sent}/${r.total} جهاز عبر FCM`);
-      (r.results || []).filter((x) => !x.ok).forEach((x) => log(false, `FCM: ${x.error || x.status}`));
-      log(null, "أغلق التطبيق الآن — يجب أن يصلك إشعار «الإشعارات تعمل».");
+      const dead = (r.results || []).filter((x) => !x.ok).length;
+      if (dead) log(null, `حُذف ${dead} توكن قديم/ميت تلقائياً`);
+
+      log(null, "٢) مسار الخلفية: قاعدة البيانات → pg_net → send-push (نفس مسار الرسائل الحقيقية)…");
+      try {
+        const { data: probe, error: probeErr } = await supabase.rpc("push_probe");
+        if (probeErr) {
+          log(false, "دالة push_probe غير موجودة — نفّذ migration v2.3");
+        } else if (!probe?.request_id) {
+          log(false, "الـ Trigger لم يستطع استدعاء pg_net — راجع SEND_PUSH_URL/SECRET في Vault");
+        } else {
+          let res = null;
+          for (let i = 0; i < 8; i += 1) {
+            await new Promise((ok) => setTimeout(ok, 1200));
+            const { data } = await supabase.rpc("push_probe_result", { p_request_id: probe.request_id });
+            if (data && !data.pending) {
+              res = data;
+              break;
+            }
+          }
+          if (!res) {
+            log(false, "لم يصل رد من send-push خلال 10 ثوانٍ (timeout) — تحقق أن الرابط في Vault صحيح");
+          } else if (res.status_code === 200) {
+            log(true, `قاعدة البيانات وصلت إلى send-push بنجاح (200): ${res.response || ""}`);
+          } else if (res.status_code === 401) {
+            log(false, "401 من send-push: قيمة SEND_PUSH_SECRET في Vault لا تطابق سر الدالة — وحّدهما ثم أعد النشر");
+          } else if (res.status_code === 404) {
+            log(false, "404: SEND_PUSH_URL في Vault خاطئ — يجب أن يكون https://<ref>.supabase.co/functions/v1/send-push");
+          } else {
+            log(false, `رد غير متوقع من send-push: ${res.status_code || res.error} ${res.response || ""}`);
+          }
+        }
+      } catch (err) {
+        log(false, "فشل المسبار: " + (err?.message || err));
+      }
+      log(null, "أغلق التطبيق الآن — يجب أن يصلك إشعاران تجريبيان.");
     } catch (err) {
       const m = err?.message || String(err);
       if (/404|not found/i.test(m)) {
@@ -1494,6 +1530,7 @@ async function loadContactsFromNetwork() {
         };
       })
       .sort(sortByLatestInteraction);
+    state.staffIds = new Set(state.contacts.map((a) => a.id));
 
     $("#contact-list").innerHTML = "";
 
@@ -1531,25 +1568,43 @@ async function loadContactsFromNetwork() {
       .from("conversations")
       .select(
         state.me.is_super_admin
-          ? "*, user:profiles!conversations_user_id_fkey(*), owner_admin:profiles!conversations_admin_id_fkey(*)"
+          ? "*, user:profiles!conversations_user_id_fkey(*), owner_admin:profiles!conversations_admin_id_fkey(id, display_name, avatar_url)"
           : "*, user:profiles!conversations_user_id_fkey(*)"
       )
       .order("last_message_at", {
         ascending: false,
+        nullsFirst: false,
       });
 
     if (!state.me.is_super_admin) {
       convsQuery = convsQuery.eq("admin_id", state.me.id);
     }
 
-    const {
+    let {
       data: convs,
       error: convsError,
     } = await convsQuery;
 
     if (convsError) {
       console.error("تعذّر جلب المحادثات:", convsError);
+      // احتياط: إن فشل الـ join المزدوج (اسم FK مختلف) اجلب بدون owner_admin
+      const fallback = await supabase
+        .from("conversations")
+        .select("*, user:profiles!conversations_user_id_fkey(*)")
+        .order("last_message_at", { ascending: false, nullsFirst: false });
+      convs = fallback.data || [];
+      convsError = fallback.error;
     }
+
+    // السوبر أدمن: اسم المشرف المالك لكل محادثة (من الـ join أو من قائمة المشرفين)
+    const adminNameById = new Map((otherAdmins || []).map((a) => [a.id, a.display_name]));
+    adminNameById.set(state.me.id, state.me.display_name);
+    (convs || []).forEach((c) => {
+      if (!c.owner_admin && c.admin_id) {
+        const name = adminNameById.get(c.admin_id);
+        if (name) c.owner_admin = { id: c.admin_id, display_name: name };
+      }
+    });
 
     const conversationIds = (convs || []).map((conversation) => conversation.id);
     const unreadByConversation = await fetchUnreadCounts(conversationIds);
@@ -1594,6 +1649,10 @@ async function loadContactsFromNetwork() {
 
     // المشرفون الذين يملكون محادثات المستخدمين في وضع السوبر أدمن قد يتكرّرون — لا مشكلة، القائمة منفصلة
     userContacts.sort(sortByLatestInteraction);
+
+    // مرجع موحّد لكل جهات الاتصال (يُستخدم لتحديد جانب الفقاعة، أسماء المرسلين، الإشعارات)
+    state.contacts = [...adminContacts, ...userContacts];
+    state.staffIds = new Set([state.me.id, ...adminContacts.map((a) => a.id)]);
 
     $("#admins-section").innerHTML = "";
     const adminsFrag = document.createDocumentFragment();
@@ -1826,12 +1885,17 @@ function formatContactTime(iso) {
 }
 
 function bumpUnreadBadge(conversationId, preview) {
+  if (state.activeConversation?.id === conversationId && document.visibilityState === "visible") {
+    return;
+  }
+
   const row =
     state.contactRowsByConversation[
       conversationId
     ];
 
   if (!row) {
+    // محادثة جديدة لم تُرسم بعد → أعد بناء القائمة (مع إزالة الارتداد)
     loadContacts();
     return;
   }
@@ -1880,6 +1944,9 @@ function bumpUnreadBadge(conversationId, preview) {
 }
 
 function clearUnreadBadge(conversationId) {
+  const contact = state.contacts.find((c) => c._conversationId === conversationId);
+  if (contact) contact._unread = 0;
+
   const row =
     state.contactRowsByConversation[
       conversationId
@@ -1980,6 +2047,8 @@ async function openConversation(otherProfile) {
     state.activeConversation = {
       id: conversationId,
       otherProfile,
+      adminId: state.me.is_admin && !otherProfile.is_admin ? state.me.id : otherProfile.is_admin ? otherProfile.id : null,
+      userId: !state.me.is_admin ? state.me.id : !otherProfile.is_admin ? otherProfile.id : null,
     };
     state.messagesHasMore = false;
     state.loadingOlder = false;
@@ -1990,6 +2059,12 @@ async function openConversation(otherProfile) {
 
     $("#chat-header-name").textContent =
       otherProfile.display_name;
+    if (otherProfile._ownerAdminName) {
+      const badge = document.createElement("span");
+      badge.className = "owner-admin-badge";
+      badge.textContent = otherProfile._ownerAdminName;
+      $("#chat-header-name").appendChild(badge);
+    }
 
     $("#chat-header-avatar").src =
       otherProfile.avatar_url || "";
@@ -1997,6 +2072,10 @@ async function openConversation(otherProfile) {
     await refreshPresenceLabel(
       otherProfile.id
     );
+
+    // صفّر العدّاد فوراً (تفاؤلياً) قبل أي نداء شبكة
+    clearUnreadBadge(conversationId);
+    closeConversationNotifications(conversationId);
 
     await loadMessages(
       conversationId
@@ -2008,13 +2087,8 @@ async function openConversation(otherProfile) {
       conversationId
     );
 
-    await markConversationRead(
-      conversationId
-    );
-
-    clearUnreadBadge(
-      conversationId
-    );
+    // علّم كمقروء في الخلفية دون تعطيل الواجهة
+    markConversationRead(conversationId);
 
     // فعّل أزرار المكالمة الآن بعد توفّر محادثة نشطة
     safeDom("open:call-buttons", () => {
@@ -2319,7 +2393,7 @@ function buildCallBubble(m) {
   row.dataset.messageId = m.id;
 
   const callerId = m.call_caller_id || m.sender_id;
-  const outgoing = callerId === state.me.id;
+  const outgoing = bubbleSideFor(callerId) === "mine";
   const isVideo = m.call_type === "video" || /فيديو/.test(m.content || "");
   const duration = Number(m.call_duration_seconds || 0);
   let status = m.call_status;
@@ -2434,18 +2508,43 @@ function messagePreviewText(m) {
   return "";
 }
 
+/**
+ * جانب الفقاعة: فقاعات المشرفين/الإدارة (بمن فيهم أنا إن كنت مشرفاً) في جهة،
+ * وفقاعات المستخدم العادي في الجهة الأخرى — حتى عندما يشاهد السوبر أدمن محادثة مشرف آخر.
+ */
+function isStaffSender(senderId) {
+  if (senderId === state.me.id) return Boolean(state.me.is_admin || state.me.is_super_admin);
+  const conv = state.activeConversation;
+  if (conv?.otherProfile?.id === senderId) {
+    return Boolean(conv.otherProfile.is_admin || conv.otherProfile.is_super_admin);
+  }
+  if (conv?.adminId && senderId === conv.adminId) return true;
+  if (conv?.userId && senderId === conv.userId) return false;
+  if (state.staffIds?.has(senderId)) return true;
+  const c = state.contacts.find((x) => x.id === senderId);
+  return Boolean(c?.is_admin || c?.is_super_admin);
+}
+
+function bubbleSideFor(senderId) {
+  const iAmStaff = Boolean(state.me.is_admin || state.me.is_super_admin);
+  const senderIsStaff = isStaffSender(senderId);
+  // "mine" = نفس فريقي (يمين للمشرفين، يمين للمستخدم عن نفسه)
+  return senderIsStaff === iAmStaff ? "mine" : "theirs";
+}
+
 function buildMessageBubble(m) {
   const mine =
     m.sender_id ===
     state.me.id;
 
+  const side = bubbleSideFor(m.sender_id);
+  const showSenderName = side === "mine" && !mine;
+
   const div =
     document.createElement("div");
 
   div.className =
-    `bubble-row ${
-      mine ? "mine" : "theirs"
-    }`;
+    `bubble-row ${side}${mine ? " own" : ""}`;
 
   div.dataset.messageId =
     m.id;
@@ -2632,8 +2731,17 @@ function buildMessageBubble(m) {
     `;
   }
 
+  const senderLabel = showSenderName
+    ? `<div class="bubble-sender">${escapeHtml(
+        (state.contacts.find((x) => x.id === m.sender_id) || state.activeConversation?.otherProfile || {}).display_name ||
+          state.activeConversation?.otherProfile?._ownerAdminName ||
+          "مشرف"
+      )}</div>`
+    : "";
+
   div.innerHTML = `
     <div class="bubble">
+      ${senderLabel}
 
       <div class="bubble-actions">
         <button
@@ -4652,17 +4760,41 @@ function subscribeInboxUpdates() {
           const row =
             payload.new;
 
-          if (
-            row &&
-            (
-              row.user_id ===
-                state.me.id ||
-              row.admin_id ===
-                state.me.id
-            )
-          ) {
-            loadContacts();
+          if (!row) return;
+
+          const involvesMe =
+            row.user_id === state.me.id ||
+            row.admin_id === state.me.id ||
+            state.me.is_super_admin;
+
+          if (!involvesMe) return;
+
+          const existing = state.contactRowsByConversation[row.id];
+          if (existing && payload.eventType === "UPDATE") {
+            // تحديث موضعي سلس: المعاينة + الوقت + النقل للأعلى، بدون إعادة رسم القائمة
+            const sub = existing.querySelector(".contact-sub");
+            if (sub && row.last_message !== undefined) sub.textContent = row.last_message || "";
+            let timeEl = existing.querySelector(".contact-time");
+            if (row.last_message_at) {
+              if (!timeEl) {
+                timeEl = document.createElement("div");
+                timeEl.className = "contact-time";
+                existing.appendChild(timeEl);
+              }
+              timeEl.textContent = formatContactTime(row.last_message_at);
+            }
+            const contact = state.contacts.find((c) => c._conversationId === row.id);
+            if (contact) {
+              contact._lastMessage = row.last_message || "";
+              contact._lastAt = row.last_message_at || contact._lastAt;
+            }
+            const parent = existing.parentElement;
+            if (parent && parent.firstElementChild !== existing) parent.prepend(existing);
+            return;
           }
+
+          // محادثة جديدة/محذوفة → إعادة بناء (مع إزالة الارتداد)
+          loadContacts();
         }
       )
       .subscribe();
@@ -4725,7 +4857,35 @@ function subscribeGlobalMessageWatch() {
           }
         }
       )
-      .subscribe();
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "messages" },
+        (payload) => {
+          // قُرئت من جهاز آخر → صفّر العدّاد هنا أيضاً
+          const msg = payload.new;
+          if (!msg || msg.status !== "read" || payload.old?.status === "read") return;
+          if (msg.sender_id === state.me.id) return;
+          const row = state.contactRowsByConversation[msg.conversation_id];
+          if (!row) return;
+          const current = parseInt(row.dataset.unread || "0", 10);
+          if (current <= 0) return;
+          const next = current - 1;
+          row.dataset.unread = String(next);
+          const badge = row.querySelector(".unread-badge");
+          if (badge) {
+            if (next <= 0) badge.remove();
+            else badge.textContent = String(next);
+          }
+        }
+      )
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("[realtime] global watch:", status, "— إعادة الاشتراك");
+          setTimeout(() => {
+            if (state.me) subscribeGlobalMessageWatch();
+          }, 2000);
+        }
+      });
 }
 
 /**

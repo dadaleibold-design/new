@@ -288,3 +288,9 @@ body[data-theme="light"] .day-separator span{background:#fff;color:#54656f}
 .contact-row:has(.unread-badge) .contact-sub{color:inherit;font-weight:600}
 
 .push-diag{margin:0;padding:10px;border-radius:10px;background:rgba(134,150,160,.12);color:inherit;font-size:12px;line-height:1.6;white-space:pre-wrap;direction:rtl;text-align:start;max-height:220px;overflow:auto}
+
+/* اسم المرسل داخل فقاعات فريق الإدارة (يظهر للسوبر أدمن عند مشاهدة رسائل مشرف آخر) */
+.bubble-sender{margin-bottom:2px;color:var(--wa-green);font-size:11.5px;font-weight:700}
+.bubble-row.mine:not(.own) .bubble{background:color-mix(in srgb,var(--wa-bubble-mine-dark) 80%,#2a3942)}
+body[data-theme="light"] .bubble-row.mine:not(.own) .bubble{background:color-mix(in srgb,var(--wa-bubble-mine-light) 85%,#fff)}
+#chat-header-name .owner-admin-badge{vertical-align:middle}

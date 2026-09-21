@@ -24,7 +24,7 @@ const CONVS_USER = [
 ];
 const UNREAD = [ {conversation_id:"c1"},{conversation_id:"c1"},{conversation_id:"c3"} ];
 const USERS_CONVS = [
-  { id:"u1", user_id:"user1", admin_id:"me", last_message:"hi", last_message_at:"2026-09-20T10:00:00Z", user:{id:"user1",display_name:"Zed"} },
+  { id:"u1", user_id:"user1", admin_id:"a2", last_message:"hi", last_message_at:"2026-09-20T10:00:00Z", user:{id:"user1",display_name:"Zed"}, owner_admin:{id:"a2",display_name:"Admin Two"} },
   { id:"u2", user_id:"user2", admin_id:"me", last_message:"yo", last_message_at:"2026-09-21T09:00:00Z", user:{id:"user2",display_name:"Amy"} },
 ];
 const calls = [];
@@ -102,6 +102,10 @@ if (ROLE === "user") {
   check("admin unread badge for Admin Two", adminRows[0].querySelector(".unread-badge")?.textContent==="1");
   const userNames = [...document.querySelectorAll("#users-section .contact-row .contact-name")].map(e=>e.textContent.trim());
   check("users sorted by latest (Amy first)", userNames[0]==="Amy", userNames.join(","));
+  if (ROLE==="super") {
+    const zed = [...document.querySelectorAll("#users-section .contact-row")].find(r=>r.querySelector(".contact-name").textContent.includes("Zed"));
+    check("super admin sees owner-admin badge next to user", zed?.querySelector(".owner-admin-badge")?.textContent.trim()==="Admin Two");
+  }
   const section = document.getElementById("admins-section");
   const toggle = document.getElementById("admins-toggle");
   check("admins toggle exists", !!toggle);
@@ -111,21 +115,34 @@ if (ROLE === "user") {
   check("toggle persisted", localStorage.getItem("wa_admins_collapsed") === (ROLE==="super" ? "0" : "1"));
   check("section header shows unread total", !!toggle.querySelector(".section-unread"));
   // open user chat and test message actions visibility
-  document.querySelector("#users-section .contact-row").click(); await wait(800);
+  const target = ROLE==="super" ? [...document.querySelectorAll("#users-section .contact-row")].find(r=>r.querySelector(".contact-name").textContent.includes("Zed")) : document.querySelector("#users-section .contact-row");
+  target.click(); await wait(800);
+  check("badge cleared instantly after opening", !target.querySelector(".unread-badge"));
+  check("chat header shows owner admin badge (super)", ROLE!=="super" || !!document.querySelector("#chat-header-name .owner-admin-badge"));
 }
 
 // ----- message actions hidden until tap -----
 const box = document.getElementById("chat-messages");
-const msgs = [
+const msgs = ROLE==="user" ? [
  {id:"m1",conversation_id:"c1",sender_id:"a1",content:"hello",message_type:"text",created_at:"2026-09-21T09:00:00Z",status:"read"},
  {id:"m2",conversation_id:"c1",sender_id:"me",content:"hi",message_type:"text",created_at:"2026-09-21T09:01:00Z",status:"read"},
+] : [
+ {id:"m1",conversation_id:"u1",sender_id:"user1",content:"hello",message_type:"text",created_at:"2026-09-21T09:00:00Z",status:"read"},
+ {id:"m2",conversation_id:"u1",sender_id:"me",content:"hi",message_type:"text",created_at:"2026-09-21T09:01:00Z",status:"read"},
+ {id:"m3",conversation_id:"u1",sender_id:"a2",content:"from admin two",message_type:"text",created_at:"2026-09-21T09:02:00Z",status:"read"},
 ];
 const convH = realtimeHandlers.filter(h=>h.opts?.table==="messages" && h.opts?.event==="INSERT" && h.opts.filter);
 check("conversation channel subscribed", convH.length>0);
 msgs.forEach(m => convH.at(-1).cb({ new:m }));
 await wait(100);
 const rowsB = [...box.querySelectorAll(".bubble-row:not(.call-row)")];
-check("2 bubbles rendered", rowsB.length===2);
+check("bubbles rendered", rowsB.length===msgs.length, String(rowsB.length));
+if (ROLE==="user") {
+  check("user: admin msg on 'theirs', own on 'mine'", rowsB[0].classList.contains("theirs") && rowsB[1].classList.contains("mine"));
+} else {
+  check("staff: user msg 'theirs', my msg 'mine', other admin msg 'mine' (same side as staff)", rowsB[0].classList.contains("theirs") && rowsB[1].classList.contains("mine") && rowsB[2].classList.contains("mine") && !rowsB[2].classList.contains("own"));
+  check("other admin's bubble shows sender name", rowsB[2].querySelector(".bubble-sender")?.textContent.trim()==="Admin Two");
+}
 check("no bubble selected initially", !box.querySelector(".bubble-row.selected"));
 const css = fs.readFileSync(path.join(ROOT,"css/style.css"),"utf8");
 check("CSS hides actions unless .selected (all roles)", /\.bubble-row \.bubble-actions,\.bubble-row:hover \.bubble-actions\{display:none !important\}/.test(css) && /\.bubble-row\.selected \.bubble-actions\{display:flex !important/.test(css) && !/\.bubble-row:has\(\.bubble-action-delete\) \.bubble-actions\{display:flex\}/.test(css));

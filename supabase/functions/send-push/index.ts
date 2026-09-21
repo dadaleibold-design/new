@@ -164,7 +164,27 @@ Deno.serve(async (req) => {
       return json({ sent, total: results.length, results }, sent ? 200 : 502);
     }
 
-    if (!isAuthorized(req)) return json({ error: "Unauthorized" }, 401);
+    if (!isAuthorized(req)) return json({ error: "Unauthorized: x-send-push-secret does not match SEND_PUSH_SECRET" }, 401);
+
+    // --- مسبار من قاعدة البيانات (Trigger path) ---
+    if (input.type === "probe") {
+      const userId = String(input.user_id || "");
+      if (!userId) return json({ error: "user_id required" }, 400);
+      const { data: tokens } = await supabase.from("fcm_tokens").select("id, token").eq("user_id", userId);
+      if (!tokens?.length) return json({ sent: 0, skipped: "no fcm token" });
+      const results = await Promise.all(tokens.map(async (row) => {
+        const r = await sendToFcm(row.token, {
+          type: "test", title: "✅ مسار الخلفية يعمل",
+          body: "وصل هذا الإشعار عبر قاعدة البيانات → send-push → FCM (نفس مسار الرسائل الحقيقية).",
+          conversationId: "",
+        }, { highPriority: true });
+        const errorText = JSON.stringify(r.details || {});
+        const invalid = r.status === 404 || r.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
+        if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
+        return { ok: r.ok, status: r.status, removed: invalid };
+      }));
+      return json({ sent: results.filter((x) => x.ok).length, total: results.length });
+    }
 
     // --- إشعار مكالمة واردة / انتهاء مكالمة (يُستدعى من trigger على call_rooms) ---
     if (input.type === "incoming_call" || input.type === "call_ended") {
