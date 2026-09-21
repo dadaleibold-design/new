@@ -88,3 +88,179 @@ body[data-theme="light"] .modal-card{background:var(--wa-panel-light);color:#111
 
 /* Call history: clear status, duration and personal delete action */
 .call-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:4px 12px;padding:14px 16px;border-bottom:1px solid rgba(134,150,160,.12);transition:background .15s ease}.call-history-row:hover{background:rgba(0,168,132,.08)}.call-history-main{min-width:0;display:flex;flex-direction:column;gap:4px}.call-history-main strong{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.call-history-main span{color:var(--wa-text-secondary);font-size:12px}.call-history-row.missed .call-history-main span{color:#ff6b6b}.call-history-row.declined .call-history-main span{color:#f0ad4e}.call-history-delete{width:34px;height:34px;display:flex;align-items:center;justify-content:center;padding:0;border:0;border-radius:50%;background:rgba(255,107,107,.1);color:#ff6b6b;font-size:15px;cursor:pointer;transition:background .15s ease,transform .15s ease}.call-history-delete:hover{background:rgba(255,107,107,.22);transform:scale(1.06)}.call-history-delete:disabled{opacity:.5;cursor:wait}.call-history-row time{grid-column:1/-1;color:var(--wa-text-secondary);font-size:11px}
+
+/* ============================================================
+   v2 — واجهة المكالمات العصرية (WhatsApp/Telegram-like)
+   ============================================================ */
+.call-overlay{position:fixed;inset:0;z-index:9000;display:flex;align-items:stretch;justify-content:stretch;background:#0b141a;animation:call-fade .22s ease;overflow:hidden}
+.call-overlay.minimized{opacity:0;pointer-events:none;transform:scale(.96);transition:opacity .2s ease,transform .2s ease}
+.call-stage{position:relative;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;background:linear-gradient(180deg,#0f2027 0%,#153b3a 50%,#0b141a 100%)}
+.call-backdrop{position:absolute;inset:-40px;z-index:0;background-size:cover;background-position:center;filter:blur(38px) saturate(1.2) brightness(.45);transform:scale(1.1);opacity:.85;transition:opacity .4s ease}
+.call-stage[data-type="video"].remote-video-on .call-backdrop{opacity:0}
+.call-video{position:absolute;overflow:hidden;background:#000}
+.call-video-remote{inset:0;width:100%;height:100%;z-index:1;background:transparent}
+.call-video-remote.has-video{background:#000}
+.call-video-remote video{width:100%!important;height:100%!important;object-fit:cover}
+.call-video-local{top:calc(64px + env(safe-area-inset-top));inset-inline-end:14px;width:clamp(96px,26vw,160px);aspect-ratio:3/4;z-index:5;border:2px solid rgba(255,255,255,.35);border-radius:16px;box-shadow:0 10px 28px rgba(0,0,0,.5);transition:transform .25s ease}
+.call-video-local:active{transform:scale(.97)}
+.call-video-local video{width:100%!important;height:100%!important;object-fit:cover}
+.call-stage[data-type="video"]:not(.remote-video-on) .call-video-local{inset:0;width:100%;height:100%;border:0;border-radius:0;aspect-ratio:auto;z-index:1;box-shadow:none}
+.call-stage[data-type="video"]:not(.remote-video-on) .call-peer-card{z-index:3;background:linear-gradient(180deg,rgba(0,0,0,.35),transparent 60%);width:100%;height:100%;justify-content:flex-start;padding-top:clamp(90px,18vh,160px)}
+.call-stage[data-type="video"]:not(.remote-video-on) .call-peer-card .call-avatar-wrap{display:none}
+
+.call-topbar{position:absolute;top:0;inset-inline:0;z-index:6;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:calc(10px + env(safe-area-inset-top)) 12px 10px;background:linear-gradient(180deg,rgba(0,0,0,.45),transparent)}
+.call-top-btn{width:40px;height:40px;display:flex;align-items:center;justify-content:center;border:0;border-radius:50%;background:rgba(255,255,255,.12);color:#fff;font-size:20px;backdrop-filter:blur(6px)}
+.call-top-btn:hover{background:rgba(255,255,255,.22)}
+.call-topbar-center{flex:1;text-align:center}
+.call-secure{display:inline-flex;align-items:center;gap:6px;color:rgba(255,255,255,.75);font-size:12px;letter-spacing:.2px}
+
+.call-peer-card{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;gap:8px;padding:24px;text-align:center;transition:all .3s ease;transform:translateY(-6vh)}
+.call-peer-card.compact{position:absolute;top:calc(58px + env(safe-area-inset-top));inset-inline-start:14px;transform:none;align-items:flex-start;gap:2px;padding:8px 12px;border-radius:14px;background:rgba(0,0,0,.45);backdrop-filter:blur(8px);text-align:start;z-index:6}
+.call-peer-card.compact .call-avatar-wrap,.call-peer-card.compact .call-quality{display:none}
+.call-peer-card.compact .call-peer-name{font-size:14px}
+.call-peer-card.compact .call-timer{font-size:12px}
+.call-avatar-wrap{position:relative;width:150px;height:150px;display:flex;align-items:center;justify-content:center;margin-bottom:10px}
+.call-avatar{position:relative;z-index:2;width:128px;height:128px;overflow:hidden;display:flex;align-items:center;justify-content:center;border:4px solid rgba(255,255,255,.18);border-radius:50%;background:linear-gradient(135deg,#00a884,#005c4b);box-shadow:0 14px 40px rgba(0,0,0,.45);transition:width .25s ease,height .25s ease}
+.call-avatar img{width:100%;height:100%;object-fit:cover}
+.call-avatar-initial{color:#fff;font-size:52px;font-weight:700;line-height:1}
+.call-ring{position:absolute;inset:0;border-radius:50%;border:2px solid rgba(0,168,132,.55);opacity:0;pointer-events:none}
+.call-stage[data-phase="ringing"] .call-ring,.incoming-card .call-ring{animation:call-ring-pulse 2.4s ease-out infinite}
+.call-ring-2{animation-delay:.8s!important}.call-ring-3{animation-delay:1.6s!important}
+@keyframes call-ring-pulse{0%{transform:scale(.85);opacity:.9}100%{transform:scale(1.6);opacity:0}}
+.call-stage[data-phase="connected"] .call-avatar{border-color:rgba(0,168,132,.85)}
+.call-stage[data-phase="ended"] .call-peer-card{opacity:.7}
+.call-peer-name{color:#fff;font-size:26px;font-weight:600;letter-spacing:.2px;overflow-wrap:anywhere;text-shadow:0 2px 12px rgba(0,0,0,.4)}
+.call-status-text{display:inline-flex;align-items:center;gap:3px;min-height:20px;color:rgba(255,255,255,.72);font-size:15px}
+.call-status-text .call-dots{display:none;gap:3px;margin-inline-start:2px}
+.call-status-text.animated .call-dots{display:inline-flex}
+.call-dots i{width:4px;height:4px;border-radius:50%;background:currentColor;animation:call-dot 1.2s infinite ease-in-out}
+.call-dots i:nth-child(2){animation-delay:.2s}.call-dots i:nth-child(3){animation-delay:.4s}
+@keyframes call-dot{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
+.call-timer{min-height:22px;color:#fff;font-size:17px;font-weight:500;font-variant-numeric:tabular-nums;letter-spacing:.5px}
+.call-quality{display:inline-flex;align-items:flex-end;gap:2px;height:14px;margin-top:2px;opacity:.75}
+.call-quality i{width:3px;background:rgba(255,255,255,.3);border-radius:1px}
+.call-quality i:nth-child(1){height:5px}.call-quality i:nth-child(2){height:8px}.call-quality i:nth-child(3){height:11px}.call-quality i:nth-child(4){height:14px}
+.call-quality[data-bars="1"] i:nth-child(-n+1),.call-quality[data-bars="2"] i:nth-child(-n+2),.call-quality[data-bars="3"] i:nth-child(-n+3),.call-quality[data-bars="4"] i:nth-child(-n+4),.call-quality:not([data-bars]) i{background:#fff}
+.call-quality.poor i{background:#e64c4c!important}
+.call-stage[data-phase="ringing"] .call-quality,.call-stage[data-phase="ended"] .call-quality{visibility:hidden}
+
+.call-controls{position:absolute;bottom:0;inset-inline:0;z-index:6;display:flex;align-items:flex-start;justify-content:center;gap:clamp(14px,5vw,30px);padding:22px 16px calc(28px + env(safe-area-inset-bottom));background:linear-gradient(180deg,transparent,rgba(0,0,0,.55));transition:transform .25s ease,opacity .25s ease}
+.call-overlay.controls-hidden .call-controls,.call-overlay.controls-hidden .call-topbar,.call-overlay.controls-hidden .call-peer-card.compact{opacity:0;pointer-events:none;transform:translateY(12px)}
+.call-ctrl{position:relative;width:60px;height:60px;flex:0 0 60px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0;border:none;border-radius:50%;background:rgba(255,255,255,.16);color:#fff;font-size:24px;backdrop-filter:blur(10px);transition:transform .12s ease,background .15s ease;-webkit-user-select:none;user-select:none}
+.call-ctrl:hover{background:rgba(255,255,255,.26)}
+.call-ctrl:active{transform:scale(.9)}
+.call-ctrl.active{background:#fff;color:#111b21}
+.call-ctrl-icon{display:flex;align-items:center;justify-content:center;line-height:1}
+.call-ctrl-label{position:absolute;top:calc(100% + 6px);color:rgba(255,255,255,.8);font-size:11px;white-space:nowrap}
+.call-ctrl-end{background:#f0443b;box-shadow:0 8px 24px rgba(240,68,59,.45)}
+.call-ctrl-end:hover{background:#ff5a52}
+.call-ctrl-accept{background:#25d366;box-shadow:0 8px 24px rgba(37,211,102,.45)}
+.call-ctrl-accept:hover{background:#2fe173}
+.call-ctrl-accept.pulse{animation:accept-pulse 1.4s ease-in-out infinite}
+@keyframes accept-pulse{0%,100%{transform:scale(1);box-shadow:0 8px 24px rgba(37,211,102,.45)}50%{transform:scale(1.08);box-shadow:0 8px 34px rgba(37,211,102,.75)}}
+
+.call-mini{position:fixed;top:calc(8px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:9100;display:flex;align-items:center;gap:8px;padding:8px 16px;border:0;border-radius:999px;background:#00a884;color:#fff;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.35);animation:call-fade .2s ease}
+.call-mini-dot{width:8px;height:8px;border-radius:50%;background:#fff;animation:call-dot 1.2s infinite}
+.call-mini-timer{font-variant-numeric:tabular-nums;opacity:.9}
+
+.incoming-call{position:fixed;inset:0;z-index:9500;display:flex;align-items:center;justify-content:center;padding:0;background:radial-gradient(circle at 50% 20%,#1d3c3a,#0b141a 70%);animation:call-fade .2s ease}
+.incoming-card{width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:32px 22px calc(48px + env(safe-area-inset-bottom));border:0;border-radius:0;background:transparent;box-shadow:none;animation:incoming-pop .3s cubic-bezier(.2,.9,.3,1.2)}
+body[data-theme="light"] .incoming-card{background:transparent}
+.incoming-kind{color:rgba(255,255,255,.7);font-size:14px;letter-spacing:.3px;text-transform:none}
+.incoming-name{color:#fff;font-size:28px;font-weight:600;text-align:center;overflow-wrap:anywhere}
+body[data-theme="light"] .incoming-name{color:#fff}
+.incoming-sub{color:rgba(255,255,255,.6);font-size:13px}
+.incoming-actions{position:absolute;bottom:calc(56px + env(safe-area-inset-bottom));inset-inline:0;display:flex;justify-content:center;gap:clamp(60px,22vw,120px);margin-top:0}
+.incoming-action{display:flex;flex-direction:column;align-items:center;gap:10px;color:rgba(255,255,255,.85);font-size:13px}
+.incoming-action .call-ctrl{width:68px;height:68px;flex-basis:68px}
+
+@media (max-width:768px){.call-ctrl{width:56px;height:56px;flex-basis:56px;font-size:22px}.call-avatar-wrap{width:130px;height:130px}.call-avatar{width:112px;height:112px}.call-peer-name{font-size:23px}}
+@media (max-width:380px){.call-ctrl{width:50px;height:50px;flex-basis:50px;font-size:20px}.call-controls{gap:14px}}
+
+/* ============ اختيار نوع الحساب في شاشة الدخول ============ */
+.auth-role-switch{display:flex;gap:6px;padding:4px;margin-bottom:14px;border-radius:10px;background:#111b21}
+.auth-role-switch button{flex:1;padding:8px;border:0;border-radius:8px;background:transparent;color:var(--wa-text-secondary);font-size:13px;font-weight:600;transition:background .15s ease,color .15s ease}
+.auth-role-switch button.active{background:#2a3942;color:#fff}
+.auth-role-switch button[data-role="admin"].active{background:#0d3b66}
+.auth-hint{margin:2px 0 0;color:var(--wa-text-secondary);font-size:11.5px;text-align:center;line-height:1.5}
+
+/* ============ بطاقة طلب إذن الإشعارات ============ */
+.notif-permission-card{position:fixed;top:calc(12px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:7000;width:min(440px,calc(100% - 24px));display:grid;grid-template-columns:auto 1fr;gap:6px 12px;padding:14px 16px;border-radius:14px;background:var(--wa-panel-dark);color:var(--wa-text-primary);box-shadow:0 16px 48px rgba(0,0,0,.45);border:1px solid rgba(0,168,132,.35);animation:notif-slide .3s ease}
+body[data-theme="light"] .notif-permission-card{background:var(--wa-panel-light);color:#111b21}
+@keyframes notif-slide{from{transform:translate(-50%,-20px);opacity:0}to{transform:translate(-50%,0);opacity:1}}
+.notif-permission-icon{grid-row:1/3;display:flex;align-items:center;font-size:30px}
+.notif-permission-body{display:flex;flex-direction:column;gap:2px}
+.notif-permission-body strong{font-size:14px}
+.notif-permission-body span{color:var(--wa-text-secondary);font-size:12.5px}
+.notif-permission-actions{display:flex;gap:8px;justify-content:flex-end}
+.notif-permission-actions button{padding:7px 16px;border:0;border-radius:8px;font-size:13px;font-weight:600}
+#notif-permission-allow{background:var(--wa-green);color:#fff}
+#notif-permission-later{background:transparent;color:var(--wa-text-secondary)}
+
+/* ============ دليل الخلفية / البطارية ============ */
+.background-help-body{padding:14px 18px 20px;font-size:14px;line-height:1.7}
+.bg-help-intro{margin:0 0 12px}
+.bg-help-status{display:inline-block;padding:6px 12px;border-radius:8px;font-size:13px;font-weight:600}
+.bg-help-status.ok{background:rgba(0,168,132,.15);color:var(--wa-green)}
+.bg-help-status.warn{background:rgba(255,183,77,.15);color:#ffb74d}
+.bg-help-status.bad{background:rgba(230,76,76,.15);color:#ff6b6b}
+.bg-help-section{margin-top:14px}
+.bg-help-section h3{margin:0 0 6px;font-size:14px;color:var(--wa-green)}
+.bg-help-section ol{margin:0;padding-inline-start:20px}
+.bg-help-section li{margin-bottom:4px}
+.bg-help-section b{color:inherit}
+
+/* ============ بطاقة المكالمة داخل المحادثة ============ */
+.bubble-row.call-row{justify-content:center;margin:6px 0}
+.bubble-row.call-row::before{display:none}
+.bubble-row.call-row .bubble{max-width:min(320px,86%);padding:0;background:transparent;box-shadow:none}
+.call-card{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:4px 12px;width:100%;padding:10px 14px;border-radius:12px;background:var(--wa-bubble-theirs-dark);box-shadow:0 1px 1px rgba(0,0,0,.2);cursor:default}
+body[data-theme="light"] .call-card{background:var(--wa-bubble-theirs-light)}
+.call-card.mine{background:var(--wa-bubble-mine-dark)}
+body[data-theme="light"] .call-card.mine{background:var(--wa-bubble-mine-light)}
+.call-card-icon{grid-row:1/3;width:40px;height:40px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(134,150,160,.16);font-size:19px}
+.call-card.missed .call-card-icon{background:rgba(230,76,76,.18)}
+.call-card.completed .call-card-icon{background:rgba(0,168,132,.18)}
+.call-card-title{font-size:14px;font-weight:600}
+.call-card.missed .call-card-title{color:#ff6b6b}
+.call-card-sub{grid-column:2;color:var(--wa-text-secondary);font-size:12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.call-card-dir{font-size:12px}
+.call-card-dir.in{color:var(--wa-green)}.call-card-dir.out{color:#53bdeb}.call-card-dir.missed{color:#ff6b6b}
+.call-card-time{grid-column:3;grid-row:1/3;color:var(--wa-text-secondary);font-size:11px;align-self:end}
+.call-card-callback{grid-column:3;grid-row:1/3;width:36px;height:36px;border:0;border-radius:50%;background:rgba(0,168,132,.18);color:var(--wa-green);font-size:16px}
+.call-card-callback:hover{background:rgba(0,168,132,.3)}
+.call-card:has(.call-card-callback) .call-card-time{grid-column:2;grid-row:3}
+
+/* ============ زر وسجل المكالمات ============ */
+.call-history-button{position:relative;width:40px!important;min-width:40px!important;padding:0!important;gap:0}
+.call-history-button svg{display:block}
+.call-history-badge{position:absolute;top:2px;inset-inline-end:2px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#f0443b;color:#fff;font-size:10px;font-weight:700;line-height:16px;text-align:center}
+.call-history-tabs{display:flex;gap:6px;padding:10px 16px 0}
+.call-history-tabs button{padding:6px 14px;border:0;border-radius:999px;background:rgba(134,150,160,.14);color:inherit;font-size:13px}
+.call-history-tabs button.active{background:var(--wa-green);color:#fff}
+.call-history-list{min-height:120px;padding-bottom:8px}
+.call-history-empty,.call-history-loading{padding:36px 16px;color:var(--wa-text-secondary);text-align:center;font-size:14px}
+.call-history-day{padding:12px 16px 4px;color:var(--wa-text-secondary);font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
+.call-history-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:2px 12px;padding:10px 16px;border-bottom:1px solid rgba(134,150,160,.08);transition:background .15s ease}
+.call-history-row:hover{background:rgba(0,168,132,.06)}
+.call-history-avatar{grid-row:1/3;width:44px;height:44px;overflow:hidden;display:flex;align-items:center;justify-content:center;border-radius:50%;background:linear-gradient(135deg,#00a884,#005c4b);color:#fff;font-size:18px;font-weight:700}
+.call-history-avatar img{width:100%;height:100%;object-fit:cover}
+.call-history-main{min-width:0;display:flex;flex-direction:column;gap:2px}
+.call-history-main strong{font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.call-history-row.missed .call-history-main strong{color:#ff6b6b}
+.call-history-main span{display:flex;align-items:center;gap:6px;color:var(--wa-text-secondary);font-size:12.5px}
+.call-history-row time{grid-column:3;grid-row:1/3;color:var(--wa-text-secondary);font-size:11.5px;text-align:end;white-space:nowrap;line-height:1.4}
+.call-history-actions{grid-column:4;grid-row:1/3;display:flex;gap:2px}
+.call-history-actions button{width:36px;height:36px;border:0;border-radius:50%;background:transparent;color:var(--wa-green);font-size:17px}
+.call-history-actions button.call-history-delete{color:var(--wa-text-secondary);font-size:15px}
+.call-history-actions button:hover{background:rgba(134,150,160,.14)}
+
+/* ============ فواصل الأيام / تحميل الأقدم / المستخدم المحظور ============ */
+.day-separator{display:flex;justify-content:center;margin:10px 0 6px}
+.day-separator span{padding:4px 12px;border-radius:8px;background:rgba(17,27,33,.75);color:var(--wa-text-secondary);font-size:12px;box-shadow:0 1px 1px rgba(0,0,0,.2)}
+body[data-theme="light"] .day-separator span{background:#fff;color:#54656f}
+.load-older{display:flex;justify-content:center;padding:8px 0 4px}
+.load-older-btn{padding:6px 14px;border:0;border-radius:999px;background:rgba(0,168,132,.14);color:var(--wa-green);font-size:12.5px;font-weight:600}
+.load-older-btn:hover{background:rgba(0,168,132,.26)}
+.contact-row.blocked-user .contact-name{text-decoration:line-through;opacity:.6}
+.contact-row.blocked-user .avatar{filter:grayscale(1);opacity:.7}

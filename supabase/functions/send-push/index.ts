@@ -82,7 +82,7 @@ async function getFirebaseAccessToken() {
   return firebaseAccessToken.value;
 }
 
-async function sendToFcm(token: string, data: Record<string, string>) {
+async function sendToFcm(token: string, data: Record<string, string>, opts: { highPriority?: boolean } = {}) {
   const accessToken = await getFirebaseAccessToken();
   const response = await fetch(
     `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_PROJECT_ID!)}/messages:send`,
@@ -98,6 +98,15 @@ async function sendToFcm(token: string, data: Record<string, string>) {
           // Data-only يمنع Firebase من إنشاء إشعار تلقائي بالتوازي مع
           // firebase-messaging-sw.js، وبالتالي لا تظهر إشعارات مزدوجة.
           data,
+          // أولوية عالية + TTL قصير للمكالمات: توقظ الجهاز من Doze وتصل فوراً
+          android: { priority: "high", ttl: opts.highPriority ? "60s" : "86400s" },
+          webpush: {
+            headers: {
+              Urgency: opts.highPriority ? "high" : "normal",
+              TTL: opts.highPriority ? "60" : "86400",
+            },
+          },
+          apns: { headers: { "apns-priority": "10", "apns-push-type": "alert" } },
         },
       }),
     },
@@ -114,6 +123,53 @@ Deno.serve(async (req) => {
 
   try {
     const input = await req.json();
+
+    // --- إشعار مكالمة واردة / انتهاء مكالمة (يُستدعى من trigger على call_rooms) ---
+    if (input.type === "incoming_call" || input.type === "call_ended") {
+      const roomId = String(input.room_id || "");
+      const calleeId = String(input.callee_id || "");
+      const callerId = String(input.caller_id || "");
+      if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id are required" }, 400);
+
+      const [{ data: caller }, { data: tokens, error: tokenError }] = await Promise.all([
+        supabase.from("profiles").select("display_name, avatar_url").eq("id", callerId).maybeSingle(),
+        supabase.from("fcm_tokens").select("id, token").eq("user_id", calleeId),
+      ]);
+      if (tokenError) throw tokenError;
+      if (!tokens?.length) return json({ sent: 0, skipped: "no fcm token" });
+
+      const isVideo = input.call_type === "video";
+      const data: Record<string, string> = input.type === "incoming_call"
+        ? {
+            type: "incoming_call",
+            roomId,
+            conversationId: String(input.conversation_id || ""),
+            callerId,
+            callType: isVideo ? "video" : "audio",
+            title: caller?.display_name || "مكالمة واردة",
+            body: isVideo ? "📹 مكالمة فيديو واردة — اضغط للرد" : "📞 مكالمة صوتية واردة — اضغط للرد",
+            icon: caller?.avatar_url || "",
+          }
+        : {
+            type: "call_ended",
+            roomId,
+            conversationId: String(input.conversation_id || ""),
+            missed: String(input.status === "missed"),
+            title: input.status === "missed" ? `مكالمة فائتة من ${caller?.display_name || "مستخدم"}` : "انتهت المكالمة",
+            body: isVideo ? "مكالمة فيديو فائتة" : "مكالمة صوتية فائتة",
+            icon: caller?.avatar_url || "",
+          };
+
+      const results = await Promise.all(tokens.map(async (row) => {
+        const result = await sendToFcm(row.token, data, { highPriority: true });
+        const errorText = JSON.stringify(result.details || {});
+        const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
+        if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
+        return { tokenId: row.id, ok: result.ok, status: result.status, removed: invalid };
+      }));
+      return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
+    }
+
     const messageId = String(input.message_id || "");
     const conversationId = String(input.conversation_id || "");
     const senderId = String(input.sender_id || "");

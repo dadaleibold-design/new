@@ -32,17 +32,42 @@ messaging.onBackgroundMessage((payload) => {
 
   const title = notification.title || data.title || "رسالة جديدة";
   const body = notification.body || data.body || "لديك رسالة جديدة";
+  const isCall = data.type === "incoming_call";
+  const isCallEnded = data.type === "call_ended";
+
+  // انتهت المكالمة/فائتة: أغلق إشعار الرنين واعرض "مكالمة فائتة"
+  if (isCallEnded) {
+    return self.registration.getNotifications({ tag: `call-${data.roomId || ""}` }).then((list) => {
+      list.forEach((n) => n.close());
+      if (data.missed === "true" || data.missed === true) {
+        return self.registration.showNotification(title || "مكالمة فائتة", {
+          body: body || "لديك مكالمة فائتة",
+          icon: data.icon || new URL("/icons/icon.png", self.location.origin).href,
+          badge: new URL("/icons/icon.png", self.location.origin).href,
+          tag: `missed-${data.roomId || Date.now()}`,
+          data: { ...data, conversationId },
+        });
+      }
+      return null;
+    });
+  }
 
   const notificationOptions = {
     body,
     icon: data.icon || new URL("/icons/icon.png", self.location.origin).href,
     badge: data.badge || new URL("/icons/icon.png", self.location.origin).href,
-    tag: conversationId ? `conversation-${conversationId}` : "whatsapp-message",
+    tag: isCall ? `call-${data.roomId || conversationId}` : conversationId ? `conversation-${conversationId}` : "whatsapp-message",
     renotify: true,
     requireInteraction: true,
     silent: false,
     data: { ...data, conversationId },
-    vibrate: [100, 50, 100],
+    vibrate: isCall ? [500, 250, 500, 250, 500, 250, 500] : [100, 50, 100],
+    actions: isCall
+      ? [
+          { action: "answer", title: "📞 رد" },
+          { action: "decline", title: "رفض" },
+        ]
+      : [],
   };
 
   return self.registration.showNotification(title, notificationOptions);
@@ -56,6 +81,12 @@ self.addEventListener("notificationclick", (event) => {
   const targetUrl = new URL("/index.html", self.location.origin);
   if (conversationId) {
     targetUrl.searchParams.set("conversation", conversationId);
+  }
+  if (event.action === "decline") {
+    // الرفض من الإشعار: افتح التطبيق بصمت ليُرسل إشارة الرفض (لا جلسة داخل الـ SW)
+    targetUrl.searchParams.set("decline_call", data.roomId || "1");
+  } else if (data.type === "incoming_call") {
+    targetUrl.searchParams.set("answer_call", data.roomId || "1");
   }
 
   event.waitUntil(

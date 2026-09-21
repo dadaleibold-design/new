@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v6";
+const CACHE_NAME = "wa-clone-shell-v7";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -14,6 +14,8 @@ const APP_SHELL = [
   "./js/calls.js",
   "./js/media.js",
   "./js/safety.js",
+  "./js/notifications.js",
+  "./js/ringtone.js",
   "./manifest.json",
   "./icons/icon.png",
   "./icons/notify.mp3",
@@ -65,6 +67,25 @@ self.addEventListener("fetch", (event) => {
 
   if (isSupabase || !isSameOrigin) {
     event.respondWith(fetch(request).catch(() => new Response(null, { status: 503 })));
+    return;
+  }
+
+  // JS/CSS/HTML: stale-while-revalidate — استجابة فورية من الكاش مع تحديث
+  // خلفي حتى لا يعلق المستخدم على نسخة قديمة بعد كل نشر.
+  const isCode = /\.(css|js|html)$/i.test(url.pathname);
+  if (isCode) {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(async (cache) => {
+        const cached = await cache.match(request);
+        const network = fetch(request)
+          .then((response) => {
+            if (response && response.ok) cache.put(request, response.clone());
+            return response;
+          })
+          .catch(() => null);
+        return cached || (await network) || new Response(null, { status: 503 });
+      })
+    );
     return;
   }
 

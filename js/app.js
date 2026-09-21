@@ -1,5 +1,5 @@
 import { supabase } from "./supabaseClient.js";
-import { signUp, signIn, signOut, getCurrentProfile } from "./auth.js";
+import { signUp, signIn, signOut, getCurrentProfile, looksLikeEmail } from "./auth.js";
 import { ADMINS } from "./config.js";
 import { applyLanguage } from "./i18n.js";
 import {
@@ -27,7 +27,14 @@ import {
   unsubscribeFromIncomingCalls,
   isCallActive,
   endCall,
+  startCallWith,
 } from "./calls.js";
+import {
+  showPermissionCardIfNeeded,
+  ensureNotificationsReady,
+  openBackgroundHelp,
+  wireBackgroundHelp,
+} from "./notifications.js";
 import {
   installGlobalErrorBoundary,
   safeAsync,
@@ -77,7 +84,18 @@ const state = {
   mediaUploadStatusElement: null,
 
   foregroundMessagesUnsub: null,
+
+  authRole: localStorage.getItem("wa_auth_role") || "user",
+  callsChannel: null,
+  callHistoryFilter: "all",
+  lastRenderedSignature: "",
+  messagesHasMore: false,
+  loadingOlder: false,
 };
+
+const MESSAGES_PAGE_SIZE = 80;
+const MESSAGE_COLUMNS =
+  "id,conversation_id,sender_id,content,attachment_url,attachment_type,reply_to_id,status,created_at,message_type,call_id,call_type,call_status,call_caller_id,call_duration_seconds,buttons";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -101,6 +119,14 @@ async function boot() {
       getActiveConversation: () => state.activeConversation,
       notify: (msg) => showAuthError(msg),
       t: () => state.t,
+      onCallLogged: () => {
+        // حدّث المحادثة المفتوحة وشارة المكالمات الفائتة فور تسجيل المكالمة
+        if (state.activeConversation) loadMessages(state.activeConversation.id, { silent: true });
+        refreshMissedCallsBadge();
+      },
+      openConversation: async (peer, conversationId) => {
+        await openConversation({ ...peer, _conversationId: conversationId });
+      },
     })
   );
 
@@ -330,7 +356,24 @@ async function enterApp() {
     subscribeInboxUpdates();
     subscribeGlobalMessageWatch();
     subscribeToIncomingCalls();
+    subscribeCallRoomsWatch();
   });
+
+  // الإشعارات: جدّد التوكن بصمت إن كان الإذن ممنوحاً، وإلا اعرض بطاقة الطلب
+  safeAsync("enterApp:notifications", async () => {
+    const ready = await ensureNotificationsReady(state.me.id);
+    if (!ready) {
+      setTimeout(() => {
+        showPermissionCardIfNeeded({
+          userId: state.me?.id,
+          notify: (msg) => showAuthError(msg),
+        });
+      }, 1500);
+    }
+  });
+
+  refreshMissedCallsBadge();
+  handleDeepLinks();
 
   if (!state.foregroundMessagesUnsub) {
     try {
@@ -408,6 +451,63 @@ function stopContactsRefreshLoop() {
   state.contactsRefreshInFlight = false;
 }
 
+function applyAuthRole(role) {
+  state.authRole = role === "admin" ? "admin" : "user";
+  localStorage.setItem("wa_auth_role", state.authRole);
+  const isAdmin = state.authRole === "admin";
+  const t = state.t || {};
+
+  $("#role-user")?.classList.toggle("active", !isAdmin);
+  $("#role-admin")?.classList.toggle("active", isAdmin);
+
+  // الدخول: هاتف للمستخدم، بريد للمشرف
+  const loginId = $("#login-identity");
+  if (loginId) {
+    loginId.type = isAdmin ? "email" : "tel";
+    loginId.inputMode = isAdmin ? "email" : "tel";
+    loginId.placeholder = isAdmin ? (t.email || "البريد الإلكتروني") : (t.login_phone || "رقم الهاتف");
+    loginId.autocomplete = isAdmin ? "email" : "tel";
+  }
+  const loginHint = $("#login-hint");
+  if (loginHint) {
+    loginHint.textContent = isAdmin
+      ? (t.login_hint_admin || "الدخول بالبريد الإلكتروني للمشرفين المعتمدين فقط")
+      : (t.login_hint_user || "الدخول برقم الهاتف للمستخدمين — المشرفون يدخلون بالبريد الإلكتروني");
+  }
+
+  // التسجيل: البريد يظهر للمشرف فقط، والهاتف إلزامي للمستخدم
+  const email = $("#signup-email");
+  const phone = $("#signup-phone");
+  if (email) {
+    email.classList.toggle("hidden", !isAdmin);
+    email.required = isAdmin;
+    if (!isAdmin) email.value = "";
+  }
+  if (phone) {
+    phone.required = !isAdmin;
+    phone.placeholder = isAdmin ? "رقم الهاتف (اختياري)" : (t.phone || "رقم الهاتف");
+  }
+  const signupHint = $("#signup-hint");
+  if (signupHint) {
+    signupHint.textContent = isAdmin
+      ? (t.signup_hint_admin || "إنشاء حساب مشرف يتطلب بريداً معتمداً في قائمة المشرفين")
+      : (t.signup_hint_user || "التسجيل باسم المستخدم ورقم الهاتف فقط — لا حاجة لبريد إلكتروني");
+  }
+}
+
+function setAuthBusy(form, busy) {
+  const btn = form?.querySelector('button[type="submit"]');
+  if (!btn) return;
+  if (busy) {
+    btn.dataset.label = btn.textContent;
+    btn.textContent = "...";
+    btn.disabled = true;
+  } else {
+    btn.textContent = btn.dataset.label || btn.textContent;
+    btn.disabled = false;
+  }
+}
+
 function wireAuthForms() {
   $("#tab-login")?.addEventListener("click", () => {
     switchAuthTab("login");
@@ -417,48 +517,84 @@ function wireAuthForms() {
     switchAuthTab("signup");
   });
 
+  $("#role-user")?.addEventListener("click", () => applyAuthRole("user"));
+  $("#role-admin")?.addEventListener("click", () => applyAuthRole("admin"));
+  applyAuthRole(state.authRole);
+
+  // إن كتب المستخدم "@" في حقل الدخول فهو مشرف — بدّل الوضع تلقائياً
+  $("#login-identity")?.addEventListener("input", (e) => {
+    const v = e.target.value || "";
+    if (looksLikeEmail(v) && state.authRole !== "admin") applyAuthRole("admin");
+  });
+
   $("#login-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const form = e.currentTarget;
 
     const identity = $("#login-identity").value.trim();
     const password = $("#login-password").value;
 
-    try {
-      await signIn({
-        identity,
-        password,
-      });
+    if (state.authRole === "admin" && !looksLikeEmail(identity)) {
+      showAuthError("أدخل البريد الإلكتروني للمشرف.");
+      return;
+    }
+    if (state.authRole === "user" && looksLikeEmail(identity)) {
+      applyAuthRole("admin");
+    }
 
+    setAuthBusy(form, true);
+    try {
+      await signIn({ identity, password });
       await enterApp();
     } catch (err) {
       showAuthError(err.message);
+    } finally {
+      setAuthBusy(form, false);
     }
   });
 
   $("#signup-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const form = e.currentTarget;
 
-    const email = $("#signup-email").value.trim();
+    const isAdmin = state.authRole === "admin";
+    const email = isAdmin ? $("#signup-email").value.trim() : "";
     const password = $("#signup-password").value;
     const displayName = $("#signup-name").value.trim();
     const phone = $("#signup-phone").value.trim();
 
+    if (!displayName) {
+      showAuthError("اسم المستخدم مطلوب.");
+      return;
+    }
+    if (isAdmin && !email) {
+      showAuthError("بريد المشرف مطلوب لإنشاء حساب مشرف.");
+      return;
+    }
+    if (!isAdmin && !phone) {
+      showAuthError("رقم الهاتف مطلوب لإنشاء الحساب.");
+      return;
+    }
+
+    setAuthBusy(form, true);
     try {
-      await signUp({
-        email,
-        password,
-        displayName,
-        phone,
-      });
+      const result = await signUp({ email, password, displayName, phone });
 
-      await signIn({
-        identity: email || phone,
-        password,
-      });
+      if (!result?.session) {
+        // تأكيد البريد مفعّل في Supabase (للمشرفين) — لا يمكن الدخول قبل التأكيد
+        if (isAdmin) {
+          showAuthError("تم إنشاء الحساب — تحقق من بريدك لتأكيده ثم سجّل الدخول.");
+          switchAuthTab("login");
+          return;
+        }
+      }
 
+      await signIn({ identity: isAdmin ? email : phone, password });
       await enterApp();
     } catch (err) {
       showAuthError(err.message);
+    } finally {
+      setAuthBusy(form, false);
     }
   });
 }
@@ -549,19 +685,30 @@ function wireChrome() {
         state.me.id
       );
 
-      showAuthError(
-        ok
-          ? "تم تفعيل الإشعارات ✅"
-          : "تعذّر التفعيل — تحقق من إذن المتصفح أو مفتاح VAPID"
-      );
+      if (ok) {
+        localStorage.setItem("wa_fcm_last_refresh", String(Date.now()));
+        showAuthError("تم تفعيل الإشعارات ✅");
+        $("#settings-panel")?.classList.add("hidden");
+        openBackgroundHelp();
+      } else if ("Notification" in window && Notification.permission === "denied") {
+        showAuthError("الإذن مرفوض من المتصفح — فعّله من إعدادات الموقع 🔒 ثم أعد المحاولة.");
+        openBackgroundHelp();
+      } else {
+        showAuthError("تعذّر التفعيل — تحقق من الاتصال وإذن المتصفح ثم أعد المحاولة.");
+      }
     }
   );
 
-  $("#btn-call-history")?.addEventListener("click", openCallHistory);
+  $("#btn-call-history")?.addEventListener("click", () => openCallHistory());
   $("#close-call-history")?.addEventListener("click", closeCallHistory);
-  $("#btn-background-help")?.addEventListener("click", () =>
-    showAuthError("لضمان وصول الإشعارات: اسمح بالإشعارات، عطّل تحسين البطارية للتطبيق/المتصفح، واسمح له بالعمل في الخلفية من إعدادات النظام.")
-  );
+  $("#call-history-modal")?.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeCallHistory();
+  });
+  $("#btn-background-help")?.addEventListener("click", () => {
+    $("#settings-panel")?.classList.add("hidden");
+    openBackgroundHelp();
+  });
+  wireBackgroundHelp();
 
   // حذف الصورة الشخصية / خلفية الدردشة (كانت الأزرار موجودة بلا ربط)
   $("#btn-remove-avatar")?.addEventListener(
@@ -596,64 +743,274 @@ function closeCallHistory() {
   $("#call-history-modal")?.classList.add("hidden");
 }
 
-async function openCallHistory() {
+const CALL_HISTORY_SEEN_KEY = "wa_calls_seen_at";
+
+function callStatusMeta(call, myId) {
+  const outgoing = call.caller_id === myId;
+  const isVideo = call.call_type === "video";
+  const duration = Number(call.duration_seconds || 0);
+  const answered = Boolean(call.answered_at) || duration > 0;
+  let kind = "completed";
+  let label;
+  if (call.status === "missed" || (!answered && call.status !== "declined" && call.status !== "active" && call.status !== "ringing")) {
+    kind = outgoing ? "unanswered" : "missed";
+    label = outgoing ? "لم يتم الرد" : "مكالمة فائتة";
+  } else if (call.status === "declined") {
+    kind = outgoing ? "unanswered" : "declined";
+    label = outgoing ? "مرفوضة" : "تم الرفض";
+  } else if (call.status === "active" || call.status === "ringing") {
+    kind = "active";
+    label = "جارية";
+  } else {
+    label = isVideo ? "مكالمة فيديو" : "مكالمة صوتية";
+  }
+  return { outgoing, isVideo, duration, answered, kind, label, missed: kind === "missed" };
+}
+
+function formatCallDuration(secs) {
+  const s = Number(secs || 0);
+  const h = Math.floor(s / 3600);
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function formatCallDay(date) {
+  const d = new Date(date);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  const same = (a, b) => a.toDateString() === b.toDateString();
+  if (same(d, today)) return state.lang === "ar" ? "اليوم" : "Today";
+  if (same(d, yesterday)) return state.lang === "ar" ? "أمس" : "Yesterday";
+  return d.toLocaleDateString(state.lang === "ar" ? "ar-SA" : "en-US", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: d.getFullYear() === today.getFullYear() ? undefined : "numeric",
+  });
+}
+
+function formatCallTime(date) {
+  return new Date(date).toLocaleTimeString(state.lang === "ar" ? "ar-SA" : "en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** شارة المكالمات الفائتة غير المشاهدة فوق أيقونة السجل */
+async function refreshMissedCallsBadge() {
+  if (!state.me || !state.isOnline) return;
+  const seenAt = localStorage.getItem(CALL_HISTORY_SEEN_KEY) || "1970-01-01T00:00:00Z";
+  const { ok, data } = await safeQuery("calls:missed-count", () =>
+    supabase
+      .from("call_rooms")
+      .select("id", { count: "exact", head: false })
+      .eq("callee_id", state.me.id)
+      .eq("status", "missed")
+      .gt("created_at", seenAt)
+      .limit(99)
+  );
+  safeDom("calls:badge", () => {
+    const badge = $("#call-history-badge");
+    if (!badge) return;
+    const n = ok && Array.isArray(data) ? data.length : 0;
+    badge.textContent = n > 99 ? "99+" : String(n);
+    badge.classList.toggle("hidden", n === 0);
+  });
+}
+
+/** يراقب تغيّرات غرف المكالمات لتحديث الشارة والمحادثة المفتوحة فوراً */
+function subscribeCallRoomsWatch() {
+  if (state.callsChannel) {
+    try {
+      supabase.removeChannel(state.callsChannel);
+    } catch {
+      /* تجاهل */
+    }
+  }
+  state.callsChannel = supabase
+    .channel("call-rooms-watch")
+    .on("postgres_changes", { event: "*", schema: "public", table: "call_rooms" }, (payload) => {
+      const row = payload.new || payload.old;
+      if (!row || !state.me) return;
+      if (row.caller_id !== state.me.id && row.callee_id !== state.me.id) return;
+      refreshMissedCallsBadge();
+      const modal = $("#call-history-modal");
+      if (modal && !modal.classList.contains("hidden")) openCallHistory(state.callHistoryFilter, { silent: true });
+    })
+    .subscribe();
+}
+
+async function openCallHistory(filter = state.callHistoryFilter || "all", { silent = false } = {}) {
   if (!state.me) return;
+  state.callHistoryFilter = filter;
   const modal = $("#call-history-modal");
   const list = $("#call-history-list");
   modal?.classList.remove("hidden");
   if (!list) return;
-  list.textContent = "جارٍ تحميل سجل المكالمات...";
 
-  const { data, error } = await supabase
-    .from("call_rooms")
-    .select("*, caller:profiles!call_rooms_caller_id_fkey(display_name), callee:profiles!call_rooms_callee_id_fkey(display_name)")
-    .or(`caller_id.eq.${state.me.id},callee_id.eq.${state.me.id}`)
-    .order("created_at", { ascending: false })
-    .limit(100);
+  // شريط التبويبات (الكل / الفائتة)
+  let tabs = modal.querySelector(".call-history-tabs");
+  if (!tabs) {
+    tabs = document.createElement("div");
+    tabs.className = "call-history-tabs";
+    tabs.innerHTML = `
+      <button type="button" data-filter="all">الكل</button>
+      <button type="button" data-filter="missed">الفائتة</button>`;
+    modal.querySelector(".modal-header")?.insertAdjacentElement("afterend", tabs);
+    tabs.querySelectorAll("button").forEach((b) =>
+      b.addEventListener("click", () => openCallHistory(b.dataset.filter))
+    );
+  }
+  tabs.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.filter === filter));
+
+  if (!silent) list.innerHTML = '<div class="call-history-loading">جارٍ تحميل سجل المكالمات...</div>';
+
+  if (!state.isOnline) {
+    list.innerHTML = '<div class="call-history-empty">لا يمكن تحميل سجل المكالمات دون اتصال.</div>';
+    return;
+  }
+
+  const [{ data, error }, { data: hiddenRows, error: hiddenError }] = await Promise.all([
+    supabase
+      .from("call_rooms")
+      .select(
+        "id,conversation_id,call_type,caller_id,callee_id,status,started_at,answered_at,ended_at,duration_seconds,created_at, caller:profiles!call_rooms_caller_id_fkey(id,display_name,avatar_url), callee:profiles!call_rooms_callee_id_fkey(id,display_name,avatar_url)"
+      )
+      .or(`caller_id.eq.${state.me.id},callee_id.eq.${state.me.id}`)
+      .order("created_at", { ascending: false })
+      .limit(200),
+    supabase.from("call_history_hidden").select("room_id").eq("user_id", state.me.id),
+  ]);
+
   if (error) {
-    list.textContent = "تعذّر تحميل سجل المكالمات.";
+    list.innerHTML = '<div class="call-history-empty">تعذّر تحميل سجل المكالمات.</div>';
     return;
   }
-  const { data: hiddenRows, error: hiddenError } = await supabase
-    .from("call_history_hidden")
-    .select("room_id")
-    .eq("user_id", state.me.id);
-  if (hiddenError) {
-    list.textContent = "تعذّر تحميل إعدادات سجل المكالمات.";
-    return;
-  }
+  if (hiddenError) console.warn("call_history_hidden:", hiddenError);
+
   const hiddenIds = new Set((hiddenRows || []).map((row) => row.room_id));
-  const visibleCalls = (data || []).filter((call) => !hiddenIds.has(call.id));
-  list.innerHTML = visibleCalls.map((call) => {
-    const peer = call.caller_id === state.me.id ? call.callee?.display_name : call.caller?.display_name;
-    const date = new Date(call.created_at).toLocaleString(state.lang === "ar" ? "ar-SA" : "en-US");
-    const status = call.status === "missed" ? "مكالمة فائتة" : call.status === "declined" ? "مرفوضة" : call.status === "active" || call.status === "ended" ? "مكتملة" : call.status;
-    const duration = Number(call.duration_seconds || 0);
-    const durationLabel = duration ? ` · ${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, "0")}` : "";
-    const statusClass = call.status === "missed" ? "missed" : call.status === "declined" ? "declined" : "completed";
-    return `<div class="call-history-row ${statusClass}" data-call-row="${escapeHtml(call.id)}">
-      <div class="call-history-main"><strong>${escapeHtml(peer || "مستخدم")}</strong><span>${call.call_type === "video" ? "فيديو" : "صوت"} · ${escapeHtml(status)}${durationLabel}</span></div>
-      <button class="call-history-delete" type="button" data-call-delete="${escapeHtml(call.id)}" title="حذف من سجلي" aria-label="حذف المكالمة">🗑️</button>
-      <time>${escapeHtml(date)}</time>
-    </div>`;
-  }).join("") || "لا توجد مكالمات بعد.";
-  list.querySelectorAll("[data-call-delete]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const roomId = button.dataset.callDelete;
-      if (!roomId || !window.confirm("حذف هذه المكالمة من سجلك؟")) return;
+  let calls = (data || []).filter((call) => !hiddenIds.has(call.id));
+  const metaById = new Map(calls.map((c) => [c.id, callStatusMeta(c, state.me.id)]));
+  if (filter === "missed") calls = calls.filter((c) => metaById.get(c.id)?.missed);
+
+  // اعتبر الفائتة مُشاهدة الآن
+  localStorage.setItem(CALL_HISTORY_SEEN_KEY, new Date().toISOString());
+  refreshMissedCallsBadge();
+
+  if (!calls.length) {
+    list.innerHTML = `<div class="call-history-empty">${state.t?.no_calls || "لا توجد مكالمات بعد."}</div>`;
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  let lastDay = null;
+  calls.forEach((call) => {
+    const meta = metaById.get(call.id);
+    const peer = meta.outgoing ? call.callee : call.caller;
+    const day = formatCallDay(call.created_at);
+    if (day !== lastDay) {
+      const h = document.createElement("div");
+      h.className = "call-history-day";
+      h.textContent = day;
+      fragment.appendChild(h);
+      lastDay = day;
+    }
+    const row = document.createElement("div");
+    row.className = `call-history-row ${meta.kind}`;
+    row.dataset.callRow = call.id;
+    const dirIcon = meta.missed ? "↙" : meta.outgoing ? "↗" : "↙";
+    const dirClass = meta.missed ? "missed" : meta.outgoing ? "out" : "in";
+    const durationLabel = meta.duration ? ` · ${formatCallDuration(meta.duration)}` : "";
+    const fullDate = new Date(call.created_at).toLocaleString(state.lang === "ar" ? "ar-SA" : "en-US", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+    row.innerHTML = `
+      <div class="call-history-avatar">${
+        peer?.avatar_url ? `<img src="${escapeHtml(peer.avatar_url)}" alt="">` : escapeHtml((peer?.display_name || "?").trim().charAt(0))
+      }</div>
+      <div class="call-history-main">
+        <strong>${escapeHtml(peer?.display_name || "مستخدم")}</strong>
+        <span><b class="call-card-dir ${dirClass}">${dirIcon}</b>${meta.isVideo ? "🎥" : "📞"} ${escapeHtml(meta.label)}${durationLabel}</span>
+      </div>
+      <time datetime="${escapeHtml(call.created_at)}" title="${escapeHtml(fullDate)}">${escapeHtml(formatCallTime(call.created_at))}<br><small>${escapeHtml(
+        new Date(call.created_at).toLocaleDateString(state.lang === "ar" ? "ar-SA" : "en-US", { day: "2-digit", month: "2-digit", year: "numeric" })
+      )}</small></time>
+      <div class="call-history-actions">
+        <button type="button" data-call-back="${escapeHtml(call.id)}" title="معاودة الاتصال" aria-label="معاودة الاتصال">${meta.isVideo ? "🎥" : "📞"}</button>
+        <button type="button" class="call-history-delete" data-call-delete="${escapeHtml(call.id)}" title="حذف من سجلي" aria-label="حذف المكالمة">🗑️</button>
+      </div>`;
+
+    row.querySelector("[data-call-back]")?.addEventListener("click", async () => {
+      if (!peer?.id) return;
+      closeCallHistory();
+      await startCallWith(peer, call.conversation_id, call.call_type);
+    });
+
+    row.querySelector("[data-call-delete]")?.addEventListener("click", async (ev) => {
+      const button = ev.currentTarget;
+      if (!window.confirm("حذف هذه المكالمة من سجلك؟")) return;
       button.disabled = true;
       const { error: deleteError } = await supabase
         .from("call_history_hidden")
-        .insert({ user_id: state.me.id, room_id: roomId });
+        .insert({ user_id: state.me.id, room_id: call.id });
       if (deleteError && deleteError.code !== "23505") {
         button.disabled = false;
         showAuthError("تعذّر حذف المكالمة من السجل.");
         return;
       }
-      button.closest("[data-call-row]")?.remove();
-      if (!list.querySelector("[data-call-row]")) list.textContent = "لا توجد مكالمات بعد.";
+      row.remove();
+      if (!list.querySelector("[data-call-row]")) {
+        list.innerHTML = `<div class="call-history-empty">${state.t?.no_calls || "لا توجد مكالمات بعد."}</div>`;
+      }
     });
+
+    fragment.appendChild(row);
   });
+
+  list.innerHTML = "";
+  list.appendChild(fragment);
+}
+
+/** فتح محادثة/مكالمة من رابط الإشعار (?conversation=...) أو رسالة الـ SW */
+function handleDeepLinks() {
+  const openById = async (conversationId) => {
+    if (!conversationId || !state.me) return;
+    const { data } = await supabase
+      .from("conversations")
+      .select("id,user_id,admin_id")
+      .eq("id", conversationId)
+      .maybeSingle();
+    if (!data) return;
+    const otherId = data.user_id === state.me.id ? data.admin_id : data.user_id;
+    const { data: peer } = await supabase.from("profiles").select("*").eq("id", otherId).maybeSingle();
+    if (peer) await openConversation({ ...peer, _conversationId: data.id });
+  };
+
+  try {
+    const url = new URL(window.location.href);
+    const conv = url.searchParams.get("conversation");
+    const hadCallParams = url.searchParams.has("answer_call") || url.searchParams.has("decline_call");
+    if (conv || hadCallParams) {
+      ["conversation", "answer_call", "decline_call"].forEach((k) => url.searchParams.delete(k));
+      window.history.replaceState({}, "", url.pathname + (url.search || "") + url.hash);
+      if (conv) openById(conv);
+      // المكالمة الواردة نفسها تصل عبر قناة الإشارات فور الاتصال بـ Realtime
+    }
+  } catch {
+    /* تجاهل */
+  }
+
+  if (!handleDeepLinks._wired && navigator.serviceWorker) {
+    handleDeepLinks._wired = true;
+    navigator.serviceWorker.addEventListener("message", (event) => {
+      if (event.data?.type === "OPEN_CONVERSATION" && event.data.conversationId) {
+        openById(event.data.conversationId);
+      }
+    });
+  }
 }
 
 /** يحذف الصورة الشخصية أو خلفية الدردشة من الملف الشخصي */
@@ -1165,7 +1522,7 @@ function buildContactRow(c, opts) {
   const row =
     document.createElement("div");
 
-  row.className = "contact-row";
+  row.className = "contact-row" + (c.is_blocked ? " blocked-user" : "");
 
   const initials =
     (c.display_name || "?")
@@ -1211,7 +1568,7 @@ function buildContactRow(c, opts) {
         ? `<div class="unread-badge">${c._unread}</div>`
         : ""
     }
-    ${state.me.is_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="حظر المستخدم">⛔</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
+    ${state.me.is_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="${c.is_blocked ? "إلغاء الحظر" : "حظر المستخدم"}">${c.is_blocked ? "✅" : "⛔"}</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
   `;
 
   row.querySelectorAll("[data-admin-action]").forEach((button) => {
@@ -1220,13 +1577,28 @@ function buildContactRow(c, opts) {
       if (!state.me.is_admin) return;
       const action = button.dataset.adminAction;
       if (action === "block") {
-        const { error } = await supabase.from("profiles").update({ is_blocked: true, blocked_at: new Date().toISOString() }).eq("id", c.id);
-        if (!error) button.disabled = true;
+        const blocking = !c.is_blocked;
+        if (!window.confirm(blocking ? `حظر ${c.display_name || "المستخدم"}؟ لن يتمكن من الدخول.` : `إلغاء حظر ${c.display_name || "المستخدم"}؟`)) return;
+        const { error } = await supabase.rpc("admin_set_user_blocked", { p_user_id: c.id, p_blocked: blocking });
+        if (error) {
+          showAuthError("تعذّر تنفيذ الحظر — تأكد من تطبيق sql/schema.sql وصلاحيات المشرف.");
+          return;
+        }
+        c.is_blocked = blocking;
+        button.textContent = blocking ? "✅" : "⛔";
+        button.title = blocking ? "إلغاء الحظر" : "حظر المستخدم";
+        row.classList.toggle("blocked-user", blocking);
+        showAuthError(blocking ? "تم حظر المستخدم." : "تم إلغاء الحظر.");
         return;
       }
-      if (action === "delete" && window.confirm("حذف المستخدم وجميع محادثاته؟")) {
-        await supabase.from("profiles").delete().eq("id", c.id);
+      if (action === "delete" && window.confirm(`حذف ${c.display_name || "المستخدم"} نهائياً مع جميع محادثاته ورسائله؟`)) {
+        const { error } = await supabase.rpc("admin_delete_user", { p_user_id: c.id });
+        if (error) {
+          showAuthError("تعذّر حذف المستخدم — تأكد من تطبيق sql/schema.sql وصلاحيات المشرف.");
+          return;
+        }
         row.remove();
+        showAuthError("تم حذف المستخدم.");
       }
     });
   });
@@ -1394,6 +1766,8 @@ async function openConversation(otherProfile) {
       id: conversationId,
       otherProfile,
     };
+    state.messagesHasMore = false;
+    state.loadingOlder = false;
 
     openConversationUIState(
       conversationId
@@ -1449,72 +1823,158 @@ async function openConversation(otherProfile) {
   }
 }
 
-async function loadMessages(conversationId) {
-  // 1) اعرض النسخة المخزّنة محلياً فوراً (تجربة سريعة + fallback عند الفشل)
+/**
+ * تحميل الرسائل — استراتيجية "Cache-first ثم مزامنة تفاضلية":
+ *  1) اعرض النسخة المخزّنة في IndexedDB فوراً (صفر انتظار، وتعمل دون اتصال).
+ *  2) إن كانت الكاش موجودة: اجلب من الشبكة فقط الرسائل الأحدث/المحدَّثة بعد
+ *     آخر created_at معروف (delta sync) بدل إعادة تحميل 500 رسالة كل مرة.
+ *  3) إن كانت الكاش فارغة: اجلب آخر صفحة (MESSAGES_PAGE_SIZE) بترتيب تنازلي
+ *     ثم اعكسها — أسرع بكثير من جلب كل التاريخ.
+ *  4) تحميل الأقدم عند التمرير للأعلى (loadOlderMessages).
+ */
+async function loadMessages(conversationId, { silent = false } = {}) {
+  const box = $("#chat-messages");
+
+  // 1) الكاش
   const cachedResult = await safeAsync(
     "loadMessages:cache",
     () => getCachedMessages(conversationId),
     { fallback: [] }
   );
-
   const cached = cachedResult.data || [];
+
   const readStateResult = await safeAsync(
     "loadMessages:read-state",
     () => getReadState(conversationId),
     { fallback: null }
   );
 
-  if (cached.length) {
+  if (state.activeConversation?.id !== conversationId) return;
+
+  if (cached.length && !silent) {
     state.messages = cached;
-    renderMessages();
-    if (typeof readStateResult.data?.scroll_top === "number") {
-      $("#chat-messages").scrollTop = readStateResult.data.scroll_top;
+    state.messagesHasMore = cached.length >= MESSAGES_PAGE_SIZE;
+    renderMessages({ keepScroll: false });
+    if (box && typeof readStateResult.data?.scroll_top === "number" && !state.isOnline) {
+      box.scrollTop = readStateResult.data.scroll_top;
     }
   }
 
   if (!state.isOnline) {
-    return;
-  }
-
-  // 2) ثم حدّث من الشبكة — أي فشل يُبقي النسخة المخزّنة معروضة
-  const { ok, data } = await safeQuery(
-    "loadMessages:network",
-    () =>
-      supabase
-        .from("messages")
-        .select("*")
-        .eq("conversation_id", conversationId)
-        .order("created_at", { ascending: true })
-        .limit(500),
-    null
-  );
-
-  if (!ok || !Array.isArray(data)) {
-    if (!cached.length) {
-      showAuthError("تعذّر تحميل الرسائل — تحقق من الاتصال.");
+    if (!cached.length && !silent) {
+      state.messages = [];
+      renderMessages();
     }
     return;
   }
 
-  // تجاهل الرد إن غُيّرت المحادثة أثناء انتظار الشبكة (سباق حالة)
-  if (state.activeConversation?.id !== conversationId) {
+  // 2/3) الشبكة
+  const latestCachedAt = cached.length ? cached[cached.length - 1].created_at : null;
+  const deltaMode = Boolean(latestCachedAt) && cached.length > 0;
+
+  const { ok, data } = await safeQuery(
+    "loadMessages:network",
+    () => {
+      let q = supabase
+        .from("messages")
+        .select(MESSAGE_COLUMNS)
+        .eq("conversation_id", conversationId);
+      if (deltaMode) {
+        // الرسائل الجديدة + أي تحديثات حالة (read/delivered) على آخر 60 رسالة
+        const since = cached[Math.max(0, cached.length - 60)].created_at;
+        q = q.gte("created_at", since).order("created_at", { ascending: true }).limit(500);
+      } else {
+        q = q.order("created_at", { ascending: false }).limit(MESSAGES_PAGE_SIZE);
+      }
+      return q;
+    },
+    null
+  );
+
+  if (!ok || !Array.isArray(data)) {
+    if (!cached.length && !silent) showAuthError("تعذّر تحميل الرسائل — تحقق من الاتصال.");
     return;
   }
 
-  state.messages = data;
+  // تجاهل الرد إن غُيّرت المحادثة أثناء انتظار الشبكة (سباق حالة)
+  if (state.activeConversation?.id !== conversationId) return;
 
-  renderMessages();
+  let merged;
+  if (deltaMode) {
+    const byId = new Map(cached.map((m) => [m.id, m]));
+    data.forEach((m) => byId.set(m.id, m));
+    // أزل الرسائل المحلية المؤقتة التي وصلت نسختها الحقيقية
+    const pending = state.messages.filter((m) => m._pending && !byId.has(m.id));
+    merged = [...byId.values(), ...pending].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    // حذف على الخادم: رسائل كانت ضمن نافذة الدلتا ولم تعد موجودة
+    const since = cached[Math.max(0, cached.length - 60)].created_at;
+    const serverIds = new Set(data.map((m) => m.id));
+    const removed = cached.filter((m) => m.created_at >= since && !serverIds.has(m.id) && !String(m.id).startsWith("local-"));
+    if (removed.length) {
+      merged = merged.filter((m) => !removed.some((r) => r.id === m.id));
+      removed.forEach((r) => safeAsync("cache:prune", () => removeCachedMessage(r.id)));
+    }
+    state.messagesHasMore = state.messagesHasMore || cached.length >= MESSAGES_PAGE_SIZE;
+  } else {
+    merged = [...data].reverse();
+    state.messagesHasMore = data.length >= MESSAGES_PAGE_SIZE;
+  }
 
-  await safeAsync("loadMessages:persist", () =>
-    cacheMessages(conversationId, state.messages)
-  );
+  const changed = messagesSignature(merged) !== messagesSignature(state.messages);
+  state.messages = merged;
+  if (changed || !silent) renderMessages({ keepScroll: silent });
+
+  await safeAsync("loadMessages:persist", () => cacheMessages(conversationId, merged.filter((m) => !m._pending)));
   await safeAsync("loadMessages:save-state", () =>
     saveReadState(conversationId, {
-      last_message_id: state.messages.at(-1)?.id || readStateResult.data?.last_message_id || null,
-      last_message_at: state.messages.at(-1)?.created_at || readStateResult.data?.last_message_at || null,
-      scroll_top: $("#chat-messages")?.scrollTop || 0,
+      last_message_id: merged.at(-1)?.id || readStateResult.data?.last_message_id || null,
+      last_message_at: merged.at(-1)?.created_at || readStateResult.data?.last_message_at || null,
+      scroll_top: box?.scrollTop || 0,
     })
   );
+}
+
+function messagesSignature(list) {
+  return (list || []).map((m) => `${m.id}:${m.status}:${m.content?.length || 0}`).join("|");
+}
+
+/** تحميل صفحة أقدم عند التمرير لأعلى المحادثة */
+async function loadOlderMessages() {
+  const conv = state.activeConversation;
+  const box = $("#chat-messages");
+  if (!conv || !box || state.loadingOlder || !state.messagesHasMore || !state.isOnline) return;
+  const oldest = state.messages.find((m) => !m._pending);
+  if (!oldest) return;
+
+  state.loadingOlder = true;
+  const prevHeight = box.scrollHeight;
+
+  const { ok, data } = await safeQuery(
+    "loadOlderMessages",
+    () =>
+      supabase
+        .from("messages")
+        .select(MESSAGE_COLUMNS)
+        .eq("conversation_id", conv.id)
+        .lt("created_at", oldest.created_at)
+        .order("created_at", { ascending: false })
+        .limit(MESSAGES_PAGE_SIZE),
+    null
+  );
+
+  state.loadingOlder = false;
+  if (!ok || !Array.isArray(data) || state.activeConversation?.id !== conv.id) return;
+
+  state.messagesHasMore = data.length >= MESSAGES_PAGE_SIZE;
+  if (!data.length) return;
+
+  const existing = new Set(state.messages.map((m) => m.id));
+  const older = data.reverse().filter((m) => !existing.has(m.id));
+  state.messages = [...older, ...state.messages];
+  renderMessages({ keepScroll: true });
+  // حافظ على موضع القراءة
+  box.scrollTop = box.scrollHeight - prevHeight;
+  await safeAsync("cache:older", () => cacheMessages(conv.id, older));
 }
 
 async function loadReactionsForConversation() {
@@ -1558,7 +2018,7 @@ async function loadReactionsForConversation() {
   renderMessages();
 }
 
-function renderMessages() {
+function renderMessages({ keepScroll = false } = {}) {
   const box =
     $("#chat-messages");
 
@@ -1566,6 +2026,9 @@ function renderMessages() {
 
   // لا نرسم بدون ملف شخصي محمّل (يمنع قراءة state.me.id على null)
   if (!state.me) return;
+
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+  const prevScrollTop = box.scrollTop;
 
   box.innerHTML = "";
 
@@ -1582,9 +2045,28 @@ function renderMessages() {
   // الرسم عبر DocumentFragment: إعادة تدفّق (reflow) واحدة بدل واحدة لكل رسالة
   const fragment = document.createDocumentFragment();
 
+  if (state.messagesHasMore) {
+    const more = document.createElement("div");
+    more.className = "load-older";
+    more.innerHTML = '<button type="button" class="load-older-btn">تحميل رسائل أقدم</button>';
+    more.querySelector("button")?.addEventListener("click", () => loadOlderMessages());
+    fragment.appendChild(more);
+  }
+
+  let lastDay = null;
   state.messages.forEach((m) => {
     try {
-      fragment.appendChild(buildMessageBubble(m));
+      const day = new Date(m.created_at).toDateString();
+      if (day !== lastDay) {
+        const sep = document.createElement("div");
+        sep.className = "day-separator";
+        sep.innerHTML = `<span>${escapeHtml(formatCallDay(m.created_at))}</span>`;
+        fragment.appendChild(sep);
+        lastDay = day;
+      }
+      fragment.appendChild(
+        m.message_type === "call" ? buildCallBubble(m) : buildMessageBubble(m)
+      );
     } catch (err) {
       // فقاعة تالفة يجب ألّا تُسقط المحادثة كلها
       console.error("buildMessageBubble failed for message:", m?.id, err);
@@ -1593,8 +2075,105 @@ function renderMessages() {
 
   box.appendChild(fragment);
 
-  box.scrollTop =
-    box.scrollHeight;
+  if (!box.dataset.scrollWired) {
+    box.dataset.scrollWired = "1";
+    box.addEventListener("scroll", () => {
+      if (box.scrollTop < 80) loadOlderMessages();
+      clearTimeout(box._saveScrollTimer);
+      box._saveScrollTimer = setTimeout(() => {
+        if (state.activeConversation) {
+          safeAsync("scroll:save", () =>
+            saveReadState(state.activeConversation.id, { scroll_top: box.scrollTop })
+          );
+        }
+      }, 400);
+    }, { passive: true });
+  }
+
+  if (keepScroll && !nearBottom) {
+    box.scrollTop = prevScrollTop;
+  } else {
+    box.scrollTop = box.scrollHeight;
+  }
+}
+
+/** بطاقة سجل المكالمة داخل المحادثة (مكالمة فائتة / مدة المكالمة) */
+function buildCallBubble(m) {
+  const row = document.createElement("div");
+  row.className = "bubble-row call-row";
+  row.dataset.messageId = m.id;
+
+  const callerId = m.call_caller_id || m.sender_id;
+  const outgoing = callerId === state.me.id;
+  const isVideo = m.call_type === "video" || /فيديو/.test(m.content || "");
+  const duration = Number(m.call_duration_seconds || 0);
+  let status = m.call_status;
+  if (!status) {
+    // توافق مع بطاقات قديمة بلا call_status
+    status = /فائتة/.test(m.content || "") ? "missed" : duration ? "ended" : "ended";
+  }
+  const answered = status === "ended" && duration > 0;
+
+  let kind = "completed";
+  let title;
+  if (status === "missed") {
+    kind = outgoing ? "unanswered" : "missed";
+    title = outgoing ? (isVideo ? "مكالمة فيديو لم يُرد عليها" : "مكالمة صوتية لم يُرد عليها") : (isVideo ? "مكالمة فيديو فائتة" : "مكالمة صوتية فائتة");
+  } else if (status === "declined") {
+    kind = outgoing ? "unanswered" : "declined";
+    title = outgoing ? "تم رفض المكالمة" : (isVideo ? "مكالمة فيديو مرفوضة" : "مكالمة صوتية مرفوضة");
+  } else if (status === "failed" || status === "network_lost") {
+    kind = "unanswered";
+    title = "مكالمة لم تكتمل";
+  } else {
+    title = isVideo ? "مكالمة فيديو" : "مكالمة صوتية";
+  }
+  if (!answered && kind === "completed") {
+    kind = "unanswered";
+  }
+
+  const time = new Date(m.created_at).toLocaleTimeString(state.lang === "ar" ? "ar-SA" : "en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const dirIcon = kind === "missed" ? "↙" : outgoing ? "↗" : "↙";
+  const dirClass = kind === "missed" ? "missed" : outgoing ? "out" : "in";
+  const dirLabel = outgoing ? "صادرة" : "واردة";
+  const sub = answered ? `المدة ${formatCallDuration(duration)}` : kind === "missed" ? "اضغط لمعاودة الاتصال" : kind === "unanswered" ? "لم يتم الرد" : "";
+  const canCallBack = Boolean(state.activeConversation?.otherProfile?.id) && state.isOnline;
+
+  row.innerHTML = `
+    <div class="bubble">
+      <div class="call-card ${kind} ${outgoing ? "mine" : ""}">
+        <div class="call-card-icon">${isVideo ? "🎥" : "📞"}</div>
+        <div class="call-card-title">${escapeHtml(title)}</div>
+        <div class="call-card-sub"><span class="call-card-dir ${dirClass}">${dirIcon} ${dirLabel}</span>${sub ? `<span>· ${escapeHtml(sub)}</span>` : ""}</div>
+        ${canCallBack ? `<button type="button" class="call-card-callback" title="معاودة الاتصال" aria-label="معاودة الاتصال">${isVideo ? "🎥" : "📞"}</button>` : ""}
+        <div class="call-card-time">${time}</div>
+      </div>
+    </div>`;
+
+  row.querySelector(".call-card-callback")?.addEventListener("click", () => {
+    startCallWith(state.activeConversation.otherProfile, state.activeConversation.id, isVideo ? "video" : "audio");
+  });
+
+  if (state.me.is_admin) {
+    // المشرف يستطيع حذف بطاقة المكالمة كأي رسالة (RLS: حذف المشرفين فقط)
+    row.addEventListener("contextmenu", async (e) => {
+      e.preventDefault();
+      if (!window.confirm("حذف سجل هذه المكالمة من المحادثة؟")) return;
+      const { error } = await supabase.from("messages").delete().eq("id", m.id);
+      if (error) {
+        showAuthError("لا يمكن حذف الرسالة.");
+        return;
+      }
+      state.messages = state.messages.filter((x) => x.id !== m.id);
+      await safeAsync("cache:delete-message", () => removeCachedMessage(m.id));
+      renderMessages({ keepScroll: true });
+    });
+  }
+
+  return row;
 }
 
 function findMessageById(id) {
@@ -2760,7 +3339,27 @@ async function sendMessage({
     return;
   }
 
+  // إرسال متفائل (Optimistic UI): تظهر الرسالة فوراً بعلامة 🕓 ثم تُستبدل
+  // بنسخة الخادم عند وصول حدث Realtime أو رد الإدراج — يزيل الإحساس بالتأخير.
+  const optimisticId = `local-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const optimistic = {
+    id: optimisticId,
+    conversation_id: conv.id,
+    sender_id: state.me.id,
+    content: content || null,
+    attachment_url: finalAttachmentUrl || null,
+    attachment_type: finalAttachmentType || null,
+    reply_to_id: replyToId,
+    status: "pending",
+    created_at: new Date().toISOString(),
+    _pending: true,
+  };
+  state.messages.push(optimistic);
+  renderMessages();
+  clearReply();
+
   const {
+    data: inserted,
     error,
   } = await supabase
     .from("messages")
@@ -2781,14 +3380,44 @@ async function sendMessage({
         replyToId,
       status:
         "sent",
-    });
+    })
+    .select(MESSAGE_COLUMNS)
+    .maybeSingle();
 
   if (error) {
-    showAuthError(
-      error.message
-    );
-
+    // فشل شبكة → خزّن في صندوق الصادر ليُرسل تلقائياً لاحقاً
+    const networkish = /failed to fetch|network|timeout|abort/i.test(error.message || "") || !navigator.onLine;
+    if (networkish) {
+      const queued = await safeAsync("outbox:queue-fallback", () =>
+        queueOutboxMessage({
+          conversation_id: conv.id,
+          sender_id: state.me.id,
+          content: content || null,
+          attachment_url: finalAttachmentUrl || null,
+          attachment_type: finalAttachmentType || null,
+          reply_to_id: replyToId,
+        })
+      );
+      if (queued.ok) {
+        showAuthError("تعذّر الإرسال الآن — ستُرسل الرسالة تلقائياً عند استقرار الاتصال.");
+        return;
+      }
+    }
+    state.messages = state.messages.filter((m) => m.id !== optimisticId);
+    renderMessages({ keepScroll: true });
+    showAuthError(error.message);
     return;
+  }
+
+  if (state.activeConversation?.id === conv.id) {
+    const idx = state.messages.findIndex((m) => m.id === optimisticId);
+    const already = inserted && state.messages.some((m) => m.id === inserted.id);
+    if (idx > -1) {
+      if (inserted && !already) state.messages[idx] = inserted;
+      else state.messages.splice(idx, 1);
+      renderMessages({ keepScroll: true });
+    }
+    if (inserted) safeAsync("cache:sent", () => cacheMessages(conv.id, [inserted]));
   }
 
   const preview =
@@ -2824,8 +3453,6 @@ async function sendMessage({
       err
     );
   }
-
-  clearReply();
 
   await setTyping(false);
 }
@@ -3422,9 +4049,15 @@ function subscribeToConversation(
             );
 
           if (!exists) {
-            state.messages.push(
-              payload.new
-            );
+            // أزل أي نسخة محلية مؤقتة مطابقة (نفس المحتوى من نفس المرسل)
+            if (payload.new.sender_id === state.me.id) {
+              const i = state.messages.findIndex(
+                (m) => m._pending && m.content === payload.new.content
+              );
+              if (i > -1) state.messages.splice(i, 1);
+            }
+            state.messages.push(payload.new);
+            state.messages.sort((a, b) => a.created_at.localeCompare(b.created_at));
           }
 
           renderMessages();
@@ -3439,7 +4072,7 @@ function subscribeToConversation(
               .sender_id !==
             state.me.id
           ) {
-            playNotificationSound();
+            if (payload.new.message_type !== "call") playNotificationSound();
 
             await markConversationRead(
               conversationId
@@ -3472,9 +4105,26 @@ function subscribeToConversation(
               idx
             ] =
               payload.new;
+            cacheMessages(conversationId, [payload.new]);
           }
 
-          renderMessages();
+          renderMessages({ keepScroll: true });
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "messages",
+        },
+        (payload) => {
+          const id = payload.old?.id;
+          if (!id) return;
+          const before = state.messages.length;
+          state.messages = state.messages.filter((m) => m.id !== id);
+          safeAsync("cache:rt-delete", () => removeCachedMessage(id));
+          if (state.messages.length !== before) renderMessages({ keepScroll: true });
         }
       )
       .subscribe();
@@ -3550,6 +4200,7 @@ function subscribeToConversation(
 async function markConversationRead(
   conversationId
 ) {
+  if (!state.isOnline) return;
 
   try {
     const { error } = await supabase

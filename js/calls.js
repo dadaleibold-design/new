@@ -13,6 +13,14 @@
 
 import { AGORA, isAgoraConfigured, buildAgoraChannelName } from "./config.js";
 import { safeAsync, safeQuery, safeDom, guard } from "./safety.js";
+import {
+  startRingtone,
+  stopRingtone as stopRingtoneEngine,
+  playConnectedTone,
+  playEndedTone,
+  playBusyTone,
+  unlockAudio,
+} from "./ringtone.js";
 
 /* ------------------------------------------------------------
  * 1) تحميل Agora SDK بشكل كسول
@@ -143,7 +151,11 @@ const callState = {
 
   micMuted: false,
   cameraOff: false,
+  speakerOn: true,
+  minimized: false,
+  ringtoneKind: null,
   joining: false,
+  onCallLogged: null, // callback يُستدعى بعد كتابة بطاقة المكالمة في المحادثة
 };
 
 function t(key, fallback) {
@@ -192,22 +204,50 @@ function ensureCallOverlay() {
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
   overlay.innerHTML = `
-    <div class="call-stage">
+    <div class="call-stage" id="call-stage" data-type="audio" data-phase="ringing">
+      <div class="call-backdrop" id="call-backdrop"></div>
       <div id="call-remote-video" class="call-video call-video-remote"></div>
-      <div id="call-local-video" class="call-video call-video-local"></div>
+      <div id="call-local-video" class="call-video call-video-local hidden"></div>
+
+      <header class="call-topbar">
+        <button type="button" id="call-btn-minimize" class="call-top-btn" title="تصغير" aria-label="تصغير">⌄</button>
+        <div class="call-topbar-center">
+          <span class="call-secure">🔒 <span>مشفّرة من طرف إلى طرف</span></span>
+        </div>
+        <button type="button" id="call-btn-flip" class="call-top-btn hidden" title="تبديل الكاميرا" aria-label="تبديل الكاميرا">🔄</button>
+      </header>
 
       <div class="call-peer-card" id="call-peer-card">
-        <div class="call-avatar"><img id="call-peer-avatar" src="" alt="" /></div>
+        <div class="call-avatar-wrap">
+          <span class="call-ring call-ring-1"></span>
+          <span class="call-ring call-ring-2"></span>
+          <span class="call-ring call-ring-3"></span>
+          <div class="call-avatar"><img id="call-peer-avatar" src="" alt="" /><span id="call-peer-initial" class="call-avatar-initial"></span></div>
+        </div>
         <div class="call-peer-name" id="call-peer-name"></div>
-        <div class="call-status-text" id="call-status-text"></div>
+        <div class="call-status-text" id="call-status-text"><span class="call-status-label"></span><span class="call-dots"><i></i><i></i><i></i></span></div>
         <div class="call-timer" id="call-timer"></div>
+        <div class="call-quality" id="call-quality" title="جودة الاتصال"><i></i><i></i><i></i><i></i></div>
       </div>
 
       <div class="call-controls" id="call-controls">
-        <button type="button" id="call-btn-mic" class="call-ctrl" title="كتم الصوت">🎙️</button>
-        <button type="button" id="call-btn-cam" class="call-ctrl" title="إيقاف الكاميرا">🎥</button>
-        <button type="button" id="call-btn-switch" class="call-ctrl" title="تبديل الكاميرا">🔄</button>
-        <button type="button" id="call-btn-end" class="call-ctrl call-ctrl-end" title="إنهاء">📵</button>
+        <button type="button" id="call-btn-speaker" class="call-ctrl" title="مكبّر الصوت" aria-label="مكبّر الصوت" data-label="السماعة">
+          <span class="call-ctrl-icon">🔊</span><span class="call-ctrl-label">السماعة</span>
+        </button>
+        <button type="button" id="call-btn-cam" class="call-ctrl" title="إيقاف الكاميرا" aria-label="إيقاف الكاميرا">
+          <span class="call-ctrl-icon">📷</span><span class="call-ctrl-label">الكاميرا</span>
+        </button>
+        <button type="button" id="call-btn-mic" class="call-ctrl" title="كتم الصوت" aria-label="كتم الصوت">
+          <span class="call-ctrl-icon">🎙️</span><span class="call-ctrl-label">كتم</span>
+        </button>
+        <button type="button" id="call-btn-switch" class="call-ctrl hidden" title="تبديل الكاميرا" aria-label="تبديل الكاميرا">
+          <span class="call-ctrl-icon">🔄</span><span class="call-ctrl-label">تبديل</span>
+        </button>
+        <button type="button" id="call-btn-end" class="call-ctrl call-ctrl-end" title="إنهاء" aria-label="إنهاء المكالمة">
+          <span class="call-ctrl-icon">
+            <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path fill="currentColor" d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.29-.7.29-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.7l-2.48 2.49c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>
+          </span><span class="call-ctrl-label">إنهاء</span>
+        </button>
       </div>
     </div>
   `;
@@ -223,10 +263,55 @@ function ensureCallOverlay() {
     .querySelector("#call-btn-switch")
     ?.addEventListener("click", guard("call:switch", switchCamera));
   overlay
+    .querySelector("#call-btn-flip")
+    ?.addEventListener("click", guard("call:flip", switchCamera));
+  overlay
+    .querySelector("#call-btn-speaker")
+    ?.addEventListener("click", guard("call:speaker", toggleSpeaker));
+  overlay
+    .querySelector("#call-btn-minimize")
+    ?.addEventListener("click", guard("call:minimize", () => setMinimized(true)));
+  overlay
     .querySelector("#call-btn-end")
     ?.addEventListener("click", guard("call:end", () => endCall("ended")));
 
+  // النقر على الفيديو يُظهر/يُخفي الضوابط (كما في تطبيقات المكالمات)
+  overlay.querySelector("#call-remote-video")?.addEventListener("click", () => {
+    if (callState.current?.callType === "video" && callState.current.connected) {
+      overlay.classList.toggle("controls-hidden");
+    }
+  });
+
   return overlay;
+}
+
+/** الفقاعة العائمة الصغيرة عند تصغير المكالمة */
+function ensureMiniBar() {
+  let bar = document.getElementById("call-mini");
+  if (bar) return bar;
+  bar = document.createElement("button");
+  bar.type = "button";
+  bar.id = "call-mini";
+  bar.className = "call-mini hidden";
+  bar.innerHTML = `<span class="call-mini-dot"></span><span id="call-mini-text">مكالمة جارية</span><span id="call-mini-timer" class="call-mini-timer"></span>`;
+  bar.addEventListener("click", guard("call:restore", () => setMinimized(false)));
+  document.body.appendChild(bar);
+  return bar;
+}
+
+function setMinimized(min) {
+  safeDom("call-minimize", () => {
+    const overlay = ensureCallOverlay();
+    const bar = ensureMiniBar();
+    callState.minimized = Boolean(min) && Boolean(callState.current);
+    overlay.classList.toggle("minimized", callState.minimized);
+    bar.classList.toggle("hidden", !callState.minimized);
+    document.body.classList.toggle("in-call", Boolean(callState.current) && !callState.minimized);
+    const text = document.getElementById("call-mini-text");
+    if (text && callState.current) {
+      text.textContent = `${callState.current.peer?.display_name || "مكالمة"} · اضغط للعودة`;
+    }
+  });
 }
 
 function ensureIncomingDialog() {
@@ -236,14 +321,31 @@ function ensureIncomingDialog() {
   box = document.createElement("div");
   box.id = "incoming-call";
   box.className = "incoming-call hidden";
+  box.setAttribute("role", "alertdialog");
   box.innerHTML = `
     <div class="incoming-card">
-      <div class="call-avatar"><img id="incoming-avatar" src="" alt="" /></div>
+      <div class="incoming-kind" id="incoming-kind">مكالمة صوتية واردة</div>
+      <div class="call-avatar-wrap">
+        <span class="call-ring call-ring-1"></span>
+        <span class="call-ring call-ring-2"></span>
+        <span class="call-ring call-ring-3"></span>
+        <div class="call-avatar"><img id="incoming-avatar" src="" alt="" /><span id="incoming-initial" class="call-avatar-initial"></span></div>
+      </div>
       <div class="incoming-name" id="incoming-name"></div>
       <div class="incoming-sub" id="incoming-sub"></div>
       <div class="incoming-actions">
-        <button type="button" id="incoming-decline" class="call-ctrl call-ctrl-end">📵</button>
-        <button type="button" id="incoming-accept" class="call-ctrl call-ctrl-accept">📞</button>
+        <div class="incoming-action">
+          <button type="button" id="incoming-decline" class="call-ctrl call-ctrl-end" aria-label="رفض">
+            <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path fill="currentColor" d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.29-.7.29-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.7l-2.48 2.49c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>
+          </button>
+          <span>رفض</span>
+        </div>
+        <div class="incoming-action">
+          <button type="button" id="incoming-accept" class="call-ctrl call-ctrl-accept pulse" aria-label="قبول">
+            <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path fill="currentColor" d="M6.62 10.79a15.05 15.05 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.01-.24c1.12.37 2.33.57 3.58.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1.02l-2.2 2.2z"/></svg>
+          </button>
+          <span>قبول</span>
+        </div>
       </div>
     </div>
   `;
@@ -263,39 +365,81 @@ function setOverlayVisible(visible) {
   safeDom("call-overlay", () => {
     const overlay = ensureCallOverlay();
     overlay.classList.toggle("hidden", !visible);
+    overlay.classList.remove("controls-hidden", "minimized");
+    ensureMiniBar().classList.add("hidden");
+    callState.minimized = false;
     document.body.classList.toggle("in-call", visible);
+    if (!visible) setCallPhase("ringing");
   });
 }
 
-function setCallStatus(text) {
+/** مرحلة المكالمة تتحكم بالأنيميشن (ringing | connecting | connected | ended) */
+function setCallPhase(phase) {
+  safeDom("call-phase", () => {
+    const stage = document.getElementById("call-stage");
+    if (stage) stage.dataset.phase = phase;
+  });
+}
+
+function setCallStatus(text, { animated = false } = {}) {
   safeDom("call-status", () => {
     const el = document.getElementById("call-status-text");
-    if (el) el.textContent = text || "";
+    if (!el) return;
+    const label = el.querySelector(".call-status-label");
+    if (label) label.textContent = text || "";
+    else el.textContent = text || "";
+    el.classList.toggle("animated", Boolean(animated) && Boolean(text));
   });
+}
+
+function initialOf(name) {
+  return String(name || "?").trim().charAt(0).toUpperCase() || "?";
 }
 
 function setPeerInfo(peer) {
   safeDom("call-peer", () => {
     const nameEl = document.getElementById("call-peer-name");
     const avatarEl = document.getElementById("call-peer-avatar");
+    const initialEl = document.getElementById("call-peer-initial");
+    const backdrop = document.getElementById("call-backdrop");
     if (nameEl) nameEl.textContent = peer?.display_name || "مستخدم";
-    if (avatarEl) avatarEl.src = peer?.avatar_url || "./icons/icon.png";
+    const hasAvatar = Boolean(peer?.avatar_url);
+    if (avatarEl) {
+      avatarEl.src = hasAvatar ? peer.avatar_url : "";
+      avatarEl.classList.toggle("hidden", !hasAvatar);
+    }
+    if (initialEl) {
+      initialEl.textContent = initialOf(peer?.display_name);
+      initialEl.classList.toggle("hidden", hasAvatar);
+    }
+    if (backdrop) {
+      backdrop.style.backgroundImage = hasAvatar ? `url("${peer.avatar_url}")` : "";
+    }
   });
+}
+
+function formatDuration(secs) {
+  const h = Math.floor(secs / 3600);
+  const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, "0");
+  const ss = String(secs % 60).padStart(2, "0");
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
 function startDurationTimer() {
   stopDurationTimer();
-  const startedAt = Date.now();
-  callState.durationTimer = setInterval(() => {
+  const startedAt = callState.current?.startedAt || Date.now();
+  const tick = () => {
     safeDom("call-timer", () => {
-      const el = document.getElementById("call-timer");
-      if (!el) return;
       const secs = Math.floor((Date.now() - startedAt) / 1000);
-      const mm = String(Math.floor(secs / 60)).padStart(2, "0");
-      const ss = String(secs % 60).padStart(2, "0");
-      el.textContent = `${mm}:${ss}`;
+      const label = formatDuration(secs);
+      const el = document.getElementById("call-timer");
+      if (el) el.textContent = label;
+      const mini = document.getElementById("call-mini-timer");
+      if (mini) mini.textContent = label;
     });
-  }, 1000);
+  };
+  tick();
+  callState.durationTimer = setInterval(tick, 1000);
 }
 
 function stopDurationTimer() {
@@ -305,25 +449,38 @@ function stopDurationTimer() {
   }
 }
 
-function playRingtone() {
+/**
+ * نغمة الرنين التفاعلية:
+ *   - "outgoing": نغمة انتظار أثناء رنين الطرف الآخر
+ *   - "incoming": لحن رنين + اهتزاز للمكالمة الواردة
+ * تُولَّد عبر Web Audio (js/ringtone.js) مع الرجوع إلى ملف notify.mp3 كبديل.
+ */
+function playRingtone(kind = "outgoing") {
   safeDom("ringtone", () => {
-    const audio = document.getElementById("notification-sound");
-    if (!audio) return;
-    callState.ringtoneEl = audio;
-    audio.loop = true;
-    // play() قد يُرجع undefined في بيئات قديمة، وقد يُرفض بسبب سياسة التشغيل التلقائي
-    const p = audio.play();
-    if (p && typeof p.catch === "function") p.catch(() => {});
+    startRingtone(kind);
+    callState.ringtoneKind = kind;
+    // بديل لمتصفحات بلا Web Audio: كرّر صوت الإشعار
+    if (!(window.AudioContext || window.webkitAudioContext)) {
+      const audio = document.getElementById("notification-sound");
+      if (!audio) return;
+      callState.ringtoneEl = audio;
+      audio.loop = true;
+      const p = audio.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    }
   });
 }
 
 function stopRingtone() {
   safeDom("ringtone-stop", () => {
-    const audio = callState.ringtoneEl || document.getElementById("notification-sound");
+    stopRingtoneEngine();
+    callState.ringtoneKind = null;
+    const audio = callState.ringtoneEl;
     if (!audio) return;
     audio.loop = false;
     audio.pause();
     audio.currentTime = 0;
+    callState.ringtoneEl = null;
   });
 }
 
@@ -529,6 +686,10 @@ async function logCallEvent(roomId, event, meta = {}) {
   return result.ok;
 }
 
+/**
+ * يكتب بطاقة سجل المكالمة داخل المحادثة (تظهر للطرفين كرسالة نظامية).
+ * status: 'ended' (تم الرد — مع المدة) | 'missed' | 'declined' | 'failed' | 'network_lost'
+ */
 async function writeCallMessage(call, status, durationSeconds = 0) {
   const supabase = callState.ctx?.supabase;
   const me = callState.ctx?.getMe?.();
@@ -540,9 +701,16 @@ async function writeCallMessage(call, status, durationSeconds = 0) {
     .eq("call_id", call.roomId)
     .maybeSingle();
   if (existing?.id) return;
-  const isMissed = status === "missed";
-  const label = isMissed ? "مكالمة فائتة" : call.callType === "video" ? "مكالمة فيديو" : "مكالمة صوتية";
-  const duration = durationSeconds ? ` · المدة ${Math.floor(durationSeconds / 60)}:${String(durationSeconds % 60).padStart(2, "0")}` : "";
+
+  const typeLabel = call.callType === "video" ? "مكالمة فيديو" : "مكالمة صوتية";
+  let label = typeLabel;
+  if (status === "missed") label = `مكالمة فائتة (${call.callType === "video" ? "فيديو" : "صوتية"})`;
+  else if (status === "declined") label = `${typeLabel} مرفوضة`;
+  else if (status === "failed" || status === "network_lost") label = `${typeLabel} لم تكتمل`;
+  const duration = durationSeconds ? ` · المدة ${formatDuration(durationSeconds)}` : "";
+
+  // المتصل هو "المرسل" المنطقي لبطاقة المكالمة حتى لو كتبها المستقبل،
+  // لكن RLS تشترط sender_id = auth.uid()؛ لذا نخزّن caller_id في عمود مستقل.
   const result = await safeQuery("calls:chat-message", () =>
     supabase.from("messages").insert({
       conversation_id: call.conversationId,
@@ -550,12 +718,21 @@ async function writeCallMessage(call, status, durationSeconds = 0) {
       content: `${label}${duration}`,
       message_type: "call",
       call_id: call.roomId,
+      call_type: call.callType || "audio",
+      call_status: status,
+      call_caller_id: call.callerId || (call.direction === "outgoing" ? me.id : call.peer?.id) || me.id,
       call_duration_seconds: durationSeconds || null,
       status: "sent",
     })
   );
   if (!result.ok && result.error?.code !== "23505") {
     console.warn("[calls] تعذّر إنشاء بطاقة سجل المكالمة:", result.error);
+    return;
+  }
+  try {
+    callState.onCallLogged?.({ call, status, durationSeconds });
+  } catch {
+    /* تجاهل */
   }
 }
 
@@ -621,6 +798,7 @@ function attachClientHandlers(client) {
             user.videoTrack?.play(container, { fit: "cover" });
             container.classList.add("has-video");
             document.getElementById("call-peer-card")?.classList.add("compact");
+            document.getElementById("call-stage")?.classList.add("remote-video-on");
           }
         });
       }
@@ -639,9 +817,22 @@ function attachClientHandlers(client) {
           container.innerHTML = "";
           container.classList.remove("has-video");
           document.getElementById("call-peer-card")?.classList.remove("compact");
+          document.getElementById("call-stage")?.classList.remove("remote-video-on");
         }
       });
     }
+  });
+
+  client.on("network-quality", (stats) => {
+    safeDom("call-quality", () => {
+      const el = document.getElementById("call-quality");
+      if (!el) return;
+      // 0 غير معروف، 1 ممتاز ... 6 منقطع
+      const q = Math.max(stats?.downlinkNetworkQuality || 0, stats?.uplinkNetworkQuality || 0);
+      const bars = q === 0 ? 4 : q <= 2 ? 4 : q === 3 ? 3 : q === 4 ? 2 : 1;
+      el.dataset.bars = String(bars);
+      el.classList.toggle("poor", q >= 5);
+    });
   });
 
   client.on("user-left", (user) => {
@@ -654,9 +845,11 @@ function attachClientHandlers(client) {
 
   client.on("connection-state-change", (curr) => {
     if (curr === "DISCONNECTED" && callState.current) {
-      setCallStatus("انقطع الاتصال...");
+      setCallStatus("انقطع الاتصال", { animated: true });
     } else if (curr === "RECONNECTING") {
-      setCallStatus("إعادة الاتصال...");
+      setCallStatus("إعادة الاتصال", { animated: true });
+    } else if (curr === "CONNECTED" && callState.current?.connected) {
+      setCallStatus("");
     }
   });
 
@@ -769,6 +962,7 @@ async function leaveAgoraChannel() {
       local.classList.add("hidden");
     }
     document.getElementById("call-peer-card")?.classList.remove("compact");
+    document.getElementById("call-stage")?.classList.remove("remote-video-on");
   });
 }
 
@@ -845,15 +1039,19 @@ export async function startCall(callType = "audio") {
     peer,
     conversationId: conv.id,
     direction: "outgoing",
+    callerId: me.id,
+    calleeId: peer.id,
     connected: false,
   };
 
+  unlockAudio();
   setPeerInfo(peer);
-  setCallStatus(callType === "video" ? "جارٍ الاتصال بالفيديو..." : "جارٍ الاتصال...");
+  setCallPhase("ringing");
+  setCallStatus("جارٍ الاتصال", { animated: true });
   setOverlayVisible(true);
   updateControlsForType(callType);
   // تبدأ المكالمة من نقرة مستخدم، لذلك يسمح المتصفح بتشغيل النغمة هنا.
-  playRingtone();
+  playRingtone("outgoing");
 
   const roomCreated = await persistCallRoom({
     roomId,
@@ -887,6 +1085,8 @@ export async function startCall(callType = "audio") {
 
   if (!delivered) {
     notify("تعذّر إرسال دعوة المكالمة — قد يكون الطرف الآخر غير متصل.");
+  } else {
+    setCallStatus("يرن", { animated: true });
   }
 
   // انضم للقناة مباشرة حتى يسمع/يرى فوراً عند قبول الطرف الآخر
@@ -933,19 +1133,29 @@ async function handleIncomingInvite(payload) {
     const box = ensureIncomingDialog();
     const nameEl = box.querySelector("#incoming-name");
     const subEl = box.querySelector("#incoming-sub");
+    const kindEl = box.querySelector("#incoming-kind");
     const avatarEl = box.querySelector("#incoming-avatar");
+    const initialEl = box.querySelector("#incoming-initial");
+    const isVideo = payload.callType === "video";
 
     if (nameEl) nameEl.textContent = payload.caller?.display_name || "مكالمة واردة";
-    if (subEl) {
-      subEl.textContent =
-        payload.callType === "video" ? "مكالمة فيديو واردة..." : "مكالمة صوتية واردة...";
+    if (kindEl) kindEl.textContent = isVideo ? "🎥 مكالمة فيديو واردة" : "📞 مكالمة صوتية واردة";
+    if (subEl) subEl.textContent = "🔒 مشفّرة من طرف إلى طرف";
+    const hasAvatar = Boolean(payload.caller?.avatar_url);
+    if (avatarEl) {
+      avatarEl.src = hasAvatar ? payload.caller.avatar_url : "";
+      avatarEl.classList.toggle("hidden", !hasAvatar);
     }
-    if (avatarEl) avatarEl.src = payload.caller?.avatar_url || "./icons/icon.png";
+    if (initialEl) {
+      initialEl.textContent = initialOf(payload.caller?.display_name);
+      initialEl.classList.toggle("hidden", hasAvatar);
+    }
 
     box.classList.remove("hidden");
   });
 
-  playRingtone();
+  playRingtone("incoming");
+  showIncomingSystemNotification(payload);
 
   clearTimeout(callState.ringTimer);
   callState.ringTimer = setTimeout(() => {
@@ -956,6 +1166,9 @@ async function handleIncomingInvite(payload) {
         roomId: payload.roomId,
         conversationId: payload.conversationId,
         callType: payload.callType,
+        callerId: payload.caller?.id,
+        peer: payload.caller,
+        direction: "incoming",
       }, "missed");
       callState.incoming = null;
     }
@@ -965,6 +1178,7 @@ async function handleIncomingInvite(payload) {
 function hideIncomingDialog() {
   stopRingtone();
   clearTimeout(callState.ringTimer);
+  if (callState.incoming?.roomId) closeIncomingSystemNotification(callState.incoming.roomId);
   safeDom("incoming-hide", () => {
     document.getElementById("incoming-call")?.classList.add("hidden");
   });
@@ -989,12 +1203,16 @@ async function acceptIncomingCall() {
     peer: invite.caller,
     conversationId: invite.conversationId,
     direction: "incoming",
+    callerId: invite.caller?.id,
+    calleeId: callState.ctx?.getMe?.()?.id,
     connected: true,
     startedAt: Date.now(),
   };
 
+  unlockAudio();
   setPeerInfo(invite.caller);
-  setCallStatus("جارٍ الانضمام...");
+  setCallPhase("connecting");
+  setCallStatus("جارٍ الانضمام", { animated: true });
   setOverlayVisible(true);
   updateControlsForType(invite.callType);
 
@@ -1016,7 +1234,9 @@ async function acceptIncomingCall() {
     return;
   }
 
-  setCallStatus("متصل");
+  setCallPhase("connected");
+  setCallStatus("");
+  playConnectedTone();
   startDurationTimer();
 }
 
@@ -1047,7 +1267,9 @@ function handlePeerAccepted(payload) {
   callState.current.startedAt = Date.now();
   clearTimeout(callState.ringTimer);
   stopRingtone();
-  setCallStatus("متصل");
+  setCallPhase("connected");
+  setCallStatus("");
+  playConnectedTone();
   startDurationTimer();
   updateCallRoom(payload.roomId, {
     status: "active",
@@ -1058,6 +1280,9 @@ function handlePeerAccepted(payload) {
 function handlePeerDeclined(payload) {
   if (!callState.current || callState.current.roomId !== payload?.roomId) return;
   notify(payload?.reason === "busy" ? "الطرف الآخر مشغول حالياً." : "تم رفض المكالمة.");
+  setCallStatus(payload?.reason === "busy" ? "مشغول" : "تم الرفض");
+  stopRingtone();
+  playBusyTone();
   endCall("declined", { silent: true });
 }
 
@@ -1083,6 +1308,26 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
   stopRingtone();
   callState.joining = false;
 
+  // إلغاء المتصل قبل الرد = مكالمة فائتة لدى الطرف الآخر
+  let effectiveReason = reason;
+  if (call && !call.connected && reason === "ended" && call.direction === "outgoing") {
+    effectiveReason = "missed";
+  }
+
+  if (call) {
+    setCallPhase("ended");
+    setCallStatus(
+      effectiveReason === "missed"
+        ? "لم يتم الرد"
+        : effectiveReason === "declined"
+          ? "تم رفض المكالمة"
+          : "انتهت المكالمة"
+    );
+    if (reason !== "declined") playEndedTone();
+    // لحظة قصيرة ليقرأ المستخدم الحالة (كما في واتساب)
+    await new Promise((r) => setTimeout(r, call.connected ? 900 : 700));
+  }
+
   await leaveAgoraChannel();
 
   setOverlayVisible(false);
@@ -1094,7 +1339,17 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
 
   callState.micMuted = false;
   callState.cameraOff = false;
+  callState.speakerOn = true;
   callState.current = null;
+  safeDom("reset-ctrls", () => {
+    document.getElementById("call-btn-mic")?.classList.remove("active");
+    document.getElementById("call-btn-cam")?.classList.remove("active");
+    document.getElementById("call-btn-speaker")?.classList.remove("active");
+    const micIcon = document.querySelector("#call-btn-mic .call-ctrl-icon");
+    if (micIcon) micIcon.textContent = "🎙️";
+    const camIcon = document.querySelector("#call-btn-cam .call-ctrl-icon");
+    if (camIcon) camIcon.textContent = "📷";
+  });
 
   await setCallPresence("available");
 
@@ -1105,14 +1360,15 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
   }
 
   await updateCallRoom(call.roomId, {
-    status: reason === "ended" ? "ended" : reason,
+    status: effectiveReason,
     ended_at: new Date().toISOString(),
   });
-  await logCallEvent(call.roomId, reason, { direction: call.direction });
+  await logCallEvent(call.roomId, effectiveReason, { direction: call.direction });
   const durationSeconds = call.connected && call.startedAt
     ? Math.max(1, Math.floor((Date.now() - call.startedAt) / 1000))
     : 0;
-  await writeCallMessage(call, reason === "missed" ? "missed" : "ended", durationSeconds);
+  const messageStatus = call.connected ? "ended" : effectiveReason === "ended" ? "ended" : effectiveReason;
+  await writeCallMessage(call, messageStatus, durationSeconds);
 
   // حرّر قنوات الإشارة بعد اكتمال إرسال call:end
   closeOutboundChannels();
@@ -1124,10 +1380,63 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
 function updateControlsForType(callType) {
   safeDom("call-controls", () => {
     const isVideo = callType === "video";
+    document.getElementById("call-stage")?.setAttribute("data-type", isVideo ? "video" : "audio");
     document.getElementById("call-btn-cam")?.classList.toggle("hidden", !isVideo);
-    document.getElementById("call-btn-switch")?.classList.toggle("hidden", !isVideo);
+    document.getElementById("call-btn-flip")?.classList.toggle("hidden", !isVideo);
+    document.getElementById("call-btn-switch")?.classList.add("hidden");
+    document.getElementById("call-btn-speaker")?.classList.toggle("hidden", isVideo);
     document.getElementById("call-local-video")?.classList.toggle("hidden", !isVideo);
   });
+}
+
+/** مكبّر الصوت: على الويب نتحكم بمستوى الصوت البعيد (تجربة مشابهة للهاتف) */
+async function toggleSpeaker() {
+  callState.speakerOn = !callState.speakerOn;
+  callState.remoteUsers.forEach((user) => {
+    try {
+      user.audioTrack?.setVolume(callState.speakerOn ? 100 : 35);
+    } catch {
+      /* تجاهل */
+    }
+  });
+  safeDom("speaker-btn", () => {
+    const btn = document.getElementById("call-btn-speaker");
+    if (!btn) return;
+    btn.classList.toggle("active", !callState.speakerOn);
+    const icon = btn.querySelector(".call-ctrl-icon");
+    if (icon) icon.textContent = callState.speakerOn ? "🔊" : "🔈";
+  });
+}
+
+/** يُظهر إشعار نظام للمكالمة الواردة عندما يكون التبويب في الخلفية */
+async function showIncomingSystemNotification(payload) {
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    if (document.visibilityState === "visible") return;
+    const reg = await navigator.serviceWorker?.getRegistration?.();
+    const title = `${payload.caller?.display_name || "مكالمة واردة"}`;
+    const body = payload.callType === "video" ? "📹 مكالمة فيديو واردة — اضغط للرد" : "📞 مكالمة صوتية واردة — اضغط للرد";
+    if (reg?.showNotification) {
+      await reg.showNotification(title, {
+        body,
+        tag: `call-${payload.roomId}`,
+        renotify: true,
+        requireInteraction: true,
+        icon: payload.caller?.avatar_url || "./icons/icon.png",
+        badge: "./icons/icon.png",
+        vibrate: [400, 200, 400, 200, 400],
+        data: { type: "incoming_call", roomId: payload.roomId, conversationId: payload.conversationId },
+      });
+    }
+  } catch {
+    /* تجاهل */
+  }
+}
+
+function closeIncomingSystemNotification(roomId) {
+  navigator.serviceWorker?.getRegistration?.().then((reg) => {
+    reg?.getNotifications?.({ tag: `call-${roomId}` }).then((list) => list.forEach((n) => n.close()));
+  }).catch(() => {});
 }
 
 async function toggleMicrophone() {
@@ -1140,7 +1449,8 @@ async function toggleMicrophone() {
   safeDom("mic-btn", () => {
     const btn = document.getElementById("call-btn-mic");
     if (!btn) return;
-    btn.textContent = callState.micMuted ? "🔇" : "🎙️";
+    const icon = btn.querySelector(".call-ctrl-icon");
+    if (icon) icon.textContent = callState.micMuted ? "🔇" : "🎙️";
     btn.classList.toggle("active", callState.micMuted);
   });
 }
@@ -1155,7 +1465,8 @@ async function toggleCamera() {
   safeDom("cam-btn", () => {
     const btn = document.getElementById("call-btn-cam");
     if (btn) {
-      btn.textContent = callState.cameraOff ? "🚫" : "🎥";
+      const icon = btn.querySelector(".call-ctrl-icon");
+      if (icon) icon.textContent = callState.cameraOff ? "🚫" : "📷";
       btn.classList.toggle("active", callState.cameraOff);
     }
     document.getElementById("call-local-video")?.classList.toggle("hidden", callState.cameraOff);
@@ -1184,9 +1495,20 @@ async function switchCamera() {
  * ---------------------------------------------------------- */
 export function initCalls(ctx) {
   callState.ctx = ctx;
+  callState.onCallLogged = typeof ctx?.onCallLogged === "function" ? ctx.onCallLogged : null;
 
   ensureCallOverlay();
   ensureIncomingDialog();
+  ensureMiniBar();
+
+  // فكّ قفل الصوت عند أول تفاعل حتى تعمل نغمة المكالمة الواردة
+  const unlockOnce = () => {
+    unlockAudio();
+    document.removeEventListener("pointerdown", unlockOnce);
+    document.removeEventListener("keydown", unlockOnce);
+  };
+  document.addEventListener("pointerdown", unlockOnce);
+  document.addEventListener("keydown", unlockOnce);
 
   // إنهاء آمن عند إغلاق التبويب حتى لا تبقى غرفة معلّقة
   window.addEventListener("pagehide", () => {
@@ -1204,6 +1526,21 @@ export function initCalls(ctx) {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && callState.current) endCall("ended");
   });
+}
+
+/** بدء مكالمة مع مستخدم محدد (يُستخدم من زر "معاودة الاتصال" في سجل المكالمات) */
+export async function startCallWith(peerProfile, conversationId, callType = "audio") {
+  if (!peerProfile?.id || !conversationId) return;
+  const conv = callState.ctx?.getActiveConversation?.();
+  if (conv?.id === conversationId) {
+    return startCall(callType);
+  }
+  // افتح المحادثة أولاً عبر التطبيق ثم ابدأ
+  if (typeof callState.ctx?.openConversation === "function") {
+    await callState.ctx.openConversation(peerProfile, conversationId);
+    return startCall(callType);
+  }
+  notify("افتح المحادثة أولاً لبدء مكالمة.");
 }
 
 /** يربط أزرار المكالمة في رأس المحادثة (تُستدعى بعد حقن الـ partial) */
