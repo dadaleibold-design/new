@@ -1,90 +1,165 @@
 // supabase/functions/send-push/index.ts
-// Edge Function تُستدعى تلقائياً (عبر trigger + pg_net) عند إدراج رسالة جديدة.
-// تُرسل Web Push للمستلم إن كان لديه اشتراك مسجّل في push_subscriptions.
-//
-// النشر:
-//   supabase functions deploy send-push
-//   supabase secrets set VAPID_PUBLIC_KEY=... VAPID_PRIVATE_KEY=... VAPID_SUBJECT=mailto:you@example.com
-//   supabase secrets set SUPABASE_SERVICE_ROLE_KEY=... SUPABASE_URL=...
-//
-// توليد مفاتيح VAPID (على جهازك، خارج هذه البيئة):
-//   npx web-push generate-vapid-keys
+// Sends Firebase Cloud Messaging notifications for newly inserted messages.
+// Required Edge Function secrets:
+//   FIREBASE_PROJECT_ID
+//   FIREBASE_CLIENT_EMAIL
+//   FIREBASE_PRIVATE_KEY  (the service-account PEM; escaped \n is supported)
+//   SEND_PUSH_SECRET      (shared secret used by the database trigger)
+// Optional:
+//   SUPABASE_URL
+//   SUPABASE_SERVICE_ROLE_KEY
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import webpush from "https://esm.sh/web-push@3.6.7";
+import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const VAPID_PUBLIC_KEY = Deno.env.get("VAPID_PUBLIC_KEY")!;
-const VAPID_PRIVATE_KEY = Deno.env.get("VAPID_PRIVATE_KEY")!;
-const VAPID_SUBJECT = Deno.env.get("VAPID_SUBJECT") || "mailto:admin@example.com";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID");
+const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL");
+const FIREBASE_PRIVATE_KEY = Deno.env.get("FIREBASE_PRIVATE_KEY")?.replace(/\\n/g, "\n");
+const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
 
-webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+  throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
+}
+if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
+  throw new Error("Firebase service-account secrets are not configured");
+}
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+const encoder = new TextEncoder();
+let firebaseAccessToken: { value: string; expiresAt: number } | null = null;
+
+function json(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function isAuthorized(req: Request) {
+  if (!SEND_PUSH_SECRET) return false;
+  const supplied = req.headers.get("x-send-push-secret");
+  const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  return supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET || bearer === SERVICE_ROLE_KEY;
+}
+
+async function getFirebaseAccessToken() {
+  if (firebaseAccessToken && firebaseAccessToken.expiresAt > Date.now() + 60_000) {
+    return firebaseAccessToken.value;
+  }
+
+  const key = await importPKCS8(FIREBASE_PRIVATE_KEY!, "RS256");
+  const now = Math.floor(Date.now() / 1000);
+  const assertion = await new SignJWT({
+    iss: FIREBASE_CLIENT_EMAIL,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+  })
+    .setProtectedHeader({ alg: "RS256", typ: "JWT" })
+    .setIssuer(FIREBASE_CLIENT_EMAIL!)
+    .setSubject(FIREBASE_CLIENT_EMAIL!)
+    .setAudience("https://oauth2.googleapis.com/token")
+    .setIssuedAt(now)
+    .setExpirationTime(now + 3600)
+    .sign(key);
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion,
+    }),
+  });
+  if (!response.ok) throw new Error(`Google OAuth token request failed: ${response.status}`);
+
+  const token = await response.json();
+  firebaseAccessToken = {
+    value: token.access_token,
+    expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000,
+  };
+  return firebaseAccessToken.value;
+}
+
+async function sendToFcm(token: string, data: Record<string, string>) {
+  const accessToken = await getFirebaseAccessToken();
+  const response = await fetch(
+    `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_PROJECT_ID!)}/messages:send`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        message: {
+          token,
+          // Data-only يمنع Firebase من إنشاء إشعار تلقائي بالتوازي مع
+          // firebase-messaging-sw.js، وبالتالي لا تظهر إشعارات مزدوجة.
+          data,
+        },
+      }),
+    },
+  );
+
+  let details: any = null;
+  try { details = await response.json(); } catch { /* empty response */ }
+  return { ok: response.ok, status: response.status, details };
+}
 
 Deno.serve(async (req) => {
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (!isAuthorized(req)) return json({ error: "Unauthorized" }, 401);
+
   try {
-    const { message_id, conversation_id, sender_id, content } = await req.json();
-
-    // حدد المستلم (الطرف الآخر في المحادثة)
-    const { data: conv } = await supabase
-      .from("conversations")
-      .select("user_id, admin_id")
-      .eq("id", conversation_id)
-      .single();
-    if (!conv) return new Response("conversation not found", { status: 404 });
-
-    const recipientId = conv.user_id === sender_id ? conv.admin_id : conv.user_id;
-
-    const { data: sender } = await supabase
-      .from("profiles")
-      .select("display_name")
-      .eq("id", sender_id)
-      .single();
-
-    const { data: subs } = await supabase
-      .from("push_subscriptions")
-      .select("*")
-      .eq("user_id", recipientId);
-
-    if (!subs || !subs.length) {
-      return new Response(JSON.stringify({ skipped: "no subscription" }), { status: 200 });
+    const input = await req.json();
+    const messageId = String(input.message_id || "");
+    const conversationId = String(input.conversation_id || "");
+    const senderId = String(input.sender_id || "");
+    if (!messageId || !conversationId || !senderId) {
+      return json({ error: "message_id, conversation_id and sender_id are required" }, 400);
     }
 
-    const payload = JSON.stringify({
-      title: sender?.display_name || "رسالة جديدة",
-      body: content || "📎 مرفق",
-      conversationId: conversation_id,
-      messageId: message_id,
-    });
+    const { data: conversation, error: conversationError } = await supabase
+      .from("conversations")
+      .select("user_id, admin_id")
+      .eq("id", conversationId)
+      .single();
+    if (conversationError || !conversation) return json({ error: "Conversation not found" }, 404);
 
-    const results = await Promise.allSettled(
-      subs.map((s) =>
-        webpush.sendNotification(
-          {
-            endpoint: s.endpoint,
-            keys: { p256dh: s.p256dh, auth: s.auth },
-          },
-          payload
-        )
-      )
-    );
+    const recipientId = conversation.user_id === senderId ? conversation.admin_id : conversation.user_id;
+    const [{ data: sender }, { data: tokens, error: tokenError }] = await Promise.all([
+      supabase.from("profiles").select("display_name").eq("id", senderId).maybeSingle(),
+      supabase.from("fcm_tokens").select("id, token").eq("user_id", recipientId),
+    ]);
+    if (tokenError) throw tokenError;
+    if (!tokens?.length) return json({ sent: 0, skipped: "no fcm token" });
 
-    // احذف الاشتراكات المنتهية الصلاحية (410/404)
-    await Promise.all(
-      results.map(async (r, i) => {
-        if (r.status === "rejected") {
-          const status = (r.reason && r.reason.statusCode) || 0;
-          if (status === 410 || status === 404) {
-            await supabase.from("push_subscriptions").delete().eq("id", subs[i].id);
-          }
-        }
-      })
-    );
+    const title = sender?.display_name || "رسالة جديدة";
+    const body = String(input.content || "📎 مرفق");
+    const data = {
+      type: "new_message",
+      messageId,
+      conversationId,
+      senderId,
+      title,
+      body,
+    };
 
-    return new Response(JSON.stringify({ sent: results.length }), { status: 200 });
-  } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), { status: 500 });
+    const results = await Promise.all(tokens.map(async (row) => {
+      const result = await sendToFcm(row.token, data);
+      const errorText = JSON.stringify(result.details || {});
+      const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
+      if (invalid) {
+        await supabase.from("fcm_tokens").delete().eq("id", row.id);
+      }
+      return { tokenId: row.id, ok: result.ok, status: result.status, removed: invalid };
+    }));
+
+    return json({ sent: results.filter((item) => item.ok).length, total: results.length, results });
+  } catch (error) {
+    console.error("send-push failed", error);
+    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
   }
 });

@@ -57,7 +57,7 @@ python3 -m http.server 8080
 - **وضع عدم الاتصال (Offline)**: تخزين المحادثات والرسائل في IndexedDB، عرضها فوراً عند فتح التطبيق حتى دون إنترنت، وشريط تنبيه علوي عند انقطاع الاتصال
 - **قائمة انتظار الإرسال (Outbox)**: أي رسالة تُكتب أثناء انقطاع الاتصال تُخزَّن محلياً وتُرسل تلقائياً بمجرد عودة الشبكة (`online` event)
 - **PWA** قابل للتثبيت + Service Worker لتخزين الواجهة (App Shell)
-- **Web Push Notifications حقيقية** تصل حتى مع إغلاق المتصفح، عبر Edge Function + جدول `push_subscriptions` (تفاصيل الإعداد أدناه)
+- **FCM Web Push Notifications حقيقية** تصل حتى مع إغلاق المتصفح، عبر Firebase Service Worker وEdge Function (تفاصيل الإعداد أدناه)
 
 ## 6. إعداد الإشعارات الحقيقية (Firebase Cloud Messaging) — تم التحويل من Web Push/VAPID
 ⚠️ **تغيير معماري مهم:** المشروع لم يعد يستخدم Web Push (VAPID) + Supabase Edge Function
@@ -87,6 +87,39 @@ python3 -m http.server 8080
 4. ضع مفتاح VAPID في `js/push.js` بالمتغيّر `VAPID_KEY`.
 5. **نفّذ قسم 8 و 9 من `sql/schema.sql`** في SQL Editor (جدول `fcm_tokens` + صلاحيات).
 6. من داخل التطبيق: **الإعدادات ⚙️ → تفعيل إشعارات الجهاز**.
+
+### نشر Edge Function للإشعارات
+
+الدالة `supabase/functions/send-push` تستخدم Firebase Cloud Messaging HTTP v1،
+ولا تستخدم جدول `push_subscriptions` القديم أو VAPID. قبل نشرها، أنشئ حساب خدمة
+Firebase بصلاحية إرسال الرسائل، ثم خزّن الأسرار التالية في إعدادات Edge Functions:
+
+```bash
+supabase functions deploy send-push
+supabase secrets set \
+  FIREBASE_PROJECT_ID="..." \
+  FIREBASE_CLIENT_EMAIL="firebase-adminsdk-...@....iam.gserviceaccount.com" \
+  FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n" \
+  SEND_PUSH_SECRET="ضع-سراً-عشوائياً-طويلاً"
+```
+
+بعد ذلك خزّن رابط الدالة والسر نفسه في Supabase Vault، ثم طبّق Trigger الرسائل
+من `sql/schema.sql`:
+
+```sql
+select vault.create_secret(
+  'https://YOUR-PROJECT-REF.supabase.co/functions/v1/send-push',
+  'SEND_PUSH_URL',
+  'رابط دالة إرسال الإشعارات'
+);
+select vault.create_secret(
+  'ضع-سراً-عشوائياً-طويلاً',
+  'SEND_PUSH_SECRET',
+  'سر استدعاء دالة الإشعارات'
+);
+```
+
+لا تضع `FIREBASE_PRIVATE_KEY` أو `SEND_PUSH_SECRET` في JavaScript أو في مستودع Git.
 
 > ملاحظة: iOS Safari لا يدعم FCM Web Push إلا عندما يكون التطبيق **مثبّتاً كـ PWA** على
 > الشاشة الرئيسية (iOS 16.4+)، تماماً كحال Web Push العادي.

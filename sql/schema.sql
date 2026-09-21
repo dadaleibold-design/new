@@ -404,20 +404,32 @@ create trigger on_message_keyword_autoreply
 -- ------------------------------------------------------------
 create extension if not exists pg_net;
 
--- عدّل القيمتين التاليتين بعد نشر الدالة (Settings > Edge Functions):
---   1. project-ref.functions.supabase.co/send-push  -> رابط دالتك الفعلي
---   2. SERVICE_ROLE_KEY -> مفتاح service_role (Settings > API) — لا تكشفه في الكود الأمامي أبداً
+-- خزّن SEND_PUSH_URL و SEND_PUSH_SECRET في Supabase Vault قبل التفعيل.
 create or replace function public.notify_new_message()
-returns trigger language plpgsql security definer as $$
+returns trigger language plpgsql security definer set search_path = public, vault, net as $$
 declare
-  v_function_url text := 'https://YOUR-PROJECT-REF.functions.supabase.co/send-push';
-  v_service_key  text := 'YOUR-SERVICE-ROLE-KEY';
+  v_function_url text;
+  v_push_secret text;
 begin
+  select decrypted_secret into v_function_url
+  from vault.decrypted_secrets
+  where name = 'SEND_PUSH_URL'
+  limit 1;
+  select decrypted_secret into v_push_secret
+  from vault.decrypted_secrets
+  where name = 'SEND_PUSH_SECRET'
+  limit 1;
+
+  if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
+    raise warning 'send-push secrets are not configured in Supabase Vault';
+    return new;
+  end if;
+
   perform net.http_post(
     url := v_function_url,
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
-      'Authorization', 'Bearer ' || v_service_key
+      'x-send-push-secret', v_push_secret
     ),
     body := jsonb_build_object(
       'message_id', new.id,
