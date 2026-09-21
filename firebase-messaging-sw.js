@@ -112,6 +112,43 @@ self.addEventListener("notificationclick", (event) => {
   );
 });
 
+// شبكة أمان: إن وصل push ولم يعالجه Firebase SDK (نسخة قديمة/خطأ تهيئة)،
+// اعرض إشعاراً عاماً حتى لا يضيع (المتصفح يعاقب الـ push الصامت).
+self.addEventListener("push", (event) => {
+  if (!event.data) return;
+  let payload = null;
+  try {
+    payload = event.data.json();
+  } catch {
+    return;
+  }
+  const data = payload?.data || {};
+  if (data.type === "call_ended") return; // يعالجه onBackgroundMessage
+  event.waitUntil(
+    (async () => {
+      // امنح Firebase SDK فرصة أولاً؛ إن كان قد عرض إشعاراً بنفس الـ tag فلا تكرّر
+      await new Promise((r) => setTimeout(r, 400));
+      const tag = data.type === "incoming_call"
+        ? `call-${data.roomId || ""}`
+        : data.conversationId
+          ? `conversation-${data.conversationId}`
+          : "whatsapp-message";
+      const existing = await self.registration.getNotifications({ tag });
+      if (existing.length) return;
+      await self.registration.showNotification(data.title || payload?.notification?.title || "رسالة جديدة", {
+        body: data.body || payload?.notification?.body || "لديك رسالة جديدة",
+        icon: data.icon || new URL("/icons/icon.png", self.location.origin).href,
+        badge: new URL("/icons/icon.png", self.location.origin).href,
+        tag,
+        renotify: true,
+        requireInteraction: data.type === "incoming_call",
+        data: { ...data },
+        vibrate: [100, 50, 100],
+      });
+    })()
+  );
+});
+
 self.addEventListener("notificationclose", () => {
   // no-op
 });

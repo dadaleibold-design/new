@@ -49,12 +49,40 @@ async function registerFirebaseServiceWorker() {
       {
         scope: "./firebase-cloud-messaging-push-scope",
         type: "classic",
+        updateViaCache: "none",
       }
     );
 
-  await navigator.serviceWorker.ready;
+  // ⚠️ navigator.serviceWorker.ready يخص الـ SW المتحكم بالصفحة (sw.js) وليس
+  // عامل Firebase — لذا ننتظر تفعيل تسجيل Firebase نفسه صراحةً، وإلا قد يفشل
+  // getToken بـ "no active Service Worker" على أول تفعيل.
+  await waitForActiveWorker(firebaseServiceWorkerRegistration);
+
+  // حدّث ملف الـ SW عند كل تفعيل حتى لا يعلق المستخدم على نسخة قديمة
+  firebaseServiceWorkerRegistration.update().catch(() => {});
 
   return firebaseServiceWorkerRegistration;
+}
+
+function waitForActiveWorker(registration, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    if (registration.active) return resolve(registration);
+    const worker = registration.installing || registration.waiting;
+    if (!worker) return resolve(registration);
+    const timer = setTimeout(() => reject(new Error("انتهت مهلة تفعيل Service Worker الخاص بالإشعارات")), timeoutMs);
+    const onChange = () => {
+      if (worker.state === "activated") {
+        clearTimeout(timer);
+        worker.removeEventListener("statechange", onChange);
+        resolve(registration);
+      } else if (worker.state === "redundant") {
+        clearTimeout(timer);
+        worker.removeEventListener("statechange", onChange);
+        reject(new Error("فشل تثبيت Service Worker الخاص بالإشعارات"));
+      }
+    };
+    worker.addEventListener("statechange", onChange);
+  });
 }
 
 export async function enablePushNotifications(userId = null) {
@@ -91,10 +119,21 @@ export async function enablePushNotifications(userId = null) {
     const registration =
       await registerFirebaseServiceWorker();
 
-    const token = await getToken(messaging, {
-      vapidKey: VAPID_KEY,
-      serviceWorkerRegistration: registration,
-    });
+    let token = null;
+    let lastError = null;
+    // إعادة محاولة قصيرة: أول getToken بعد التسجيل قد يفشل بسبب سباق تفعيل الـ SW
+    for (let attempt = 0; attempt < 3 && !token; attempt += 1) {
+      try {
+        token = await getToken(messaging, {
+          vapidKey: VAPID_KEY,
+          serviceWorkerRegistration: registration,
+        });
+      } catch (err) {
+        lastError = err;
+        await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+      }
+    }
+    if (!token && lastError) throw lastError;
 
     if (!token) {
       console.warn(
@@ -122,7 +161,7 @@ export async function enablePushNotifications(userId = null) {
           {
             user_id: userId,
             token,
-            platform: "web",
+            platform: detectPlatformLabel(),
             updated_at: new Date().toISOString(),
           },
           { onConflict: "token" }
@@ -282,6 +321,37 @@ export function listenForForegroundMessages({
       }
     }
   );
+}
+
+function detectPlatformLabel() {
+  const ua = navigator.userAgent || "";
+  const standalone = window.matchMedia?.("(display-mode: standalone)")?.matches ? "-pwa" : "";
+  if (/Android/i.test(ua)) return `android${standalone}`;
+  if (/iPhone|iPad|iPod/i.test(ua)) return `ios${standalone}`;
+  return `web${standalone}`;
+}
+
+/**
+ * إرسال إشعار تجريبي لنفس الجهاز عبر Edge Function — يتحقق من السلسلة
+ * كاملة (توكن → send-push → FCM → Service Worker) بدون انتظار رسالة حقيقية.
+ */
+export async function sendTestNotification() {
+  const { supabase } = await import("./supabaseClient.js");
+  const { SUPABASE_URL, SUPABASE_ANON_KEY } = await import("./config.js");
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) throw new Error("سجّل الدخول أولاً.");
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({ type: "test" }),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+  return json;
 }
 
 export function getCurrentFcmToken() {

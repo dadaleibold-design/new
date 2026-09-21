@@ -284,3 +284,16 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **مشرف**: بريد معتمد في قائمة `ADMINS` + كلمة المرور.
 - شاشة الدخول: مبدّل (👤 مستخدم / 🛡️ مشرف). إدخال **هاتف + كلمة مرور** ⇒ مستخدم عادي؛ إدخال **بريد + كلمة مرور** ⇒ مشرف (ويُرفض إن لم يكن البريد معتمداً أو الحساب غير مشرف).
 - من إعدادات Supabase → Authentication: أبقِ مزوّد **Email** مفعّلاً، ويُنصح بتعطيل "Confirm email" (أو إضافة `users.local` لقائمة السماح) حتى يدخل المستخدمون فوراً.
+
+## الإصدار v2.1 — عدّاد غير المقروء، الترتيب، إجراءات الرسائل، الإشعارات
+
+- **عدّاد غير المقروء للمستخدم العادي**: يُحسب من `messages` ويُحدَّث لحظياً (Realtime) مع نقل المحادثة للأعلى.
+- **الترتيب حسب آخر تفاعل** في قائمة المشرفين (لوحة المشرف والمستخدم) وقائمة المستخدمين.
+- **إجراءات الرسالة** (حذف/تفاعل/رد) مخفية دائماً وتظهر فقط عند النقر على الفقاعة (Esc أو النقر خارجها يخفيها).
+- **قسم المشرفين قابل للطي**: مطوي افتراضياً للسوبر أدمن مع زر إظهار؛ الحالة محفوظة في `localStorage`.
+- **الإشعارات في الخلفية** — قائمة التحقق بعد النشر:
+  1. نفّذ `sql/migrations/2026-09-21_v2_1_unread_push.sql` (Triggers لا تكسر الإدراج + جدول `push_delivery_log` للتشخيص).
+  2. في Vault: `SEND_PUSH_URL` = `https://<project>.supabase.co/functions/v1/send-push` و `SEND_PUSH_SECRET`.
+  3. `supabase functions deploy send-push --no-verify-jwt` (أو اعتمد `supabase/config.toml`) وضبط `SEND_PUSH_SECRET` و `FIREBASE_SERVICE_ACCOUNT` كأسرار للدالة.
+  4. من التطبيق: **🔔 إرسال إشعار تجريبي** ثم أغلق التطبيق — يجب أن يصل. إن لم يصل راجع `select * from push_delivery_log order by id desc`.
+- اختبارات دخانية: `cd tests && npm i jsdom && node smoke.mjs user|admin|super`.

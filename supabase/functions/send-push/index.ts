@@ -33,7 +33,7 @@ let firebaseAccessToken: { value: string; expiresAt: number } | null = null;
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
 
@@ -117,12 +117,54 @@ async function sendToFcm(token: string, data: Record<string, string>, opts: { hi
   return { ok: response.ok, status: response.status, details };
 }
 
+async function getUserFromRequest(req: Request) {
+  const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!bearer) return null;
+  const { data, error } = await supabase.auth.getUser(bearer);
+  if (error) return null;
+  return data.user;
+}
+
 Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-send-push-secret",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+      },
+    });
+  }
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  if (!isAuthorized(req)) return json({ error: "Unauthorized" }, 401);
 
   try {
     const input = await req.json();
+
+    // --- إشعار تجريبي للمستخدم نفسه (يتطلب JWT المستخدم) ---
+    if (input.type === "test") {
+      const user = await getUserFromRequest(req);
+      if (!user) return json({ error: "Unauthorized" }, 401);
+      const { data: tokens, error: tokenError } = await supabase
+        .from("fcm_tokens").select("id, token").eq("user_id", user.id);
+      if (tokenError) throw tokenError;
+      if (!tokens?.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب — فعّل الإشعارات أولاً." }, 404);
+      const results = await Promise.all(tokens.map(async (row) => {
+        const result = await sendToFcm(row.token, {
+          type: "test",
+          title: "✅ الإشعارات تعمل",
+          body: "هذا إشعار تجريبي — إن وصلك والتطبيق مغلق فكل شيء سليم.",
+          conversationId: "",
+        }, { highPriority: true });
+        const errorText = JSON.stringify(result.details || {});
+        const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
+        if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
+        return { ok: result.ok, status: result.status, removed: invalid, error: result.ok ? undefined : errorText.slice(0, 300) };
+      }));
+      const sent = results.filter((r) => r.ok).length;
+      return json({ sent, total: results.length, results }, sent ? 200 : 502);
+    }
+
+    if (!isAuthorized(req)) return json({ error: "Unauthorized" }, 401);
 
     // --- إشعار مكالمة واردة / انتهاء مكالمة (يُستدعى من trigger على call_rooms) ---
     if (input.type === "incoming_call" || input.type === "call_ended") {

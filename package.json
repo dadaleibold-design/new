@@ -1,5 +1,7 @@
 {
   "dependencies": {
-    "agora-rtc-sdk-ng": "^4.24.8"
+    "agora-rtc-sdk-ng": "^4.24.8",
+    "eslint": "^9.39.5",
+    "jsdom": "^24.1.3"
   }
 }

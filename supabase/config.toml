@@ -1,0 +1,9 @@
+# إعدادات Edge Functions
+# send-push تُستدعى من Trigger قاعدة البيانات (pg_net) بسر مشترك وليس بـ JWT مستخدم،
+# لذا يجب تعطيل التحقق من JWT على مستوى البوابة — وإلا تُرفض بـ 401 ولا تصل الإشعارات
+# عندما يكون التطبيق مغلقاً. الدالة تتحقق من السر/الـ JWT داخلياً.
+[functions.send-push]
+verify_jwt = false
+
+[functions.agora-token]
+verify_jwt = false

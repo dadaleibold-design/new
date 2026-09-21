@@ -264,3 +264,25 @@ body[data-theme="light"] .day-separator span{background:#fff;color:#54656f}
 .load-older-btn:hover{background:rgba(0,168,132,.26)}
 .contact-row.blocked-user .contact-name{text-decoration:line-through;opacity:.6}
 .contact-row.blocked-user .avatar{filter:grayscale(1);opacity:.7}
+
+/* ============ إجراءات الرسالة: مخفية حتى النقر على الرسالة ============ */
+.bubble-row:hover .bubble-actions,.bubble-row:has(.bubble-action-delete) .bubble-actions{display:none}
+.bubble-row.selected .bubble-actions{display:flex;animation:actions-pop .14s ease}
+.bubble-row.selected>.bubble{outline:2px solid rgba(0,168,132,.45);outline-offset:1px}
+.bubble{cursor:pointer}
+@keyframes actions-pop{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ============ قسم المشرفين القابل للطي + وقت آخر تفاعل ============ */
+.section-heading.collapsible{padding:0}
+.section-toggle{width:100%;display:flex;align-items:center;gap:8px;padding:8px 16px;border:0;background:transparent;color:var(--wa-text-secondary);font:inherit;font-size:13px;font-weight:600;text-align:start;cursor:pointer}
+.section-toggle:hover{background:rgba(134,150,160,.08)}
+.section-toggle-title{flex:1}
+.section-toggle-title small{font-weight:400;opacity:.8}
+.section-online{color:var(--wa-green);font-size:11px}
+.section-unread{position:static;margin:0}
+.section-chevron{font-size:14px;opacity:.8;transition:transform .15s ease}
+#admins-section{overflow:hidden;transition:max-height .25s ease,opacity .2s ease;max-height:60vh;opacity:1}
+#admins-section.collapsed{max-height:0;opacity:0;pointer-events:none}
+.contact-time{flex:0 0 auto;align-self:flex-start;margin-inline-start:6px;color:var(--wa-text-secondary);font-size:11px;white-space:nowrap}
+.contact-row:has(.unread-badge) .contact-time{color:var(--wa-green)}
+.contact-row:has(.unread-badge) .contact-sub{color:inherit;font-weight:600}

@@ -17,8 +17,8 @@ import {
 } from "./db.js";
 import {
   enablePushNotifications,
-  disablePushNotifications,
   listenForForegroundMessages,
+  sendTestNotification,
 } from "./push.js";
 import {
   initCalls,
@@ -699,6 +699,25 @@ function wireChrome() {
     }
   );
 
+  $("#btn-test-push")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    if (!state.me) return;
+    if (!("Notification" in window) || Notification.permission !== "granted") {
+      showAuthError("فعّل الإشعارات أولاً من الزر أعلاه.");
+      return;
+    }
+    btn.disabled = true;
+    try {
+      if (!localStorage.getItem("fcm_token")) await enablePushNotifications(state.me.id);
+      const r = await sendTestNotification();
+      showAuthError(r?.sent ? `تم الإرسال إلى ${r.sent} جهاز — أغلق التطبيق وانتظر الإشعار.` : "لم يُرسل الإشعار — راجع سجل send-push.");
+    } catch (err) {
+      showAuthError("فشل الاختبار: " + (err?.message || "خطأ غير معروف"));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   $("#btn-call-history")?.addEventListener("click", () => openCallHistory());
   $("#close-call-history")?.addEventListener("click", closeCallHistory);
   $("#call-history-modal")?.addEventListener("click", (e) => {
@@ -1174,6 +1193,14 @@ function wireChatPanel() {
   // أزرار المكالمات (صوتية/مرئية) بجانب زر البحث في رأس المحادثة
   safeDom("wire:call-buttons", () => wireCallButtons());
 
+  // النقر خارج أي رسالة يخفي أزرار الإجراءات
+  $("#chat-messages")?.addEventListener("click", (e) => {
+    if (!e.target.closest(".bubble-row")) closeAllMessageActions();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeAllMessageActions();
+  });
+
   // زر البحث داخل المحادثة
   $("#chat-search-toggle")?.addEventListener(
     "click",
@@ -1365,11 +1392,11 @@ function renderContactsFromCache(cached) {
 
   const fragment = document.createDocumentFragment();
 
-  (cached || []).forEach((c) => {
+  [...(cached || [])].sort(sortByLatestInteraction).forEach((c) => {
     try {
       fragment.appendChild(
         buildContactRow(c, {
-          withUnread: !!c._unread,
+          withUnread: true,
         })
       );
     } catch (err) {
@@ -1384,17 +1411,31 @@ async function loadContactsFromNetwork() {
   state.contactRowsByConversation = {};
 
   if (!state.me.is_admin) {
-    const {
-      data: adminProfiles,
-    } = await supabase
-      .from("profiles")
-      .select("*")
-      .in(
-        "email",
-        ADMINS.map((a) => a.email)
-      );
+    // المستخدم العادي: قائمة المشرفين + عدّاد غير المقروء + ترتيب حسب آخر تفاعل
+    const [{ data: adminProfiles }, { data: myConvs }] = await Promise.all([
+      supabase.from("profiles").select("*").in("email", ADMINS.map((a) => a.email)),
+      supabase
+        .from("conversations")
+        .select("id, admin_id, last_message, last_message_at")
+        .eq("user_id", state.me.id),
+    ]);
 
-    state.contacts = adminProfiles || [];
+    const convByAdmin = new Map((myConvs || []).map((c) => [c.admin_id, c]));
+    const convIds = (myConvs || []).map((c) => c.id);
+    const unreadByConversation = await fetchUnreadCounts(convIds);
+
+    state.contacts = (adminProfiles || [])
+      .map((a) => {
+        const conv = convByAdmin.get(a.id);
+        return {
+          ...a,
+          _conversationId: conv?.id || null,
+          _unread: conv ? unreadByConversation.get(conv.id) || 0 : 0,
+          _lastMessage: conv?.last_message || "",
+          _lastAt: conv?.last_message_at || null,
+        };
+      })
+      .sort(sortByLatestInteraction);
 
     $("#contact-list").innerHTML = "";
 
@@ -1404,13 +1445,11 @@ async function loadContactsFromNetwork() {
     $("#users-heading")?.classList.add("hidden");
     $("#users-section")?.classList.add("hidden");
 
+    const frag = document.createDocumentFragment();
     state.contacts.forEach((c) => {
-      $("#contact-list").appendChild(
-        buildContactRow(c, {
-          withUnread: false,
-        })
-      );
+      frag.appendChild(buildContactRow(c, { withUnread: true }));
     });
+    $("#contact-list").appendChild(frag);
 
     await safeAsync("cacheContacts", () => cacheContacts(state.contacts));
   } else {
@@ -1455,53 +1494,63 @@ async function loadContactsFromNetwork() {
     }
 
     const conversationIds = (convs || []).map((conversation) => conversation.id);
-    const unreadByConversation = new Map();
-    if (conversationIds.length) {
-      const { data: unreadMessages, error: unreadError } = await supabase
-        .from("messages")
-        .select("conversation_id, sender_id, status")
-        .in("conversation_id", conversationIds)
-        .neq("sender_id", state.me.id)
-        .neq("status", "read");
-      if (unreadError) throw unreadError;
-      for (const message of unreadMessages || []) {
-        unreadByConversation.set(
-          message.conversation_id,
-          (unreadByConversation.get(message.conversation_id) || 0) + 1
-        );
-      }
-    }
+    const unreadByConversation = await fetchUnreadCounts(conversationIds);
+
+    // محادثات المشرف الحالي مع المشرفين الآخرين (هو الطرف user_id فيها) — لترتيبهم حسب آخر تفاعل
+    const { data: adminConvs } = await supabase
+      .from("conversations")
+      .select("id, admin_id, user_id, last_message, last_message_at")
+      .or(`user_id.eq.${state.me.id},admin_id.eq.${state.me.id}`);
+    const adminConvByPeer = new Map();
+    (adminConvs || []).forEach((c) => {
+      const peer = c.user_id === state.me.id ? c.admin_id : c.user_id;
+      adminConvByPeer.set(peer, c);
+    });
+    const adminConvIds = [...adminConvByPeer.values()].map((c) => c.id).filter((id) => !conversationIds.includes(id));
+    const adminUnread = await fetchUnreadCounts(adminConvIds);
 
     const userContacts = (convs || []).map((c) => ({
       ...c.user,
       _conversationId: c.id,
       _unread: unreadByConversation.get(c.id) || 0,
       _lastMessage: c.last_message,
+      _lastAt: c.last_message_at || null,
       _ownerAdminName:
         state.me.is_super_admin && c.owner_admin?.id !== state.me.id
           ? c.owner_admin?.display_name
           : null,
     }));
 
-    $("#admins-section").innerHTML = "";
+    const adminContacts = (otherAdmins || [])
+      .map((a) => {
+        const conv = adminConvByPeer.get(a.id);
+        return {
+          ...a,
+          _conversationId: conv?.id || null,
+          _unread: conv ? adminUnread.get(conv.id) || unreadByConversation.get(conv.id) || 0 : 0,
+          _lastMessage: conv?.last_message || "",
+          _lastAt: conv?.last_message_at || null,
+        };
+      })
+      .sort(sortByLatestInteraction);
 
-    (otherAdmins || []).forEach((c) => {
-      $("#admins-section").appendChild(
-        buildContactRow(c, {
-          withUnread: false,
-        })
-      );
+    // المشرفون الذين يملكون محادثات المستخدمين في وضع السوبر أدمن قد يتكرّرون — لا مشكلة، القائمة منفصلة
+    userContacts.sort(sortByLatestInteraction);
+
+    $("#admins-section").innerHTML = "";
+    const adminsFrag = document.createDocumentFragment();
+    adminContacts.forEach((c) => {
+      adminsFrag.appendChild(buildContactRow(c, { withUnread: true }));
     });
+    $("#admins-section").appendChild(adminsFrag);
+    renderAdminsSectionHeader(adminContacts);
 
     $("#users-section").innerHTML = "";
-
+    const usersFrag = document.createDocumentFragment();
     userContacts.forEach((c) => {
-      $("#users-section").appendChild(
-        buildContactRow(c, {
-          withUnread: true,
-        })
-      );
+      usersFrag.appendChild(buildContactRow(c, { withUnread: true }));
     });
+    $("#users-section").appendChild(usersFrag);
 
     await Promise.all(
       (convs || []).map((conversation) =>
@@ -1511,11 +1560,79 @@ async function loadContactsFromNetwork() {
 
     await safeAsync("cacheContacts:admin", () =>
       cacheContacts([
-        ...(otherAdmins || []),
+        ...adminContacts,
         ...userContacts,
       ])
     );
   }
+}
+
+/** عدد الرسائل غير المقروءة (الواردة من الطرف الآخر) لكل محادثة */
+async function fetchUnreadCounts(conversationIds) {
+  const map = new Map();
+  if (!conversationIds?.length || !state.me) return map;
+  const { data, error } = await supabase
+    .from("messages")
+    .select("conversation_id")
+    .in("conversation_id", conversationIds)
+    .neq("sender_id", state.me.id)
+    .neq("status", "read")
+    .limit(5000);
+  if (error) {
+    console.warn("[unread] count failed:", error);
+    return map;
+  }
+  for (const row of data || []) {
+    map.set(row.conversation_id, (map.get(row.conversation_id) || 0) + 1);
+  }
+  return map;
+}
+
+/** ترتيب حسب آخر تفاعل: الأحدث أولاً، ثم من لديه محادثة، ثم أبجدياً */
+function sortByLatestInteraction(a, b) {
+  const ta = a._lastAt ? Date.parse(a._lastAt) : 0;
+  const tb = b._lastAt ? Date.parse(b._lastAt) : 0;
+  if (tb !== ta) return tb - ta;
+  if ((b._unread || 0) !== (a._unread || 0)) return (b._unread || 0) - (a._unread || 0);
+  return String(a.display_name || "").localeCompare(String(b.display_name || ""), "ar");
+}
+
+const ADMINS_COLLAPSED_KEY = "wa_admins_collapsed";
+
+/**
+ * رأس قسم المشرفين قابل للطي: للسوبر أدمن مطويّ افتراضياً (يشغل سطراً واحداً)
+ * مع زر لإظهار القائمة الكاملة بضغطة واحدة. للمشرف العادي مفتوح افتراضياً.
+ */
+function renderAdminsSectionHeader(adminContacts) {
+  const heading = $("#admins-heading");
+  const section = $("#admins-section");
+  if (!heading || !section) return;
+
+  const stored = localStorage.getItem(ADMINS_COLLAPSED_KEY);
+  const collapsed = stored === null ? Boolean(state.me?.is_super_admin) : stored === "1";
+  const totalUnread = adminContacts.reduce((n, c) => n + (c._unread || 0), 0);
+  const online = adminContacts.filter((c) => c.id && state.onlineMap[c.id]).length;
+
+  heading.classList.add("collapsible");
+  heading.innerHTML = `
+    <button type="button" class="section-toggle" id="admins-toggle" aria-expanded="${!collapsed}" aria-controls="admins-section">
+      <span class="section-toggle-title">${escapeHtml(state.t?.admins || "المشرفون")} <small>(${adminContacts.length})</small></span>
+      ${online ? `<span class="section-online">● ${online}</span>` : ""}
+      ${totalUnread ? `<span class="unread-badge section-unread">${totalUnread}</span>` : ""}
+      <span class="section-chevron" aria-hidden="true">${collapsed ? "▸" : "▾"}</span>
+    </button>`;
+
+  section.classList.toggle("collapsed", collapsed);
+
+  heading.querySelector("#admins-toggle")?.addEventListener("click", () => {
+    const nowCollapsed = !section.classList.contains("collapsed");
+    section.classList.toggle("collapsed", nowCollapsed);
+    localStorage.setItem(ADMINS_COLLAPSED_KEY, nowCollapsed ? "1" : "0");
+    const btn = heading.querySelector("#admins-toggle");
+    btn?.setAttribute("aria-expanded", String(!nowCollapsed));
+    const chev = heading.querySelector(".section-chevron");
+    if (chev) chev.textContent = nowCollapsed ? "▸" : "▾";
+  });
 }
 
 function buildContactRow(c, opts) {
@@ -1562,6 +1679,8 @@ function buildContactRow(c, opts) {
         ${escapeHtml(c._lastMessage || "")}
       </div>
     </div>
+
+    ${c._lastAt ? `<div class="contact-time">${escapeHtml(formatContactTime(c._lastAt))}</div>` : ""}
 
     ${
       opts.withUnread && c._unread
@@ -1625,7 +1744,21 @@ function buildContactRow(c, opts) {
   return row;
 }
 
-function bumpUnreadBadge(conversationId) {
+function formatContactTime(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const now = new Date();
+  const locale = state.lang === "ar" ? "ar-SA" : "en-US";
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+  }
+  const y = new Date();
+  y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return state.lang === "ar" ? "أمس" : "Yesterday";
+  return d.toLocaleDateString(locale, { day: "2-digit", month: "2-digit" });
+}
+
+function bumpUnreadBadge(conversationId, preview) {
   const row =
     state.contactRowsByConversation[
       conversationId
@@ -1662,6 +1795,21 @@ function bumpUnreadBadge(conversationId) {
 
   badge.textContent =
     String(current);
+
+  // انقل المحادثة إلى أعلى قائمتها (آخر تفاعل) وحدّث المعاينة
+  if (preview !== undefined) {
+    const sub = row.querySelector(".contact-sub");
+    if (sub) sub.textContent = preview || "";
+    let timeEl = row.querySelector(".contact-time");
+    if (!timeEl) {
+      timeEl = document.createElement("div");
+      timeEl.className = "contact-time";
+      row.appendChild(timeEl);
+    }
+    timeEl.textContent = formatContactTime(new Date().toISOString());
+  }
+  const parent = row.parentElement;
+  if (parent && parent.firstElementChild !== row) parent.prepend(row);
 }
 
 function clearUnreadBadge(conversationId) {
@@ -2176,6 +2324,12 @@ function buildCallBubble(m) {
   return row;
 }
 
+/** يخفي أزرار الإجراءات ولوحة التفاعل لكل الرسائل */
+function closeAllMessageActions() {
+  document.querySelectorAll(".bubble-row.selected").forEach((r) => r.classList.remove("selected"));
+  document.querySelectorAll(".quick-react-panel:not(.hidden)").forEach((p) => p.classList.add("hidden"));
+}
+
 function findMessageById(id) {
   return state.messages.find(
     (m) => m.id === id
@@ -2500,8 +2654,18 @@ function buildMessageBubble(m) {
       "click",
       () => {
         setReplyTarget(m);
+        closeAllMessageActions();
       }
     );
+
+  // الإجراءات مخفية افتراضياً — تظهر عند النقر على الرسالة نفسها فقط
+  const bubbleEl = div.querySelector(".bubble");
+  bubbleEl?.addEventListener("click", (e) => {
+    if (e.target.closest(".bubble-actions, .quick-react-panel, .reaction-chip, .msg-btn, a, audio, .msg-attachment")) return;
+    const wasSelected = div.classList.contains("selected");
+    closeAllMessageActions();
+    if (!wasSelected) div.classList.add("selected");
+  });
 
   div.querySelector(".bubble-action-delete")?.addEventListener("click", async () => {
     if (!state.me.is_admin || !window.confirm("حذف الرسالة؟")) return;
@@ -2572,9 +2736,7 @@ function buildMessageBubble(m) {
             emoji
           );
 
-          quickPanel.classList.add(
-            "hidden"
-          );
+          closeAllMessageActions();
         }
       }
     );
@@ -4223,6 +4385,8 @@ async function markConversationRead(
 
     if (error) {
       console.error("markConversationRead failed:", error);
+    } else {
+      clearUnreadBadge(conversationId);
     }
   } catch (err) {
     console.error("markConversationRead network error:", err);
@@ -4437,10 +4601,14 @@ function subscribeInboxUpdates() {
 }
 
 function subscribeGlobalMessageWatch() {
-  if (
-    !state.me?.is_admin
-  ) {
-    return;
+  if (!state.me) return;
+
+  if (state.globalMsgChannel) {
+    try {
+      supabase.removeChannel(state.globalMsgChannel);
+    } catch {
+      /* تجاهل */
+    }
   }
 
   state.globalMsgChannel =
@@ -4472,14 +4640,18 @@ function subscribeGlobalMessageWatch() {
           if (
             state.activeConversation &&
             msg.conversation_id ===
-              state.activeConversation.id
+              state.activeConversation.id &&
+            document.visibilityState === "visible"
           ) {
             return;
           }
 
+          // RLS تضمن أن الرسائل الواصلة هنا تخص محادثات المستخدم فقط
           bumpUnreadBadge(
-            msg.conversation_id
+            msg.conversation_id,
+            messagePreviewText(msg)
           );
+          if (msg.message_type !== "call") playNotificationSound();
         }
       )
       .subscribe();
