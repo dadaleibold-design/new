@@ -39,6 +39,8 @@ begin
 end $$;
 
 -- حذف شامل: جداول public + ملفات Storage + حساب auth
+-- (نوع الإرجاع تغيّر من void إلى jsonb → يجب إسقاط الدالة القديمة أولاً)
+drop function if exists public.admin_delete_user(uuid);
 create or replace function public.admin_delete_user(p_user_id uuid)
 returns jsonb language plpgsql security definer set search_path = public, auth, storage as $$
 declare
