@@ -128,7 +128,7 @@ const rowsB = [...box.querySelectorAll(".bubble-row:not(.call-row)")];
 check("2 bubbles rendered", rowsB.length===2);
 check("no bubble selected initially", !box.querySelector(".bubble-row.selected"));
 const css = fs.readFileSync(path.join(ROOT,"css/style.css"),"utf8");
-check("CSS hides actions unless .selected", /\.bubble-row\.selected \.bubble-actions\{display:flex/.test(css) && /\.bubble-row:hover \.bubble-actions,\.bubble-row:has\(\.bubble-action-delete\) \.bubble-actions\{display:none\}/.test(css));
+check("CSS hides actions unless .selected (all roles)", /\.bubble-row \.bubble-actions,\.bubble-row:hover \.bubble-actions\{display:none !important\}/.test(css) && /\.bubble-row\.selected \.bubble-actions\{display:flex !important/.test(css) && !/\.bubble-row:has\(\.bubble-action-delete\) \.bubble-actions\{display:flex\}/.test(css));
 rowsB[0].querySelector(".bubble").click();
 check("tap selects bubble (actions visible)", rowsB[0].classList.contains("selected"));
 rowsB[1].querySelector(".bubble").click();

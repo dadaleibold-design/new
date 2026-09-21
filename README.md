@@ -297,3 +297,11 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   3. `supabase functions deploy send-push --no-verify-jwt` (أو اعتمد `supabase/config.toml`) وضبط `SEND_PUSH_SECRET` و `FIREBASE_SERVICE_ACCOUNT` كأسرار للدالة.
   4. من التطبيق: **🔔 إرسال إشعار تجريبي** ثم أغلق التطبيق — يجب أن يصل. إن لم يصل راجع `select * from push_delivery_log order by id desc`.
 - اختبارات دخانية: `cd tests && npm i jsdom && node smoke.mjs user|admin|super`.
+
+## الإصدار v2.2 — تشخيص الإشعارات + حذف المستخدم الشامل
+- زر **🔔 إرسال إشعار تجريبي** يعرض الآن تقريراً خطوة بخطوة (HTTPS، الإذن، Service Worker، إشعار محلي فوري، توكن FCM، pg_net/Vault/Triggers عبر `push_diagnostics()`, ثم الإرسال الفعلي عبر `send-push`).
+- **سبب عدم وصول الإشعارات حالياً**: دالة `send-push` غير منشورة على المشروع (تعيد 404). الحل:
+  `supabase functions deploy send-push --no-verify-jwt` + ضبط الأسرار `FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY / SEND_PUSH_SECRET`، ثم Vault: `SEND_PUSH_URL`, `SEND_PUSH_SECRET`، ثم تنفيذ migrations v2.1 و v2.2.
+- إشعار مرئي محلي عند وصول رسالة Realtime والتطبيق مفتوح في محادثة/تبويب آخر (لا يعتمد على FCM).
+- `admin_delete_user`: متاح لكل مشرف (`is_admin` أو `is_super_admin`)، يحذف: التخزين (مرفقات/أفاتار/خلفيات)، التفاعلات، الرسائل، الكتابة، المكالمات وسجلاتها، المحادثات، توكنات FCM، الملف الشخصي، وحساب `auth.users`؛ ويعيد إحصاءات ما حُذف. `reply_to_id` أصبح `on delete set null` حتى لا يعيق الحذف.
+- إجراءات الرسالة مخفية لكل الأدوار حتى النقر على الفقاعة.

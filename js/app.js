@@ -702,17 +702,75 @@ function wireChrome() {
   $("#btn-test-push")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
     if (!state.me) return;
-    if (!("Notification" in window) || Notification.permission !== "granted") {
-      showAuthError("فعّل الإشعارات أولاً من الزر أعلاه.");
-      return;
-    }
     btn.disabled = true;
+    const out = $("#push-diag");
+    const lines = [];
+    const log = (ok, msg) => {
+      lines.push(`${ok === null ? "•" : ok ? "✅" : "❌"} ${msg}`);
+      if (out) {
+        out.textContent = lines.join("\n");
+        out.classList.remove("hidden");
+      }
+    };
     try {
-      if (!localStorage.getItem("fcm_token")) await enablePushNotifications(state.me.id);
+      log(null, "فحص سلسلة الإشعارات…");
+      const secure = window.isSecureContext;
+      log(secure, secure ? "اتصال آمن (HTTPS)" : "الموقع ليس HTTPS — الإشعارات لن تعمل");
+      const perm = "Notification" in window ? Notification.permission : "unsupported";
+      log(perm === "granted", `إذن الإشعارات: ${perm}`);
+      if (perm !== "granted") {
+        log(null, "اضغط «تفعيل إشعارات الجهاز» أولاً ووافق على الإذن.");
+        return;
+      }
+      const reg = await navigator.serviceWorker?.getRegistration("./firebase-cloud-messaging-push-scope");
+      log(!!reg?.active, reg?.active ? "Service Worker الخاص بالإشعارات نشط" : "Service Worker الخاص بالإشعارات غير مسجّل");
+      // إشعار محلي فوري — يثبت أن النظام يعرض الإشعارات أصلاً (بدون سيرفر)
+      try {
+        await (reg || (await navigator.serviceWorker.ready)).showNotification("🔔 اختبار محلي", {
+          body: "إن رأيت هذا الإشعار فالجهاز يسمح بعرض الإشعارات.",
+          icon: "./icons/icon.png",
+          tag: "local-test",
+        });
+        log(true, "أُرسل إشعار محلي (يجب أن يظهر الآن)");
+      } catch (err) {
+        log(false, "فشل الإشعار المحلي: " + (err?.message || err));
+      }
+      if (!localStorage.getItem("fcm_token")) {
+        log(null, "لا يوجد توكن FCM — جارٍ التفعيل…");
+        await enablePushNotifications(state.me.id);
+      }
+      const token = localStorage.getItem("fcm_token");
+      log(!!token, token ? `توكن FCM موجود (…${token.slice(-8)})` : "تعذّر الحصول على توكن FCM");
+      if (!token) return;
+      try {
+        const { data: diag, error: diagErr } = await supabase.rpc("push_diagnostics");
+        if (diagErr) {
+          log(false, "دالة push_diagnostics غير موجودة — نفّذ migration v2.2 في Supabase");
+        } else {
+          log(!!diag.pg_net_installed, "امتداد pg_net " + (diag.pg_net_installed ? "مفعّل" : "غير مفعّل"));
+          log(!!diag.vault_url_set && !!diag.vault_secret_set, "أسرار Vault (SEND_PUSH_URL/SEND_PUSH_SECRET) " + (diag.vault_url_set && diag.vault_secret_set ? "مضبوطة" : "ناقصة"));
+          log(!!diag.trigger_messages, "Trigger الرسائل " + (diag.trigger_messages ? "موجود" : "مفقود"));
+          log(Number(diag.my_tokens) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag.my_tokens}`);
+          const last = (diag.last_log || [])[0];
+          if (last?.note) log(false, "آخر محاولة إرسال: " + last.note);
+        }
+      } catch {
+        /* تجاهل */
+      }
+      log(null, "استدعاء دالة send-push على السيرفر…");
       const r = await sendTestNotification();
-      showAuthError(r?.sent ? `تم الإرسال إلى ${r.sent} جهاز — أغلق التطبيق وانتظر الإشعار.` : "لم يُرسل الإشعار — راجع سجل send-push.");
+      log(r.sent > 0, `السيرفر أرسل إلى ${r.sent}/${r.total} جهاز عبر FCM`);
+      (r.results || []).filter((x) => !x.ok).forEach((x) => log(false, `FCM: ${x.error || x.status}`));
+      log(null, "أغلق التطبيق الآن — يجب أن يصلك إشعار «الإشعارات تعمل».");
     } catch (err) {
-      showAuthError("فشل الاختبار: " + (err?.message || "خطأ غير معروف"));
+      const m = err?.message || String(err);
+      if (/404|not found/i.test(m)) {
+        log(false, "دالة send-push غير منشورة على Supabase (404). نفّذ: supabase functions deploy send-push --no-verify-jwt");
+      } else if (/401/.test(m)) {
+        log(false, "الدالة ترفض الطلب (401): انشرها بخيار --no-verify-jwt أو عبر supabase/config.toml");
+      } else {
+        log(false, "فشل: " + m);
+      }
     } finally {
       btn.disabled = false;
     }
@@ -1711,7 +1769,10 @@ function buildContactRow(c, opts) {
         return;
       }
       if (action === "delete" && window.confirm(`حذف ${c.display_name || "المستخدم"} نهائياً مع جميع محادثاته ورسائله؟`)) {
-        const { error } = await supabase.rpc("admin_delete_user", { p_user_id: c.id });
+        const { data: deleted, error } = await supabase.rpc("admin_delete_user", { p_user_id: c.id });
+        if (!error && deleted) {
+          showAuthError(`تم الحذف: ${deleted.messages ?? 0} رسالة، ${deleted.conversations ?? 0} محادثة، ${deleted.call_rooms ?? 0} مكالمة، ${deleted.storage_objects ?? 0} ملف`);
+        }
         if (error) {
           showAuthError("تعذّر حذف المستخدم — تأكد من تطبيق sql/schema.sql وصلاحيات المشرف.");
           return;
@@ -4387,6 +4448,7 @@ async function markConversationRead(
       console.error("markConversationRead failed:", error);
     } else {
       clearUnreadBadge(conversationId);
+      closeConversationNotifications(conversationId);
     }
   } catch (err) {
     console.error("markConversationRead network error:", err);
@@ -4651,10 +4713,55 @@ function subscribeGlobalMessageWatch() {
             msg.conversation_id,
             messagePreviewText(msg)
           );
-          if (msg.message_type !== "call") playNotificationSound();
+          if (msg.message_type !== "call") {
+            playNotificationSound();
+            showLocalMessageNotification(msg);
+          }
         }
       )
       .subscribe();
+}
+
+/**
+ * إشعار مرئي عبر Service Worker عند وصول رسالة لحظية (Realtime) والتطبيق مفتوح
+ * لكن في تبويب آخر/محادثة أخرى — لا يعتمد على FCM، ويُلغى عند فتح المحادثة.
+ */
+async function showLocalMessageNotification(msg) {
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    if (!("serviceWorker" in navigator)) return;
+    const sender = state.contacts.find((c) => c.id === msg.sender_id);
+    const title = sender?.display_name || "رسالة جديدة";
+    const body = messagePreviewText(msg) || "لديك رسالة جديدة";
+    const reg =
+      (await navigator.serviceWorker.getRegistration("./firebase-cloud-messaging-push-scope")) ||
+      (await navigator.serviceWorker.getRegistration()) ||
+      (await navigator.serviceWorker.ready);
+    await reg.showNotification(title, {
+      body,
+      icon: sender?.avatar_url || "./icons/icon.png",
+      badge: "./icons/icon.png",
+      tag: `conversation-${msg.conversation_id}`,
+      renotify: true,
+      silent: true, // الصوت يُشغَّل من التطبيق نفسه
+      data: { conversationId: msg.conversation_id, type: "message" },
+    });
+  } catch (err) {
+    console.warn("showLocalMessageNotification failed:", err);
+  }
+}
+
+async function closeConversationNotifications(conversationId) {
+  try {
+    if (!("serviceWorker" in navigator)) return;
+    const regs = await navigator.serviceWorker.getRegistrations();
+    for (const reg of regs) {
+      const list = await reg.getNotifications({ tag: `conversation-${conversationId}` });
+      list.forEach((n) => n.close());
+    }
+  } catch {
+    /* تجاهل */
+  }
 }
 
 function playNotificationSound() {

@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v7";
+const CACHE_NAME = "wa-clone-shell-v8";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -76,14 +76,19 @@ self.addEventListener("fetch", (event) => {
   if (isCode) {
     event.respondWith(
       caches.open(CACHE_NAME).then(async (cache) => {
-        const cached = await cache.match(request);
-        const network = fetch(request)
-          .then((response) => {
-            if (response && response.ok) cache.put(request, response.clone());
-            return response;
-          })
-          .catch(() => null);
-        return cached || (await network) || new Response(null, { status: 503 });
+        // network-first مع مهلة قصيرة: يضمن وصول أحدث CSS/JS فور النشر،
+        // ويعود للكاش عند انقطاع الشبكة أو بطئها.
+        const cached = await cache.match(request, { ignoreSearch: true });
+        try {
+          const response = await Promise.race([
+            fetch(request),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500)),
+          ]);
+          if (response && response.ok) cache.put(request, response.clone());
+          return response;
+        } catch {
+          return cached || new Response(null, { status: 503 });
+        }
       })
     );
     return;
