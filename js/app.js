@@ -61,6 +61,8 @@ const state = {
   typingTimeout: null,
   onlineMap: {},
   heartbeatInterval: null,
+  contactsRefreshInterval: null,
+  contactsRefreshInFlight: false,
 
   recording: null,
 
@@ -126,6 +128,7 @@ async function boot() {
   supabase.auth.onAuthStateChange((event) => {
     if (event === "SIGNED_OUT") {
       state.me = null;
+      stopContactsRefreshLoop();
       try {
         unsubscribeFromIncomingCalls();
       } catch (err) {
@@ -165,6 +168,7 @@ async function boot() {
       updateOfflineBanner();
       flushOutbox();
       resubscribeRealtime();
+      startContactsRefreshLoop();
     })
   );
 
@@ -319,6 +323,7 @@ async function enterApp() {
   startHeartbeat();
 
   await safeAsync("enterApp:contacts", () => loadContacts());
+  startContactsRefreshLoop();
 
   safeDom("enterApp:realtime", () => {
     subscribeGlobalPresence();
@@ -368,6 +373,39 @@ function startHeartbeat() {
       touchLastSeen(true);
     }
   }, 25000);
+}
+
+/**
+ * مزامنة هادئة لقائمة المحادثات والعدادات.
+ * Realtime هو المسار الأسرع، وهذا المسار الاحتياطي يلتقط أي حدث لم يصل
+ * بسبب إعادة الاتصال أو تعليق قناة Realtime، من دون لمس نافذة الدردشة.
+ */
+function startContactsRefreshLoop() {
+  stopContactsRefreshLoop();
+  if (!state.me) return;
+
+  state.contactsRefreshInterval = setInterval(() => {
+    if (!state.me || !state.isOnline || state.contactsRefreshInFlight) return;
+
+    state.contactsRefreshInFlight = true;
+    Promise.resolve(loadContacts())
+      .catch((error) => {
+        // لا نعرض خطأ للمستخدم في المزامنة الخلفية؛ الكاش وRealtime
+        // يستمران بالعمل، وتُعاد المحاولة في الدورة التالية.
+        console.warn("[contacts-sync] background refresh skipped:", error);
+      })
+      .finally(() => {
+        state.contactsRefreshInFlight = false;
+      });
+  }, 3000);
+}
+
+function stopContactsRefreshLoop() {
+  if (state.contactsRefreshInterval) {
+    clearInterval(state.contactsRefreshInterval);
+    state.contactsRefreshInterval = null;
+  }
+  state.contactsRefreshInFlight = false;
 }
 
 function wireAuthForms() {
@@ -916,6 +954,9 @@ async function loadContacts() {
       loadContactsTimer = null;
       try {
         await loadContactsInternal();
+      } catch (error) {
+        // لا تترك الوعد معلّقاً؛ الدورة التالية تعيد المحاولة بهدوء.
+        console.warn("[contacts] refresh failed:", error);
       } finally {
         loadContactsPending = null;
         resolve();
