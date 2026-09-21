@@ -89,3 +89,25 @@ self.addEventListener("fetch", (event) => {
     fetch(request).catch(() => caches.match(request).then((cached) => cached || new Response(null, { status: 503 })))
   );
 });
+
+// Fallback for foreground notifications shown through the app-shell worker.
+// Background FCM notifications are handled by firebase-messaging-sw.js.
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const data = event.notification?.data || {};
+  const url = new URL("/index.html", self.location.origin);
+  const conversationId = data.conversationId || data.conversation_id || "";
+  if (conversationId) url.searchParams.set("conversation", conversationId);
+
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ("focus" in client) {
+          if (conversationId) client.postMessage({ type: "OPEN_CONVERSATION", conversationId });
+          return client.focus();
+        }
+      }
+      return clients.openWindow ? clients.openWindow(url.href) : null;
+    })
+  );
+});

@@ -35,9 +35,9 @@ messaging.onBackgroundMessage((payload) => {
 
   const notificationOptions = {
     body,
-    icon: data.icon || "./icons/icon.png",
-    badge: data.badge || "./icons/icon.png",
-    tag: conversationId || "whatsapp-message",
+    icon: data.icon || new URL("/icons/icon.png", self.location.origin).href,
+    badge: data.badge || new URL("/icons/icon.png", self.location.origin).href,
+    tag: conversationId ? `conversation-${conversationId}` : "whatsapp-message",
     renotify: true,
     requireInteraction: true,
     silent: false,
@@ -53,9 +53,10 @@ self.addEventListener("notificationclick", (event) => {
 
   const data = event.notification?.data || {};
   const conversationId = data.conversationId || data.conversation_id || "";
-  const targetUrl = conversationId
-    ? `./index.html?conversation=${encodeURIComponent(conversationId)}`
-    : "./index.html";
+  const targetUrl = new URL("/index.html", self.location.origin);
+  if (conversationId) {
+    targetUrl.searchParams.set("conversation", conversationId);
+  }
 
   event.waitUntil(
     clients
@@ -73,7 +74,7 @@ self.addEventListener("notificationclick", (event) => {
           }
         }
         if (clients.openWindow) {
-          return clients.openWindow(targetUrl);
+          return clients.openWindow(targetUrl.href);
         }
         return null;
       })

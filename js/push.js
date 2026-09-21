@@ -241,14 +241,27 @@ export function listenForForegroundMessages({
         document.visibilityState === "visible"
       ) {
         try {
-          const registration = await navigator.serviceWorker.ready;
+          // استخدم تسجيل Firebase نفسه، لا navigator.serviceWorker.ready؛
+          // الأخير قد يعيد الـ App Shell worker المسجّل على النطاق الرئيسي.
+          const registration =
+            firebaseServiceWorkerRegistration ||
+            (await navigator.serviceWorker.getRegistration(
+              "./firebase-cloud-messaging-push-scope"
+            )) ||
+            (await navigator.serviceWorker.ready);
 
           await registration.showNotification(title, {
             body,
-            icon: "./icons/icon.png",
-            badge: "./icons/icon.png",
-            tag: "whatsapp-web-message",
-            data,
+            icon: new URL("./icons/icon.png", window.location.origin).href,
+            badge: new URL("./icons/icon.png", window.location.origin).href,
+            tag: data.conversationId
+              ? `conversation-${data.conversationId}`
+              : "whatsapp-web-message",
+            renotify: true,
+            data: {
+              ...data,
+              conversationId: data.conversationId || data.conversation_id || "",
+            },
             vibrate: [100, 50, 100],
           });
         } catch (error) {
