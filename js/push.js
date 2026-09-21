@@ -3,6 +3,7 @@ import {
   getMessaging,
   getToken,
   onMessage,
+  onTokenRefresh,
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
 
 const firebaseConfig = {
@@ -17,8 +18,13 @@ const firebaseConfig = {
 const VAPID_KEY =
   "BGKcsJH4YH7vV384UCmx_FKD0xGiWTNuMA7skLLUWzIodKXTSFLRleq1K0ttPMnXZfzQO42bQig8nSKTSIw1jts";
 
+export const TOKEN_KEY = "fcm_token";
+export const TOKEN_SYNC_KEY = "wa_fcm_last_sync";
+export const TOKEN_MIN_SYNC_MS = 30 * 60 * 1000; // إعادة تحقق صامتة كل 30 دقيقة على الأكثر
+
 let firebaseApp = null;
 let messaging = null;
+let syncPushTokenPromise = null;
 
 try {
   firebaseApp = getApps().length
@@ -116,67 +122,7 @@ export async function enablePushNotifications(userId = null) {
       return false;
     }
 
-    const registration =
-      await registerFirebaseServiceWorker();
-
-    let token = null;
-    let lastError = null;
-    // إعادة محاولة قصيرة: أول getToken بعد التسجيل قد يفشل بسبب سباق تفعيل الـ SW
-    for (let attempt = 0; attempt < 3 && !token; attempt += 1) {
-      try {
-        token = await getToken(messaging, {
-          vapidKey: VAPID_KEY,
-          serviceWorkerRegistration: registration,
-        });
-      } catch (err) {
-        lastError = err;
-        await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
-      }
-    }
-    if (!token && lastError) throw lastError;
-
-    if (!token) {
-      console.warn(
-        "[FCM] لم يتم الحصول على FCM Token."
-      );
-      return false;
-    }
-
-    localStorage.setItem(
-      "fcm_token",
-      token
-    );
-
-    if (userId) {
-      localStorage.setItem(
-        "fcm_user_id",
-        String(userId)
-      );
-    }
-
-    if (userId) {
-      try {
-        const { supabase } = await import("./supabaseClient.js");
-        const { error } = await supabase.from("fcm_tokens").upsert(
-          {
-            user_id: userId,
-            token,
-            platform: detectPlatformLabel(),
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "token" }
-        );
-        if (error) {
-          console.error("[FCM] فشل حفظ التوكن في Supabase:", error);
-        }
-      } catch (error) {
-
-        console.error("[FCM] خطأ غير متوقع أثناء حفظ التوكن:", error);
-      }
-    }
-
-    return true;
-
+    return await syncPushToken({ userId, force: true });
   } catch (error) {
     console.error(
       "[FCM] enablePushNotifications:",
@@ -189,7 +135,7 @@ export async function enablePushNotifications(userId = null) {
 
 export async function disablePushNotifications() {
   try {
-    const token = localStorage.getItem("fcm_token");
+    const token = localStorage.getItem(TOKEN_KEY);
     const userId = localStorage.getItem("fcm_user_id");
 
     if (token) {
@@ -205,8 +151,9 @@ export async function disablePushNotifications() {
       }
     }
 
-    localStorage.removeItem("fcm_token");
+    localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem("fcm_user_id");
+    localStorage.removeItem(TOKEN_SYNC_KEY);
 
     console.log("[FCM] تم تعطيل الإشعارات محليًا.");
 
@@ -223,7 +170,9 @@ export async function disablePushNotifications() {
 
 export function listenForForegroundMessages({
   onNotification = null,
-  soundUrl = "./sounds/notification.mp3",
+  soundUrl = "./icons/notify.mp3",
+  shouldSuppress = null,
+  getActiveConversationId = null,
 } = {}) {
 
   if (!messaging) {
@@ -247,7 +196,7 @@ export function listenForForegroundMessages({
 
       const data =
         payload.data || {};
-
+      const conversationId = String(data.conversationId || data.conversation_id || "");
       const title =
         notification.title ||
         data.title ||
@@ -258,56 +207,75 @@ export function listenForForegroundMessages({
         data.body ||
         "لديك رسالة جديدة";
 
-      try {
-        const audio = new Audio(soundUrl);
+      const isVisible = document.visibilityState === "visible";
+      const activeId = typeof getActiveConversationId === "function" ? getActiveConversationId() : null;
+      const viewingThread = Boolean(isVisible && conversationId && activeId === conversationId);
 
-        audio.volume = 1;
-
-        await audio.play().catch(() => {
-          console.warn(
-            "[FCM] تشغيل الصوت التلقائي محظور من المتصفح."
-          );
-        });
-      } catch (error) {
-        console.warn(
-          "[FCM] Audio error:",
-          error
-        );
+      // قرار العرض:
+      //   • التطبيق في المقدمة ويفتح نفس المحادثة → لا إشعار (التجربة أفضل داخل الواجهة)
+      //   • أي حالة أخرى (تبويب في الخلفية، نافذة مغطاة، محادثة أخرى) → إشعار فوري
+      // كانت النسخة السابقة تُسقط الإشعار كاملاً متى ما كان التبويب غير مرئي
+      // (visibilityState !== "visible") — وهو سبب رئيسي لتوقّف الإشعارات حين
+      // يبقى التطبيق في الخلفية. الآن الأصل هو العرض، والاستثناء ضيّق جداً.
+      let suppress = false;
+      if (typeof shouldSuppress === "function") {
+        try {
+          suppress = Boolean(shouldSuppress({ payload, data, conversationId, viewingThread }));
+        } catch (error) {
+          console.warn("[FCM] فشل تقييم shouldSuppress:", error);
+        }
+      } else {
+        suppress = viewingThread;
       }
 
-      if (
-        Notification.permission === "granted" &&
-        document.visibilityState === "visible"
-      ) {
+      if (!suppress) {
         try {
-          // استخدم تسجيل Firebase نفسه، لا navigator.serviceWorker.ready؛
-          // الأخير قد يعيد الـ App Shell worker المسجّل على النطاق الرئيسي.
-          const registration =
-            firebaseServiceWorkerRegistration ||
-            (await navigator.serviceWorker.getRegistration(
-              "./firebase-cloud-messaging-push-scope"
-            )) ||
-            (await navigator.serviceWorker.ready);
+          const audio = new Audio(soundUrl);
 
-          await registration.showNotification(title, {
-            body,
-            icon: new URL("./icons/icon.png", window.location.origin).href,
-            badge: new URL("./icons/icon.png", window.location.origin).href,
-            tag: data.conversationId
-              ? `conversation-${data.conversationId}`
-              : "whatsapp-web-message",
-            renotify: true,
-            data: {
-              ...data,
-              conversationId: data.conversationId || data.conversation_id || "",
-            },
-            vibrate: [100, 50, 100],
+          audio.volume = 1;
+
+          await audio.play().catch(() => {
+            console.warn(
+              "[FCM] تشغيل الصوت التلقائي محظور من المتصفح."
+            );
           });
         } catch (error) {
           console.warn(
-            "[FCM] Foreground showNotification error:",
+            "[FCM] Audio error:",
             error
           );
+        }
+
+        if (Notification.permission === "granted") {
+          try {
+            // استخدم تسجيل Firebase نفسه، لا navigator.serviceWorker.ready؛
+            // الأخير قد يعيد الـ App Shell worker المسجّل على النطاق الرئيسي.
+            const registration = await getMessagingServiceWorkerRegistration();
+
+            await registration.showNotification(title, {
+              body,
+              icon: data.icon || new URL("./icons/icon.png", window.location.origin).href,
+              badge: new URL("./icons/icon.png", window.location.origin).href,
+              tag: conversationId
+                ? `conversation-${conversationId}`
+                : "whatsapp-web-message",
+              renotify: true,
+              // الصوت داخل التطبيق مسؤولية الواجهة، لكن إن كان التبويب في
+              // الخلفية فلا يمكن تشغيل الصوت دائماً → نُبقي صوت النظام.
+              silent: isVisible,
+              data: {
+                ...data,
+                conversationId,
+                messageId: data.messageId || data.message_id || "",
+              },
+              vibrate: [100, 50, 100],
+            });
+          } catch (error) {
+            console.warn(
+              "[FCM] Foreground showNotification error:",
+              error
+            );
+          }
         }
       }
 
@@ -323,12 +291,184 @@ export function listenForForegroundMessages({
   );
 }
 
+/** يعيد تسجيل الـ Service Worker الخاص بالإشعارات (أو يعيد استخدامه) */
+async function getMessagingServiceWorkerRegistration() {
+  if (firebaseServiceWorkerRegistration?.active) {
+    return firebaseServiceWorkerRegistration;
+  }
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("Service Worker غير مدعوم.");
+  }
+  try {
+    const existing = await navigator.serviceWorker.getRegistration(
+      "./firebase-cloud-messaging-push-scope"
+    );
+    if (existing?.active) {
+      firebaseServiceWorkerRegistration = existing;
+      return existing;
+    }
+  } catch {
+    /* تجاهل — سنُسجّل من جديد */
+  }
+  return registerFirebaseServiceWorker();
+}
+
 function detectPlatformLabel() {
   const ua = navigator.userAgent || "";
   const standalone = window.matchMedia?.("(display-mode: standalone)")?.matches ? "-pwa" : "";
   if (/Android/i.test(ua)) return `android${standalone}`;
   if (/iPhone|iPad|iPod/i.test(ua)) return `ios${standalone}`;
   return `web${standalone}`;
+}
+
+/**
+ * مزامنة توكن FCM مع قاعدة البيانات — دالة القلب في موثوقية إشعارات الخلفية.
+ *
+ * لماذا نحتاجها؟ توكن FCM ليس ثابتاً:
+ *   1) عند تدوير اشتراك Push في المتصفح يُصدر FCM توكن جديداً فوراً.
+ *   2) التوكن القديم يصبح غير صالح، فيحذفه Edge Function من `fcm_tokens`
+ *      عند استلام 404/410 (UNREGISTERED) — وتتوقّف الإشعارات كلياً.
+ *   3) إن كان التطبيق مفتوحاً في الخلفية ولا يُعاد تفعيله، لا يعود التوكن
+ *      إلى قاعدة البيانات أبداً؛ لذلك نُزامن: كل عودة للمقدمة، وكل تدوير
+ *      توكن (onTokenRefresh)، ودورياً كل 30 دقيقة على الأكثر.
+ *
+ * @param {{ userId?:string|null, force?:boolean, minIntervalMs?:number }} options
+ * @returns {Promise<boolean>} true إن كان التوكن موجوداً ومُسجَّلاً
+ */
+export async function syncPushToken({ userId = null, force = false, minIntervalMs = TOKEN_MIN_SYNC_MS } = {}) {
+  if (syncPushTokenPromise) return syncPushTokenPromise;
+
+  syncPushTokenPromise = (async () => {
+    try {
+      if (!messaging) return false;
+      if (!("Notification" in window) || Notification.permission !== "granted") return false;
+      if (!("serviceWorker" in navigator) || !window.isSecureContext) return false;
+
+      const lastSync = Number(localStorage.getItem(TOKEN_SYNC_KEY) || 0);
+      const cached = localStorage.getItem(TOKEN_KEY);
+      const needsServerWrite = force || !cached || !lastSync || Date.now() - lastSync > minIntervalMs;
+
+      let registration = null;
+      try {
+        registration = await getMessagingServiceWorkerRegistration();
+      } catch (error) {
+        console.warn("[FCM] تعذّر تجهيز Service Worker:", error);
+      }
+
+      let token = cached;
+      let obtained = null;
+
+      if (registration) {
+        for (let attempt = 0; attempt < 2 && !obtained; attempt += 1) {
+          try {
+            obtained = await getToken(messaging, {
+              vapidKey: VAPID_KEY,
+              serviceWorkerRegistration: registration,
+            });
+          } catch (error) {
+            console.warn(`[FCM] getToken فشل (محاولة ${attempt + 1}):`, error);
+            await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+          }
+        }
+      }
+
+      if (obtained && obtained !== cached) {
+        console.log("[FCM] توكن جديد — جارٍ تحديث قاعدة البيانات.");
+        token = obtained;
+        localStorage.setItem(TOKEN_KEY, obtained);
+        localStorage.removeItem(TOKEN_SYNC_KEY);
+      }
+
+      if (!token) return false;
+
+      if (userId) {
+        localStorage.setItem("fcm_user_id", String(userId));
+      }
+
+      if (!needsServerWrite) return true;
+
+      const targetUser = userId || localStorage.getItem("fcm_user_id");
+      if (!targetUser) return Boolean(token);
+
+      const { supabase } = await import("./supabaseClient.js");
+
+      // ملاحظة: نُرسل الأعمدة الأساسية فقط حتى لا يفشل الإدراج إذا لم تُنفَّذ
+      // هجرات لاحقة أضافت أعمدة جديدة إلى fcm_tokens.
+      const { error } = await supabase.from("fcm_tokens").upsert(
+        {
+          user_id: targetUser,
+          token,
+          platform: detectPlatformLabel(),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "token" }
+      );
+
+      if (error) {
+        console.error("[FCM] فشل حفظ التوكن في Supabase:", error);
+        return false;
+      }
+
+      localStorage.setItem(TOKEN_SYNC_KEY, String(Date.now()));
+      return true;
+    } catch (error) {
+      console.error("[FCM] syncPushToken:", error);
+      return false;
+    } finally {
+      syncPushTokenPromise = null;
+    }
+  })();
+
+  return syncPushTokenPromise;
+}
+
+/**
+ * يراقب تدوير التوكن من Firebase ويعيد تسجيله فوراً.
+ * بدونه: التوكن الموجود في قاعدة البيانات يصبح غير صالح بهدوء، ثم يُحذف،
+ * فتتوقف إشعارات الخلفية حتى يفتح المستخدم التطبيق مرة أخرى.
+ * @returns {() => void} دالة إلغاء المراقبة
+ */
+export function watchTokenRefresh(userId = null) {
+  if (!messaging || typeof onTokenRefresh !== "function") return () => {};
+
+  try {
+    return onTokenRefresh(messaging, async () => {
+      console.log("[FCM] تم تدوير التوكن — إعادة التسجيل على السيرفر.");
+      try {
+        localStorage.removeItem(TOKEN_SYNC_KEY);
+        await syncPushToken({ userId: userId || localStorage.getItem("fcm_user_id"), force: true });
+      } catch (error) {
+        console.error("[FCM] فشل تسجيل التوكن المُدوَّر:", error);
+      }
+    });
+  } catch (error) {
+    console.warn("[FCM] تعذّر تفعيل مراقبة تدوير التوكن:", error);
+    return () => {};
+  }
+}
+
+/** هل سلسلة الإشعارات جاهزة فعلاً (إذن + SW + توكن)؟ */
+export function isPushReady() {
+  try {
+    return Boolean(
+      messaging &&
+      "Notification" in window &&
+      Notification.permission === "granted" &&
+      "serviceWorker" in navigator &&
+      localStorage.getItem(TOKEN_KEY)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** وقت آخر مزامنة ناجحة مع السيرفر (ملّي ثانية) */
+export function getLastTokenSyncAt() {
+  try {
+    return Number(localStorage.getItem(TOKEN_SYNC_KEY) || 0);
+  } catch {
+    return 0;
+  }
 }
 
 /**

@@ -1,6 +1,6 @@
 import { supabase } from "./supabaseClient.js";
 import { signUp, signIn, signOut, getCurrentProfile, looksLikeEmail } from "./auth.js";
-import { ADMINS } from "./config.js";
+import { ADMINS, SUPABASE_URL, SUPABASE_ANON_KEY } from "./config.js";
 import { applyLanguage } from "./i18n.js";
 import {
   cacheMessages,
@@ -19,6 +19,10 @@ import {
   enablePushNotifications,
   listenForForegroundMessages,
   sendTestNotification,
+  syncPushToken,
+  watchTokenRefresh,
+  isPushReady,
+  getLastTokenSyncAt,
 } from "./push.js";
 import {
   initCalls,
@@ -40,9 +44,28 @@ import {
   safeAsync,
   safeQuery,
   safeDom,
+  safeSync,
   guard,
 } from "./safety.js";
 import { prepareFileForUpload, MEDIA_PRESETS, formatBytes } from "./media.js";
+import {
+  createResilientChannel,
+  ensureRealtimeConnected,
+  startRealtimeWatchdog,
+  diagnoseRealtime,
+} from "./realtime.js";
+import {
+  initNotificationRouter,
+  setNotificationRouteHandler,
+  flushPendingRoutes,
+  peekPendingRoute,
+  clearPendingRoutes,
+  dispatchRoute,
+} from "./notification-router.js";
+
+// يُشغَّل عند استيراد الوحدة (قبل boot) حتى لا يضيع نقر إشعار وقع أثناء الإقلاع
+initNotificationRouter();
+
 const state = {
   me: null,
   t: null,
@@ -70,6 +93,15 @@ const state = {
   heartbeatInterval: null,
   contactsRefreshInterval: null,
   contactsRefreshInFlight: false,
+
+  // عدّادات غير المقروء: مصدر واحد للحقيقة في الواجهة (conversationId → عدد)
+  unreadByConversation: {},
+  subscribedConversationId: null,
+  realtimeWatchdog: null,
+  tokenRefreshUnsub: null,
+  lastCatchUpAt: 0,
+  hiddenCatchUpTimer: null,
+  focusMessageId: null,
 
   recording: null,
 
@@ -155,6 +187,22 @@ async function boot() {
     if (event === "SIGNED_OUT") {
       state.me = null;
       stopContactsRefreshLoop();
+      stopRealtimeWatchdog();
+      stopHiddenCatchUp();
+      clearPendingRoutes();
+      state.unreadByConversation = {};
+      try {
+        state.tokenRefreshUnsub?.();
+      } catch {
+        /* تجاهل */
+      }
+      state.tokenRefreshUnsub = null;
+      try {
+        state.foregroundMessagesUnsub?.();
+      } catch {
+        /* تجاهل */
+      }
+      state.foregroundMessagesUnsub = null;
       try {
         unsubscribeFromIncomingCalls();
       } catch (err) {
@@ -165,12 +213,17 @@ async function boot() {
   });
 
   window.addEventListener("beforeunload", () => {
-    if (state.me) {
-      navigator.sendBeacon &&
-        navigator.sendBeacon("about:blank");
-    }
+    // لا يمكن انتظار طلب شبكة هنا؛ نُرسل نبضة keepalive حتى لا يبدو
+    // المستخدم "متاحاً" بعد إغلاق التطبيق.
+    // (لا تُرسل للمشرف: حضوره ثابت ودائم بالتصميم.)
+    if (!state.me || state.me.is_admin) return;
+    safeDom("beforeunload:offline", () => updatePresenceOfflineBeacon());
   });
 
+  // ===== دورة حياة التطبيق في الخلفية =====
+  // مهم: لا نقطع اتصال Realtime عند الإخفاء. التطبيق في الخلفية يجب أن يبقى
+  // مستمعاً (أسرع من الإشعار) — والإشعار يعمل كطبقة ضمان. القطع كان يجعل
+  // التطبيق "أصمّ" بعد العودة للمقدمة حتى إعادة الاشتراك.
   document.addEventListener("visibilitychange", async () => {
     if (!state.me) return;
 
@@ -180,11 +233,32 @@ async function boot() {
     await safeAsync("visibility", async () => {
       if (document.visibilityState === "hidden") {
         await touchLastSeen(false);
-      } else {
-        await touchLastSeen(true);
-        resubscribeRealtime();
+        scheduleHiddenCatchUp();
+        return;
       }
+
+      stopHiddenCatchUp();
+      await touchLastSeen(true);
+      // العودة للمقدمة: أعد بناء الاشتراكات إن ماتت أثناء التجميد،
+      // ثم زامن ما فات (الرسائل + العدّادات) قبل أن يرى المستخدم واجهة قديمة.
+      if (!diagnoseRealtime(supabase).healthy) await resubscribeRealtime("visible");
+      await runCatchUpSync("visible");
     });
+  });
+
+  // التبويب المُجمّد (Frozen) لا يستقبل أحداث visibilitychange — هذه الأحداث
+  // هي الطريقة الرسمية لمعرفة أن التبويب جُمّد/استُؤنف (Page Lifecycle API).
+  document.addEventListener("resume", () => {
+    if (!state.me) return;
+    safeAsync("lifecycle:resume", async () => {
+      await resubscribeRealtime("resume");
+      await runCatchUpSync("resume");
+    });
+  });
+
+  document.addEventListener("freeze", () => {
+    // نحفظ آخر ظهور فقط حتى لا يظهر المستخدم "متاحاً" للأبد
+    if (state.me) safeAsync("lifecycle:freeze", () => touchLastSeen(false));
   });
 
   window.addEventListener(
@@ -193,8 +267,10 @@ async function boot() {
       state.isOnline = true;
       updateOfflineBanner();
       flushOutbox();
-      resubscribeRealtime();
+      flushPendingReads();
+      resubscribeRealtime("online");
       startContactsRefreshLoop();
+      runCatchUpSync("online", { force: true });
     })
   );
 
@@ -213,6 +289,21 @@ async function boot() {
   );
 
   updateOfflineBanner();
+
+  // استئناف من bfcache (iOS) — الصفحة كانت مُجمّدة والاتصال قد يكون مات
+  window.addEventListener("pageshow", (event) => {
+    if (!state.me || isCallActive()) return;
+    safeAsync("pageshow", async () => {
+      if (!diagnoseRealtime(supabase).healthy) await resubscribeRealtime("pageshow");
+      await runCatchUpSync("pageshow", { force: event.persisted });
+    });
+  });
+
+  window.addEventListener("focus", () => {
+    if (!state.me || isCallActive()) return;
+    if (document.visibilityState !== "visible") return;
+    runCatchUpSync("focus");
+  });
 
   window.addEventListener("popstate", (event) => {
     if (!event.state || !event.state.waChat) {
@@ -237,15 +328,21 @@ async function boot() {
 
 window.addEventListener('pageshow', (event) => {
   if (event.persisted && supabase) {
-    supabase.realtime.connect();
-    if (state.me) resubscribeRealtime();
+    ensureRealtimeConnected(supabase);
+    if (state.me) resubscribeRealtime("pageshow:persisted");
   }
 });
 
-window.addEventListener('pagehide', () => {
-  if (supabase && supabase.realtime) {
-    supabase.realtime.disconnect();
+// pagehide يقع عند الإخفاء *وعند* الخروج، والفرق في event.persisted:
+//   persisted === true  → الصفحة ستُجمَّد وتُستأنف → لا نقطع الاتصال.
+//   persisted === false → خروج فعلي → نقطع الاتصال ونُعلن عدم الاتصال.
+window.addEventListener('pagehide', (event) => {
+  if (event.persisted) return;
+  // المشرف يبقى "متصل الآن" دائماً حتى عند الخروج (حضور ثابت بالتصميم)
+  if (!state.me?.is_admin) {
+    safeAsync("pagehide:last-seen", () => touchLastSeen(false));
   }
+  if (supabase?.realtime) supabase.realtime.disconnect();
 });
 
 function openConversationUIState(conversationId) {
@@ -359,6 +456,26 @@ async function enterApp() {
     subscribeCallRoomsWatch();
   });
 
+  // نبضة اليقظة: تكتشف موت اتصال Realtime (تجميد التبويب/Doze) وتُحييه
+  startRealtimeWatchdogLoop({
+    supabase,
+    isEnabled: () => Boolean(state.me) && !isCallActive(),
+    onRevive: (reason) => {
+      // أثناء مكالمة جارية قناة الإشارات مقدّسة — لا نعيد بناءها
+      if (isCallActive()) return Promise.resolve();
+      return resubscribeRealtime(`watchdog:${reason}`);
+    },
+    onConnectionLost: (info) => {
+      console.warn("[realtime] فُقد الاتصال:", info);
+    },
+  });
+
+  // مراقبة تدوير توكن FCM: بدونه يصبح التوكن في قاعدة البيانات غير صالح
+  // بصمت فتتوقف إشعارات الخلفية حتى يفتح المستخدم التطبيق من جديد.
+  if (!state.tokenRefreshUnsub) {
+    state.tokenRefreshUnsub = watchTokenRefresh(state.me.id);
+  }
+
   // الإشعارات: جدّد التوكن بصمت إن كان الإذن ممنوحاً، وإلا اعرض بطاقة الطلب
   safeAsync("enterApp:notifications", async () => {
     const ready = await ensureNotificationsReady(state.me.id);
@@ -373,13 +490,20 @@ async function enterApp() {
   });
 
   refreshMissedCallsBadge();
-  handleDeepLinks();
 
   if (!state.foregroundMessagesUnsub) {
     try {
       state.foregroundMessagesUnsub = listenForForegroundMessages({
-        onNotification: () => {
-
+        // قرار عرض الإشعار والتطبيق في المقدمة: يُعرض دائماً إلا إن كان
+        // المستخدم يقرأ نفس المحادثة أمام الشاشة (النسخة السابقة كانت
+        // تُسقط الإشعار كلياً متى كان التبويب غير مرئي).
+        shouldSuppress: ({ viewingThread }) => viewingThread,
+        getActiveConversationId: () => state.activeConversation?.id || null,
+        onNotification: ({ data }) => {
+          // وصول إشعار FCM لجهازنا = الرسالة وصلتنا ⇒ ✓✓ رمادي عند المرسل
+          const conversationId =
+            data?.conversationId || data?.conversation_id || state.activeConversation?.id || null;
+          if (conversationId) markMessagesDelivered(conversationId);
           loadContacts();
         },
       });
@@ -388,13 +512,51 @@ async function enterApp() {
     }
   }
 
+  // موجّه نقرات الإشعارات: يسجّل المعالج ثم يفرّغ أي نقر معلّق (وصل قبل الجهوزية)
+  setNotificationRouteHandler((route) => openRouteFromNotification(route));
+  flushPendingRoutes();
+
+  // رسالة وصلت عبر Push والتطبيق في المقدمة → زامن فوراً (Realtime قد يتأخر)
+  window.addEventListener("wa-push-delivered", () => {
+    runCatchUpSync("push-delivered", { force: true });
+  });
+
+  // تغيّر اشتراك Push في المتصفح: التوكن القديم أصبح غير صالح → أعد التسجيل
+  window.addEventListener("wa-push-resubscribe", () => {
+    safeAsync("push:resubscribe", async () => {
+      try {
+        localStorage.removeItem("wa_fcm_last_sync");
+      } catch {
+        /* تجاهل */
+      }
+      await syncPushToken({ userId: state.me?.id, force: true });
+    });
+  });
+
+  // إن كان المستخدم قد نقر إشعاراً أثناء إقلاع التطبيق فسجّلناه في الرابط
+  handleDeepLinks();
+
   if (state.isOnline) {
     flushOutbox();
+
+    // تصحيح جماعي لعلامات التسليم عند كل دخول: أي رسالة وصلت أثناء إغلاق
+    // التطبيق تنتقل من ✓ إلى ✓✓ حتى لو تأخّر/فُقد إشعارها.
+    safeAsync("enterApp:delivered-sweep", () => sweepDeliveredMessages({ force: true }));
   }
+
+  updateUnreadTotals();
 }
 
+/**
+ * نبضة "آخر ظهور" الخاصة بي.
+ *
+ * ملاحظة مهمة: للمشرفين لا تُرسَل حالة "غير متصل" إطلاقاً — حضور المشرف
+ * ثابت في الواجهة وفي قاعدة البيانات (يُفرض بمُشغِّل على الجدول أيضاً)،
+ * فلا يقطع "متصل الآن" عند المستخدم العادي بسبب سكون متصفح المشرف.
+ */
 async function touchLastSeen(online) {
   if (!state.me || !state.isOnline) return;
+  if (!online && state.me.is_admin) return;
 
   await safeQuery("touchLastSeen", () =>
     supabase
@@ -427,8 +589,20 @@ function startContactsRefreshLoop() {
   stopContactsRefreshLoop();
   if (!state.me) return;
 
-  state.contactsRefreshInterval = setInterval(() => {
+  const tick = () => {
+    const hidden = document.visibilityState === "hidden";
+    // مؤقت متكيّف: سريع في المقدمة، بطيء في الخلفية (يخنق المتصفح المؤقتات
+    // الخلفية أصلاً إلى نبضة/دقيقة، والاستعلام الثقيل كل 3 ثوانٍ هناك كان
+    // يستهلك البطارية ويزيد احتمال تجميد التبويب من قِبَل المتصفح).
+    state.contactsRefreshInterval = setTimeout(tick, hidden ? 60000 : 5000);
+
+    // أثناء الخفاء: أعد تثبيت حضور المشرفين دورياً حتى تبقى الحالة صحيحة
+    // عند أي إعادة رسم أو مزامنة تحدث في الخلفية.
+    if (hidden) noteAdminPresenceOnline();
+
     if (!state.me || !state.isOnline || state.contactsRefreshInFlight) return;
+    // أثناء مكالمة جارية لا نُثقل الشبكة/المعالج بمزامنة غير ضرورية
+    if (isCallActive()) return;
 
     state.contactsRefreshInFlight = true;
     Promise.resolve(loadContacts())
@@ -440,15 +614,134 @@ function startContactsRefreshLoop() {
       .finally(() => {
         state.contactsRefreshInFlight = false;
       });
-  }, 3000);
+  };
+
+  state.contactsRefreshInterval = setTimeout(tick, 4000);
 }
 
 function stopContactsRefreshLoop() {
   if (state.contactsRefreshInterval) {
+    clearTimeout(state.contactsRefreshInterval);
     clearInterval(state.contactsRefreshInterval);
     state.contactsRefreshInterval = null;
   }
   state.contactsRefreshInFlight = false;
+}
+
+/* ------------------------------------------------------------
+ * إحياء الاتصال والمزامنة التفاضلية بعد الخلفية/التجميد
+ * ---------------------------------------------------------- */
+
+function startRealtimeWatchdogLoop(options) {
+  stopRealtimeWatchdog();
+  const started = safeSync("watchdog:start", () => startRealtimeWatchdog(options));
+  state.realtimeWatchdog = started.data || null;
+}
+
+function stopRealtimeWatchdog() {
+  if (!state.realtimeWatchdog) return;
+  try {
+    state.realtimeWatchdog.stop();
+  } catch {
+    /* تجاهل */
+  }
+  state.realtimeWatchdog = null;
+}
+
+/**
+ * مؤقت مزامنة يعمل في الخلفية: كل دقيقتين (بقدر ما يسمح المتصفح) نتحقق من
+ * العدّادات. الغرض: إن مُنع الإشعار لأي سبب (حظر نظام، محسّن بطارية، إشعار
+ * صامت) يبقى العدّاد صحيحاً عند العودة للتطبيق.
+ */
+function scheduleHiddenCatchUp() {
+  stopHiddenCatchUp();
+  state.hiddenCatchUpTimer = setInterval(() => {
+    if (document.visibilityState === "visible") {
+      stopHiddenCatchUp();
+      return;
+    }
+    if (!state.me || !state.isOnline || isCallActive()) return;
+    runCatchUpSync("hidden", { light: true });
+  }, 120000);
+}
+
+function stopHiddenCatchUp() {
+  if (state.hiddenCatchUpTimer) {
+    clearInterval(state.hiddenCatchUpTimer);
+    state.hiddenCatchUpTimer = null;
+  }
+}
+
+/**
+ * مزامنة "ما فات" بعد العودة من الخلفية: الرسائل + العدّادات + الإشعارات.
+ * @param {string} reason
+ * @param {{force?:boolean, light?:boolean}} options
+ */
+async function runCatchUpSync(reason = "resume", { force = false, light = false } = {}) {
+  if (!state.me || !state.isOnline) return;
+
+  const now = Date.now();
+  if (!force && now - state.lastCatchUpAt < 1500) return;
+  state.lastCatchUpAt = now;
+
+  await safeAsync(`catchup:${reason}`, async () => {
+    await flushPendingReads();
+    // علّم كل ما وصل إلينا فعلاً كـ"مُسلَّم" (✓✓ رمادي عند المرسل)
+    await sweepDeliveredMessages();
+
+    // تحقّق من تحديثات Service Worker (بما فيها worker الإشعارات) — مرة/ساعة
+    refreshServiceWorker();
+
+    // بعد الخلفية قد يكون التوكن قد دُوِّر أو حُذف من قاعدة البيانات —
+    // نُزامنه بصمت (بحد أدنى 30 دقيقة بين المزامنات الفعلية).
+    safeAsync("catchup:push-token", () => syncPushToken({ userId: state.me?.id }));
+
+    if (light) {
+      // في الخلفية نكتفي بالعدّادات (استعلام واحد خفيف)
+      await refreshUnreadBadges();
+      return;
+    }
+
+    if (state.activeConversation) {
+      const id = state.activeConversation.id;
+      await loadMessages(id, { silent: true });
+      // ما وصل أثناء الانقطاع يُثبَّت كـ"مُسلَّم"، والقراءة فقط إن كانت الشاشة مرئية
+      await markMessagesDelivered(id, { force: true });
+      if (document.visibilityState === "visible") {
+        await markConversationRead(id, { force: true });
+      }
+    }
+
+    await loadContacts();
+    refreshMissedCallsBadge();
+  });
+}
+
+/** نبضة keepalive عند إغلاق الصفحة — تُبقي "آخر ظهور" صحيحاً */
+function updatePresenceOfflineBeacon() {
+  try {
+    // المشرف لا يُعلَن "غير متصل" أبداً
+    if (state.me?.is_admin) return;
+
+    const session = JSON.parse(localStorage.getItem("wa_browser_session") || "null");
+    const token = session?.access_token;
+    if (!token || !state.me?.id) return;
+
+    const url = `${SUPABASE_URL}/rest/v1/profiles?id=eq.${encodeURIComponent(state.me.id)}`;
+    fetch(url, {
+      method: "PATCH",
+      keepalive: true,
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${token}`,
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({ is_online: false, last_seen: new Date().toISOString() }),
+    }).catch(() => {});
+  } catch {
+    /* تجاهل — لا يمكن فعل أكثر من ذلك أثناء الخروج */
+  }
 }
 
 function applyAuthRole(role) {
@@ -724,6 +1017,20 @@ function wireChrome() {
       }
       const reg = await navigator.serviceWorker?.getRegistration("./firebase-cloud-messaging-push-scope");
       log(!!reg?.active, reg?.active ? "Service Worker الخاص بالإشعارات نشط" : "Service Worker الخاص بالإشعارات غير مسجّل");
+
+      // حالة توكن FCM ومزامنته (سبب شائع لتوقّف إشعارات الخلفية)
+      const tokenSyncedAt = getLastTokenSyncAt();
+      const syncedMinutes = tokenSyncedAt ? Math.round((Date.now() - tokenSyncedAt) / 60000) : null;
+      log(isPushReady(), syncedMinutes === null
+        ? "لم تُسجَّل مزامنة توكن مع السيرفر بعد"
+        : `آخر مزامنة توكن مع السيرفر قبل ${syncedMinutes} دقيقة`);
+
+      // حالة اتصال Realtime وقنواته (تكشف "الموت الصامت" في الخلفية)
+      const rt = diagnoseRealtime(supabase);
+      log(rt.healthy, `Realtime: ${rt.connection}${rt.channels.length ? ` — ${rt.channels.length} قناة` : ""}`);
+      if (rt.unhealthy.length) {
+        log(false, "قنوات متوقفة: " + rt.unhealthy.map((c) => `${c.topic}(${c.state})`).join(", "));
+      }
       // إشعار محلي فوري — يثبت أن النظام يعرض الإشعارات أصلاً (بدون سيرفر)
       try {
         await (reg || (await navigator.serviceWorker.ready)).showNotification("🔔 اختبار محلي", {
@@ -899,24 +1206,33 @@ async function refreshMissedCallsBadge() {
 
 /** يراقب تغيّرات غرف المكالمات لتحديث الشارة والمحادثة المفتوحة فوراً */
 function subscribeCallRoomsWatch() {
-  if (state.callsChannel) {
-    try {
-      supabase.removeChannel(state.callsChannel);
-    } catch {
-      /* تجاهل */
-    }
-  }
-  state.callsChannel = supabase
-    .channel("call-rooms-watch")
-    .on("postgres_changes", { event: "*", schema: "public", table: "call_rooms" }, (payload) => {
-      const row = payload.new || payload.old;
-      if (!row || !state.me) return;
-      if (row.caller_id !== state.me.id && row.callee_id !== state.me.id) return;
-      refreshMissedCallsBadge();
-      const modal = $("#call-history-modal");
-      if (modal && !modal.classList.contains("hidden")) openCallHistory(state.callHistoryFilter, { silent: true });
-    })
-    .subscribe();
+  if (!state.me) return;
+
+  teardownChannel("callsChannel");
+
+  state.callsChannel = createResilientChannel(supabase, {
+    topic: "call-rooms-watch",
+    label: "call-rooms",
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: { event: "*", schema: "public", table: "call_rooms" },
+        callback: (payload) => {
+          const row = payload.new || payload.old;
+          if (!row || !state.me) return;
+          if (row.caller_id !== state.me.id && row.callee_id !== state.me.id) return;
+          refreshMissedCallsBadge();
+          const modal = $("#call-history-modal");
+          if (modal && !modal.classList.contains("hidden")) {
+            openCallHistory(state.callHistoryFilter, { silent: true });
+          }
+        },
+      },
+    ],
+    onStatus: (status) => {
+      if (status === "SUBSCRIBED") refreshMissedCallsBadge();
+    },
+  });
 }
 
 async function openCallHistory(filter = state.callHistoryFilter || "all", { silent = false } = {}) {
@@ -1051,42 +1367,163 @@ async function openCallHistory(filter = state.callHistoryFilter || "all", { sile
   list.appendChild(fragment);
 }
 
-/** فتح محادثة/مكالمة من رابط الإشعار (?conversation=...) أو رسالة الـ SW */
-function handleDeepLinks() {
-  const openById = async (conversationId) => {
-    if (!conversationId || !state.me) return;
-    const { data } = await supabase
+/**
+ * فتح محادثة بالمعرّف (من نقر إشعار أو من رابط).
+ *
+ * يتعامل مع كل الحالات التي كانت تُسقط النقرة بصمت سابقاً:
+ *   • التطبيق لم يكتمل تحميله بعد (لا `state.me`) → إعادة محاولة قصيرة.
+ *   • استعلام فاشل (شبكة/RLS) → إعادة محاولة بتراجع تدريجي.
+ *   • المحادثة غير موجودة/غير مسموحة → تنبيه واضح بدل الصمت.
+ *   • المحادثة مفتوحة بالفعل → تمرير مباشر للرسالة + تصفير العدّاد.
+ */
+async function openConversationById(conversationId, { messageId = null, attempt = 0 } = {}) {
+  if (!conversationId) return false;
+
+  if (!state.me) {
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      return openConversationById(conversationId, { messageId, attempt: attempt + 1 });
+    }
+    return false;
+  }
+
+  if (state.activeConversation?.id === conversationId) {
+    resetUnreadFor(conversationId);
+    await markConversationRead(conversationId);
+    if (messageId) await scrollToMessage(messageId);
+    return true;
+  }
+
+  const { ok, data } = await safeQuery("deeplink:conversation", () =>
+    supabase
       .from("conversations")
       .select("id,user_id,admin_id")
       .eq("id", conversationId)
-      .maybeSingle();
-    if (!data) return;
-    const otherId = data.user_id === state.me.id ? data.admin_id : data.user_id;
-    const { data: peer } = await supabase.from("profiles").select("*").eq("id", otherId).maybeSingle();
-    if (peer) await openConversation({ ...peer, _conversationId: data.id });
-  };
+      .maybeSingle()
+  );
 
-  try {
-    const url = new URL(window.location.href);
-    const conv = url.searchParams.get("conversation");
-    const hadCallParams = url.searchParams.has("answer_call") || url.searchParams.has("decline_call");
-    if (conv || hadCallParams) {
-      ["conversation", "answer_call", "decline_call"].forEach((k) => url.searchParams.delete(k));
-      window.history.replaceState({}, "", url.pathname + (url.search || "") + url.hash);
-      if (conv) openById(conv);
-      // المكالمة الواردة نفسها تصل عبر قناة الإشارات فور الاتصال بـ Realtime
-    }
-  } catch {
-    /* تجاهل */
+  if (ok && !data) {
+    showAuthError("تعذّر فتح المحادثة — قد تكون حُذفت أو لا تملك صلاحية الوصول إليها.");
+    return false;
   }
 
-  if (!handleDeepLinks._wired && navigator.serviceWorker) {
-    handleDeepLinks._wired = true;
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type === "OPEN_CONVERSATION" && event.data.conversationId) {
-        openById(event.data.conversationId);
-      }
-    });
+  if (!ok) {
+    if (attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+      return openConversationById(conversationId, { messageId, attempt: attempt + 1 });
+    }
+    showAuthError("تعذّر فتح المحادثة من الإشعار — تحقق من الاتصال.");
+    return false;
+  }
+
+  const otherId = data.user_id === state.me.id ? data.admin_id : data.user_id;
+
+  // الاسم/الصورة من القائمة المحلية إن وُجدت، وإلا من الشبكة
+  let peer = state.contacts.find((c) => c.id === otherId) || null;
+
+  if (!peer) {
+    const { data: profile } = await safeQuery("deeplink:profile", () =>
+      supabase.from("profiles").select("*").eq("id", otherId).maybeSingle()
+    );
+    peer = profile || null;
+  }
+
+  if (!peer) {
+    showAuthError("تعذّر تحميل بيانات المحادثة.");
+    return false;
+  }
+
+  await openConversation({ ...peer, _conversationId: data.id }, { messageId });
+  return true;
+}
+
+/** يوجّه أي هدف قادم من الإشعار (رسالة/مكالمة) إلى الواجهة الصحيحة */
+async function openRouteFromNotification(route) {
+  if (!route) return;
+
+  // مكالمة واردة: قناة الإشارات هي المسار الأساسي للرنين، وهذا المسار يضمن
+  // أن واجهة المكالمة تُفتح حتى لو كان التطبيق مُغلقاً تماماً.
+  if (route.action === "answer" && route.roomId) {
+    const handled = await safeAsync("route:call", () =>
+      openCallFromNotification(route.roomId, route.conversationId)
+    );
+    if (handled.data) return;
+  }
+
+  if (!route.conversationId) return;
+
+  closeConversationNotifications(route.conversationId);
+  resetUnreadFor(route.conversationId);
+
+  await openConversationById(route.conversationId, { messageId: route.messageId });
+}
+
+/** يحاول فتح/استئناف واجهة مكالمة واردة من إشعار */
+async function openCallFromNotification(roomId, conversationId) {
+  const { ok, data } = await safeQuery("route:call-room", () =>
+    supabase
+      .from("call_rooms")
+      .select("id,status,conversation_id,caller_id,callee_id")
+      .eq("id", roomId)
+      .maybeSingle()
+  );
+
+  if (!ok || !data) return false;
+  if (!["ringing", "active"].includes(data.status)) return false;
+
+  if (conversationId && state.activeConversation?.id !== conversationId) {
+    await openConversationById(conversationId);
+  }
+  return true;
+}
+
+/**
+ * مستمع نقرات الإشعارات. المنطق الفعلي انتقل إلى js/notification-router.js
+ * (يلتقط الهدف حتى قبل جهوزية التطبيق)، وهذه الدالة تفرّغ أي هدف معلّق.
+ */
+function handleDeepLinks() {
+  if (peekPendingRoute()) flushPendingRoutes();
+}
+
+/**
+ * هل هذا الطرف مشرف؟ يُستخدم لتثبيت حالة "متصل الآن" وإظهارها دائماً.
+ *
+ * الشرط يشمل أكثر من مسار حتى لا تعتمد النتيجة على اكتمال حقل واحد:
+ *   • البريد مطابق لقائمة المشرفين الثابتة في js/config.js (ADMINS)
+ *   • أو حقل is_admin / is_super_admin في الملف الشخصي
+ *   • أو بيانات المحادثة القائمة (نفس الحقول)
+ */
+function isAdminContact(id, profile = null) {
+  const candidate = profile || state.contacts?.find((c) => c.id === id) || null;
+  const email = String(candidate?.email || "").toLowerCase().trim();
+
+  if (email && ADMINS.some((a) => String(a.email).toLowerCase() === email)) return true;
+  if (candidate?.is_admin || candidate?.is_super_admin) return true;
+
+  const known = state.contacts?.find((c) => c.id === id);
+  if (known?.is_admin || known?.is_super_admin) return true;
+  if (!candidate && !known && !id) return false;
+
+  // المشرفون في هذا التطبيق هم أصحاب الحسابات المعلَّمة في قاعدة البيانات؛
+  // إن غاب الحقل تماماً نعتبره مشرفاً إن كان ضمن قسم المشرفين المعروض.
+  if (candidate && (candidate._isAdminSection || candidate._adminSection)) return true;
+  if (id && state.adminContacts?.some?.((c) => c.id === id)) return true;
+
+  return false;
+}
+
+/**
+ * تثبيت حضور المشرفين في خريطة الحضور الحالية.
+ * يُستدعى قبل كل رسم/مزامنة حتى لا تُسقط أي مزامنة (تحديث دوري، عودة من
+ * الخلفية، إعادة اتصال) حالة "متصل الآن" التي يراها المستخدم العادي.
+ */
+function noteAdminPresenceOnline() {
+  (state.contacts || []).forEach((c) => {
+    if (c?.id && isAdminContact(c.id, c)) state.onlineMap[c.id] = true;
+  });
+  if (state.activeConversation?.otherProfile) {
+    const peer = state.activeConversation.otherProfile;
+    if (peer?.id && isAdminContact(peer.id, peer)) state.onlineMap[peer.id] = true;
   }
 }
 
@@ -1463,6 +1900,8 @@ function renderContactsFromCache(cached) {
   });
 
   list.appendChild(fragment);
+
+  updateUnreadTotals();
 }
 
 async function loadContactsFromNetwork() {
@@ -1595,6 +2034,9 @@ async function loadContactsFromNetwork() {
     // المشرفون الذين يملكون محادثات المستخدمين في وضع السوبر أدمن قد يتكرّرون — لا مشكلة، القائمة منفصلة
     userContacts.sort(sortByLatestInteraction);
 
+    // قبل أي رسم: ثبّت حضور المشرفين، فلا تُسقط أي مزامنة "متصل الآن"
+    noteAdminPresenceOnline();
+
     $("#admins-section").innerHTML = "";
     const adminsFrag = document.createDocumentFragment();
     adminContacts.forEach((c) => {
@@ -1623,19 +2065,43 @@ async function loadContactsFromNetwork() {
       ])
     );
   }
+
+  // إجماليات الأقسام + شارة أيقونة التطبيق بعد كل تحديث للقائمة
+  updateUnreadTotals();
 }
 
-/** عدد الرسائل غير المقروءة (الواردة من الطرف الآخر) لكل محادثة */
+/**
+ * عدد الرسائل غير المقروءة (الواردة من الطرف الآخر) لكل محادثة.
+ *
+ * المسار المفضّل: دالة `unread_counts` في قاعدة البيانات (تجميع في الخادم —
+ * بايتات أقل ونتيجة أدق من سحب آلاف الصفوف وحسابها في المتصفح).
+ * المسار الاحتياطي: العدّ في العميل (يعمل حتى قبل تنفيذ migration v2.1).
+ */
 async function fetchUnreadCounts(conversationIds) {
   const map = new Map();
-  if (!conversationIds?.length || !state.me) return map;
+  const ids = (conversationIds || []).filter(Boolean);
+  if (!ids.length || !state.me) return map;
+
+  const rpc = await safeQuery("unread:rpc", () =>
+    supabase.rpc("unread_counts", { p_conversation_ids: ids })
+  );
+
+  if (rpc.ok && Array.isArray(rpc.data)) {
+    rpc.data.forEach((row) => {
+      if (!row?.conversation_id) return;
+      map.set(row.conversation_id, Number(row.unread) || 0);
+    });
+    return map;
+  }
+
   const { data, error } = await supabase
     .from("messages")
     .select("conversation_id")
-    .in("conversation_id", conversationIds)
+    .in("conversation_id", ids)
     .neq("sender_id", state.me.id)
     .neq("status", "read")
     .limit(5000);
+
   if (error) {
     console.warn("[unread] count failed:", error);
     return map;
@@ -1644,6 +2110,120 @@ async function fetchUnreadCounts(conversationIds) {
     map.set(row.conversation_id, (map.get(row.conversation_id) || 0) + 1);
   }
   return map;
+}
+
+/**
+ * مصدر واحد للحقيقة لعدّاد غير المقروء في الواجهة.
+ * يحدّث: شارة الصف + إجماليات الأقسام + شارة التطبيق على أيقونة النظام.
+ */
+function setConversationUnread(conversationId, value, { preview = undefined } = {}) {
+  if (!conversationId) return;
+
+  const count = Math.max(0, Number(value) || 0);
+
+  if (count === 0) delete state.unreadByConversation[conversationId];
+  else state.unreadByConversation[conversationId] = count;
+
+  const row = state.contactRowsByConversation[conversationId];
+  if (row) {
+    row.dataset.unread = String(count);
+    let badge = row.querySelector(".unread-badge");
+    if (count === 0) {
+      badge?.remove();
+    } else {
+      if (!badge) {
+        badge = document.createElement("div");
+        badge.className = "unread-badge";
+        row.appendChild(badge);
+      }
+      badge.textContent = String(count);
+    }
+    if (preview !== undefined) {
+      const sub = row.querySelector(".contact-sub");
+      if (sub) sub.textContent = preview || "";
+    }
+  }
+
+  updateUnreadTotals();
+}
+
+function unreadTotalFor(conversationIds) {
+  return (conversationIds || []).reduce(
+    (sum, id) => sum + (state.unreadByConversation[id] || 0),
+    0
+  );
+}
+
+/** إجمالي غير المقروء في كل المحادثات المعروفة */
+function totalUnreadCount() {
+  return Object.values(state.unreadByConversation).reduce(
+    (sum, n) => sum + (Number(n) || 0),
+    0
+  );
+}
+
+/** يحدّث ترويسة الأقسام (شارة المشرفين) وشارة أيقونة التطبيق */
+function updateUnreadTotals() {
+  safeDom("unread:totals", () => {
+    const adminSectionIds = [...document.querySelectorAll("#admins-section .contact-row")]
+      .map((row) => row.dataset.conversationId)
+      .filter(Boolean);
+    const adminUnread = unreadTotalFor(adminSectionIds);
+
+    const toggle = $("#admins-heading")?.querySelector("#admins-toggle");
+    if (toggle) {
+      let badge = toggle.querySelector(".section-unread");
+      if (adminUnread > 0) {
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "unread-badge section-unread";
+          toggle.querySelector(".section-toggle-title")?.after(badge);
+        }
+        badge.textContent = String(adminUnread);
+      } else {
+        badge?.remove();
+      }
+    }
+
+    // شارة أيقونة التطبيق على نظام التشغيل (Badging API)
+    const total = totalUnreadCount();
+    try {
+      if (typeof navigator.setAppBadge === "function") {
+        const result = total > 0 ? navigator.setAppBadge(total) : navigator.clearAppBadge?.();
+        if (result && typeof result.catch === "function") result.catch(() => {});
+      }
+    } catch {
+      /* غير مدعومة */
+    }
+  });
+}
+
+/**
+ * إعادة حساب العدّادات من قاعدة البيانات لمجموعة محادثات (أو لكل المعروض)
+ * وتحديث الواجهة — تُستدعى بعد أي تغيير حالة (read) أو عودة من الخلفية.
+ */
+async function refreshUnreadBadges(conversationIds = null) {
+  if (!state.me || !state.isOnline) return null;
+
+  const ids = (conversationIds?.length
+    ? conversationIds
+    : Object.keys(state.contactRowsByConversation)
+  ).filter(Boolean);
+
+  if (!ids.length) return null;
+
+  const map = await fetchUnreadCounts(ids);
+
+  // ما لم يعد في الخريطة يعني أنه قُرئ → صفر
+  ids.forEach((id) => setConversationUnread(id, map.get(id) || 0));
+
+  return map;
+}
+
+/** تصفير فوري لعدّاد محادثة (عند النقر/الفتح) قبل انتظار أي طلب شبكة */
+function resetUnreadFor(conversationId, options = {}) {
+  if (!conversationId) return;
+  setConversationUnread(conversationId, 0, options);
 }
 
 /** ترتيب حسب آخر تفاعل: الأحدث أولاً، ثم من لديه محادثة، ثم أبجدياً */
@@ -1704,9 +2284,14 @@ function buildContactRow(c, opts) {
       .trim()
       .charAt(0);
 
+  // المشرف يظهر "متصل الآن" دائماً وثابتاً (نقطة خضراء) — لا يعتمد على
+  // نجاح نبضة الحضور ولا على ظهوره في قناة الحضور.
+  const adminPeer = isAdminContact(c.id, c);
+  if (adminPeer && c.id) state.onlineMap[c.id] = true;
+
   const online =
-    c.id &&
-    state.onlineMap[c.id];
+    Boolean(c.id) &&
+    Boolean(adminPeer || state.onlineMap[c.id]);
 
   row.innerHTML = `
     <div class="avatar">
@@ -1790,6 +2375,9 @@ function buildContactRow(c, opts) {
   });
 
   row.addEventListener("click", () => {
+    // تصفير العدّاد لحظة النقر — قبل أي عمل غير متزامن داخل openConversation.
+    // (المطلوب: يزول العدّاد بمجرد فتح المحادثة لا بعد جهوزية الشبكة).
+    if (c._conversationId) resetUnreadFor(c._conversationId);
     openConversation(c);
   });
 
@@ -1806,6 +2394,10 @@ function buildContactRow(c, opts) {
     state.contactRowsByConversation[
       c._conversationId
     ] = row;
+
+    // زامِن خريطة العدّادات مع ما رُسم فعلاً (مصدر واحد للحقيقة)
+    if (c._unread) state.unreadByConversation[c._conversationId] = c._unread;
+    else delete state.unreadByConversation[c._conversationId];
   }
 
   return row;
@@ -1825,6 +2417,10 @@ function formatContactTime(iso) {
   return d.toLocaleDateString(locale, { day: "2-digit", month: "2-digit" });
 }
 
+/**
+ * زيادة فورية لعدّاد غير المقروء عند وصول رسالة (قبل أي طلب شبكة).
+ * المصدر الرسمي للعدّاد يبقى قاعدة البيانات، ويُصحَّح عبر refreshUnreadBadges.
+ */
 function bumpUnreadBadge(conversationId, preview) {
   const row =
     state.contactRowsByConversation[
@@ -1832,41 +2428,20 @@ function bumpUnreadBadge(conversationId, preview) {
     ];
 
   if (!row) {
+    // المحادثة غير معروضة (جديدة) → أعد بناء القائمة ثم صحّح العدّاد
     loadContacts();
+    setTimeout(() => refreshUnreadBadges([conversationId]), 700);
     return;
   }
 
   const current =
-    parseInt(
-      row.dataset.unread || "0",
-      10
-    ) + 1;
+    (state.unreadByConversation[conversationId] ??
+      parseInt(row.dataset.unread || "0", 10)) + 1;
 
-  row.dataset.unread =
-    String(current);
+  setConversationUnread(conversationId, current, { preview });
 
-  let badge =
-    row.querySelector(
-      ".unread-badge"
-    );
-
-  if (!badge) {
-    badge =
-      document.createElement("div");
-
-    badge.className =
-      "unread-badge";
-
-    row.appendChild(badge);
-  }
-
-  badge.textContent =
-    String(current);
-
-  // انقل المحادثة إلى أعلى قائمتها (آخر تفاعل) وحدّث المعاينة
+  // انقل المحادثة إلى أعلى قائمتها (آخر تفاعل) وحدّث وقتها
   if (preview !== undefined) {
-    const sub = row.querySelector(".contact-sub");
-    if (sub) sub.textContent = preview || "";
     let timeEl = row.querySelector(".contact-time");
     if (!timeEl) {
       timeEl = document.createElement("div");
@@ -1880,18 +2455,8 @@ function bumpUnreadBadge(conversationId, preview) {
 }
 
 function clearUnreadBadge(conversationId) {
-  const row =
-    state.contactRowsByConversation[
-      conversationId
-    ];
-
-  if (!row) return;
-
-  row.dataset.unread = "0";
-
-  row.querySelector(
-    ".unread-badge"
-  )?.remove();
+  if (!conversationId) return;
+  setConversationUnread(conversationId, 0);
 }
 
 function escapeHtml(str) {
@@ -1904,7 +2469,7 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
-async function openConversation(otherProfile) {
+async function openConversation(otherProfile, { messageId = null } = {}) {
   if (!otherProfile.id) {
     showAuthError(
       "هذا المشرف لم يُنشئ حسابه في التطبيق بعد، لا يمكن بدء محادثة معه حالياً."
@@ -1984,6 +2549,12 @@ async function openConversation(otherProfile) {
     state.messagesHasMore = false;
     state.loadingOlder = false;
 
+    // ⚡️ تصفير العدّاد فور فتح المحادثة — قبل أي طلب شبكة.
+    // الشرط الوحيد لتصفير العدّاد هو فتح المحادثة، والقيمة النهائية
+    // تُثبَّت في قاعدة البيانات بعد قليل عبر markConversationRead.
+    resetUnreadFor(conversationId);
+    closeConversationNotifications(conversationId);
+
     openConversationUIState(
       conversationId
     );
@@ -2009,12 +2580,23 @@ async function openConversation(otherProfile) {
     );
 
     await markConversationRead(
-      conversationId
+      conversationId,
+      { force: true }
     );
 
-    clearUnreadBadge(
-      conversationId
-    );
+    // نقر الإشعار: تمرير إلى الرسالة التي أحدثته مع تمييز مؤقت. قد تكون
+    // أحدث من آخر مزامنة أو أقدم من الصفحة المحمّلة، لذا نحاول مرتين.
+    if (messageId) {
+      state.focusMessageId = messageId;
+      safeAsync("deeplink:focus", async () => {
+        const found = await scrollToMessage(messageId);
+        if (found) return;
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await loadMessages(conversationId, { silent: true });
+        state.focusMessageId = null;
+        await scrollToMessage(messageId, { attempts: 5 });
+      });
+    }
 
     // فعّل أزرار المكالمة الآن بعد توفّر محادثة نشطة
     safeDom("open:call-buttons", () => {
@@ -2403,6 +2985,59 @@ function findMessageById(id) {
   );
 }
 
+/** تهيئة معرّف للاستخدام داخل محدّد CSS بأمان */
+function selectorSafeId(id) {
+  const value = String(id || "");
+  try {
+    if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(value);
+  } catch {
+    /* تجاهل */
+  }
+  return value.replace(/["\\\]]/g, "\\$&");
+}
+
+/**
+ * يمرّر نافذة الدردشة إلى الرسالة التي أحدثت الإشعار ويميّزها لحظياً —
+ * هذا ما يجعل نقر الإشعار ينقل المستخدم إلى "سياق" الرسالة لا إلى آخر الصفحة.
+ * إن كانت الرسالة أقدم من الصفحة المحمّلة تُحمَّل صفحات أقدم تدريجياً (بحد أقصى).
+ */
+async function scrollToMessage(messageId, { attempts = 3 } = {}) {
+  if (!messageId) return false;
+
+  const box = $("#chat-messages");
+  if (!box) return false;
+
+  const selector = `.bubble-row[data-message-id="${selectorSafeId(messageId)}"]`;
+  let row = box.querySelector(selector);
+
+  for (let i = 0; i < attempts && !row && state.messagesHasMore; i += 1) {
+    await safeAsync("scrollToMessage:older", () => loadOlderMessages());
+    row = box.querySelector(selector);
+  }
+
+  if (!row) {
+    console.warn("[deeplink] الرسالة غير موجودة في الصفحة الحالية:", messageId);
+    return false;
+  }
+
+  // التمييز أولاً (لا يعتمد على دعم scrollIntoView في كل بيئة)
+  safeDom("scrollToMessage:highlight", () => {
+    row.classList.add("flash-message");
+    setTimeout(() => row.classList.remove("flash-message"), 2400);
+  });
+
+  safeDom("scrollToMessage:scroll", () => {
+    if (typeof row.scrollIntoView === "function") {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+    } else {
+      const box = $("#chat-messages");
+      if (box) box.scrollTop = Math.max(0, row.offsetTop - box.clientHeight / 2);
+    }
+  });
+
+  return true;
+}
+
 function messagePreviewText(m) {
   if (!m) return "";
 
@@ -2463,10 +3098,12 @@ function buildMessageBubble(m) {
       }
     );
 
+  // الحالات: pending = محفوظة محلياً (✓) | sent/delivered = وصلت السيرفر أو
+  // وصل إشعارها (✓✓ رمادي) | read = قُرئت فعلاً (✓✓ أزرق) | failed = فشل الإرسال
   const ticks =
     mine
-      ? m._pending
-        ? '<span class="ticks">🕓</span>'
+      ? m._failed || m.status === "failed"
+        ? '<span class="ticks ticks-failed" title="تعذّر الإرسال">⚠</span>'
         : renderTicks(m.status)
       : "";
 
@@ -2974,25 +3611,43 @@ function wireSwipeToReply(
   );
 }
 
+/**
+ * علامات حالة الرسالة (Ticks) — القاعدة المعتمدة:
+ *
+ *   ✓   صح واحد        : الرسالة حُفظت محلياً فقط — التطبيق أوفلاين أو في
+ *                        الخلفية بلا ارتباط (لم يستلمها السيرفر بعد).
+ *   ✓✓  صحّان رماديان  : السيرفر استلم الرسالة، أو وصل الإشعار لجهاز المستقبِل.
+ *   ✓✓  صحّان أزرقان   : الطرف الآخر فتح المحادثة وقرأ الرسالة فعلاً.
+ *
+ * الحالات التي تصل من قاعدة البيانات: sent | delivered | read
+ * والحالة المحلية الوحيدة قبل الإرسال الفعلي: pending (صندوق الصادر).
+ */
 function renderTicks(status) {
-  if (status === "read") {
+  const normalized = String(status || "").toLowerCase();
+
+  // ✓✓ أزرق: قرأها الطرف الآخر فعلاً
+  if (normalized === "read") {
     return `
-      <span class="ticks ticks-read">
+      <span class="ticks ticks-read" title="تم القراءة">
         ✓✓
       </span>
     `;
   }
 
-  if (status === "delivered") {
+  // ✓✓ رمادي: وصلت السيرفر أو وصل إشعارها إلى جهاز المستقبِل
+  if (normalized === "delivered" || normalized === "sent") {
     return `
-      <span class="ticks">
+      <span class="ticks ticks-delivered" title="${
+        normalized === "delivered" ? "تم التسليم" : "أُرسلت"
+      }">
         ✓✓
       </span>
     `;
   }
 
+  // ✓ واحد: محفوظة محلياً (أوفلاين / في الخلفية) ولم يصلها السيرفر بعد
   return `
-    <span class="ticks">
+    <span class="ticks ticks-pending" title="في انتظار الإرسال">
       ✓
     </span>
   `;
@@ -4170,115 +4825,121 @@ async function flushOutbox() {
   }
 }
 
-function resubscribeRealtime() {
+/** يغلق قناة (مرنة أو خام) بأمان ويُفرّغ مكانها في الحالة */
+function teardownChannel(key) {
+  const holder = state[key];
+  if (!holder) return;
+
+  state[key] = null;
+
+  try {
+    if (typeof holder.stop === "function") {
+      holder.stop(); // قناة مرنة: تُلغي إعادة المحاولات وتُغلق القناة الداخلية
+    } else {
+      supabase.removeChannel(holder);
+    }
+  } catch (error) {
+    console.warn(`[realtime] تعذّر إغلاق ${key}:`, error);
+  }
+}
+
+/**
+ * إعادة بناء كل اشتراكات Realtime بعد انقطاع/تجميد.
+ * تُستدعى عند: العودة للمقدمة، resume، عودة الشبكة، أو نبضة اليقظة.
+ * مُسلسَلة عبر realtimeResubscribePromise لمنع إنشاء قنوات بنفس الـ topic بالتوازي.
+ */
+function resubscribeRealtime(reason = "manual") {
   if (!state.me) return Promise.resolve();
   if (state.realtimeResubscribePromise) return state.realtimeResubscribePromise;
 
+  console.log(`[realtime] إعادة بناء الاشتراكات (${reason})`);
+
   state.realtimeResubscribePromise = (async () => {
+    // 0) تأكد أن الاتصال الأساسي حيّ قبل إعادة الاشتراك
+    ensureRealtimeConnected(supabase);
 
-  // removeChannel is asynchronous. Do not attach presence listeners to a new
-  // channel while the previous channel with the same topic is still closing.
-  if (state.presenceChannel) {
-    const oldPresenceChannel = state.presenceChannel;
-    state.presenceChannel = null;
-    try {
-      await supabase.removeChannel(oldPresenceChannel);
-    } catch (error) {
-      console.warn("[realtime] تعذّر إغلاق قناة الحضور القديمة:", error);
+    // removeChannel غير متزامنة — لا نربط مستمعي قناة جديدة قبل إغلاق القديمة
+    teardownChannel("presenceChannel");
+    subscribeGlobalPresence();
+
+    teardownChannel("inboxChannel");
+    subscribeInboxUpdates();
+
+    teardownChannel("globalMsgChannel");
+    subscribeGlobalMessageWatch();
+
+    if (!isCallActive()) {
+      teardownChannel("callsChannel");
+      subscribeCallRoomsWatch();
+
+      try {
+        unsubscribeFromIncomingCalls();
+        subscribeToIncomingCalls();
+      } catch (error) {
+        console.warn("[realtime] تعذّر إعادة الاشتراك بقناة المكالمات:", error);
+      }
     }
-  }
 
-  subscribeGlobalPresence();
-
-  if (
-    state.inboxChannel
-  ) {
-    supabase.removeChannel(
-      state.inboxChannel
-    );
-  }
-
-  subscribeInboxUpdates();
-
-  if (
-    state.globalMsgChannel
-  ) {
-    supabase.removeChannel(
-      state.globalMsgChannel
-    );
-  }
-
-  subscribeGlobalMessageWatch();
-
-  if (
-    state.activeConversation
-  ) {
-    subscribeToConversation(
-      state.activeConversation.id
-    );
-
-    loadMessages(
-      state.activeConversation.id
-    );
-  }
-  })().finally(() => {
-    state.realtimeResubscribePromise = null;
-  });
+    if (state.activeConversation) {
+      state.subscribedConversationId = null;
+      subscribeToConversation(state.activeConversation.id);
+      await loadMessages(state.activeConversation.id, { silent: true });
+    }
+  })()
+    .catch((error) => {
+      console.warn("[realtime] فشل إعادة بناء الاشتراكات:", error);
+    })
+    .finally(() => {
+      state.realtimeResubscribePromise = null;
+    });
 
   return state.realtimeResubscribePromise;
 }
 
+/**
+ * الاشتراك في قنوات المحادثة المفتوحة (رسائل + "يكتب الآن" + تفاعلات).
+ *
+ * كل قناة تُبنى عبر createResilientChannel: إن سقطت (CHANNEL_ERROR/TIMED_OUT)
+ * تُعاد تلقائياً بخلفية تصاعدية بدل أن تبقى المحادثة "صامتة" حتى يتفاعل
+ * المستخدم. والاشتراك متكرّر الأمان (idempotent) لنفس المحادثة.
+ */
 function subscribeToConversation(
   conversationId
 ) {
-  if (state.msgChannel) {
-    supabase.removeChannel(
-      state.msgChannel
-    );
+  if (!conversationId || !state.me) return;
+
+  // نفس المحادثة وقناة حيّة → لا تُهدر إعادة اشتراك
+  if (state.subscribedConversationId === conversationId && state.msgChannel?.channel) {
+    return;
   }
 
-  if (state.typingChannel) {
-    supabase.removeChannel(
-      state.typingChannel
-    );
-  }
+  teardownChannel("msgChannel");
+  teardownChannel("typingChannel");
+  teardownChannel("reactionsChannel");
 
-  if (
-    state.reactionsChannel
-  ) {
-    supabase.removeChannel(
-      state.reactionsChannel
-    );
-  }
+  state.subscribedConversationId = conversationId;
 
-  state.msgChannel =
-    supabase
-      .channel(
-        `messages:${conversationId}`
-      )
-      .on(
-        "postgres_changes",
-        {
-          event:
-            "INSERT",
-          schema:
-            "public",
-          table:
-            "messages",
-          filter:
-            `conversation_id=eq.${conversationId}`,
+  const isActive = () => state.activeConversation?.id === conversationId;
+
+  state.msgChannel = createResilientChannel(supabase, {
+    topic: `messages:${conversationId}`,
+    label: `messages:${conversationId}`,
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `conversation_id=eq.${conversationId}`,
         },
-        async (payload) => {
+        callback: async (payload) => {
+          if (!payload?.new || !isActive()) return;
 
-          const exists =
-            state.messages.some(
-              (m) =>
-                m.id ===
-                payload.new.id
-            );
+          const exists = state.messages.some((m) => m.id === payload.new.id);
 
           if (!exists) {
-            // أزل أي نسخة محلية مؤقتة مطابقة (نفس المحتوى من نفس المرسل)
+            // أزل النسخة المحلية المؤقتة المطابقة (نفس المحتوى من نفس المرسل)
             if (payload.new.sender_id === state.me.id) {
               const i = state.messages.findIndex(
                 (m) => m._pending && m.content === payload.new.content
@@ -4289,176 +4950,343 @@ function subscribeToConversation(
             state.messages.sort((a, b) => a.created_at.localeCompare(b.created_at));
           }
 
+          // إن كانت رسالة الإشعار المفتوح قد وصلت للتوّ → مرّر إليها
+          if (state.focusMessageId && payload.new.id === state.focusMessageId) {
+            state.focusMessageId = null;
+            setTimeout(() => scrollToMessage(payload.new.id), 60);
+          }
+
           renderMessages();
 
-          cacheMessages(
-            conversationId,
-            [payload.new]
-          );
+          cacheMessages(conversationId, [payload.new]);
 
-          if (
-            payload.new
-              .sender_id !==
-            state.me.id
-          ) {
+          if (payload.new.sender_id !== state.me.id) {
             if (payload.new.message_type !== "call") playNotificationSound();
 
-            await markConversationRead(
-              conversationId
-            );
+            if (document.visibilityState === "visible") {
+              // فتح المحادثة = قراءة: صفّر العدّاد فوراً وثبّتها على الخادم
+              await markConversationRead(conversationId);
+            } else {
+              // التبويب مخفي: وصلت الرسالة إلينا فعلاً ⇒ "تم التسليم" فقط،
+              // ولا نعلن القراءة قبل أن يرى المستخدم الشاشة.
+              await markMessagesDelivered(conversationId);
+            }
           }
-        }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event:
-            "UPDATE",
-          schema:
-            "public",
-          table:
-            "messages",
-          filter:
-            `conversation_id=eq.${conversationId}`,
         },
-        (payload) => {
-          const idx =
-            state.messages.findIndex(
-              (m) =>
-                m.id ===
-                payload.new.id
-            );
+      },
+      {
+        type: "postgres_changes",
+        filter: {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        callback: (payload) => {
+          if (!payload?.new || !isActive()) return;
+
+          const idx = state.messages.findIndex((m) => m.id === payload.new.id);
 
           if (idx > -1) {
-            state.messages[
-              idx
-            ] =
-              payload.new;
+            state.messages[idx] = payload.new;
             cacheMessages(conversationId, [payload.new]);
           }
 
           renderMessages({ keepScroll: true });
-        }
-      )
-      .on(
-        "postgres_changes",
-        {
+        },
+      },
+      {
+        type: "postgres_changes",
+        filter: {
           event: "DELETE",
           schema: "public",
           table: "messages",
         },
-        (payload) => {
+        callback: (payload) => {
           const id = payload.old?.id;
           if (!id) return;
           const before = state.messages.length;
           state.messages = state.messages.filter((m) => m.id !== id);
           safeAsync("cache:rt-delete", () => removeCachedMessage(id));
           if (state.messages.length !== before) renderMessages({ keepScroll: true });
-        }
-      )
-      .subscribe();
-
-  state.typingChannel =
-    supabase
-      .channel(
-        `typing:${conversationId}`
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema:
-            "public",
-          table:
-            "typing_status",
-          filter:
-            `conversation_id=eq.${conversationId}`,
         },
-        (payload) => {
-          const row =
-            payload.new;
+      },
+    ],
+    onStatus: (status, error) => {
+      if (status === "SUBSCRIBED") {
+        // بعد كل (إعادة) اتصال: اسحب ما فات في هذه المحادثة فوراً
+        if (isActive() && state.isOnline) {
+          safeAsync("thread:resync", async () => {
+            await loadMessages(conversationId, { silent: true });
+            await markConversationRead(conversationId, { force: true });
+          });
+        }
+        return;
+      }
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn(`[realtime] قناة المحادثة ${conversationId}: ${status}`, error || "");
+      }
+    },
+  });
 
-          if (
-            row &&
-            row.user_id !==
-              state.me.id
-          ) {
-            $("#typing-indicator")?.classList.toggle(
-              "hidden",
-              !row.is_typing
-            );
+  state.typingChannel = createResilientChannel(supabase, {
+    topic: `typing:${conversationId}`,
+    label: `typing:${conversationId}`,
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: {
+          event: "*",
+          schema: "public",
+          table: "typing_status",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        callback: (payload) => {
+          const row = payload.new;
+          if (row && row.user_id !== state.me.id && isActive()) {
+            $("#typing-indicator")?.classList.toggle("hidden", !row.is_typing);
           }
-        }
-      )
-      .subscribe();
-
-  state.reactionsChannel =
-    supabase
-      .channel(
-        `reactions:${conversationId}`
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema:
-            "public",
-          table:
-            "message_reactions",
         },
-        (payload) => {
-          const row =
-            payload.new ||
-            payload.old;
+      },
+    ],
+    onStatus: (status) => {
+      // مؤشّر "يكتب الآن" يجب ألّا يبقى عالقاً بعد انقطاع القناة
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        safeDom("typing:reset", () => $("#typing-indicator")?.classList.add("hidden"));
+      }
+    },
+  });
 
-          if (
-            row &&
-            state.messages.some(
-              (m) =>
-                m.id ===
-                row.message_id
-            )
-          ) {
+  state.reactionsChannel = createResilientChannel(supabase, {
+    topic: `reactions:${conversationId}`,
+    label: `reactions:${conversationId}`,
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: {
+          event: "*",
+          schema: "public",
+          table: "message_reactions",
+        },
+        callback: (payload) => {
+          const row = payload.new || payload.old;
+          if (row && isActive() && state.messages.some((m) => m.id === row.message_id)) {
             loadReactionsForConversation();
           }
-        }
-      )
-      .subscribe();
+        },
+      },
+    ],
+  });
 }
 
-async function markConversationRead(
-  conversationId
-) {
-  if (!state.isOnline) return;
+const PENDING_READS_KEY = "wa_pending_reads";
+const readRequestsInFlight = new Map();
+const unreadReconcileQueue = new Set();
+let unreadReconcileTimer = null;
 
+function loadPendingReads() {
   try {
-    const { error } = await supabase
-      .from("messages")
-      .update({
-        status: "read",
-      })
-      .eq(
-        "conversation_id",
-        conversationId
-      )
-      .neq(
-        "sender_id",
-        state.me.id
-      )
-      .neq(
-        "status",
-        "read"
-      );
-
-    if (error) {
-      console.error("markConversationRead failed:", error);
-    } else {
-      clearUnreadBadge(conversationId);
-      closeConversationNotifications(conversationId);
-    }
-  } catch (err) {
-    console.error("markConversationRead network error:", err);
+    const parsed = JSON.parse(localStorage.getItem(PENDING_READS_KEY) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter(Boolean) : []);
+  } catch {
+    return new Set();
   }
+}
+
+function savePendingReads(set) {
+  try {
+    localStorage.setItem(PENDING_READS_KEY, JSON.stringify([...set].slice(-40)));
+  } catch {
+    /* التخزين ممتلئ/معطّل — نتجاهل */
+  }
+}
+
+function queuePendingRead(conversationId) {
+  if (!conversationId) return;
+  const pending = loadPendingReads();
+  if (!pending.has(conversationId)) {
+    pending.add(conversationId);
+    savePendingReads(pending);
+  }
+}
+
+function unqueuePendingRead(conversationId) {
+  const pending = loadPendingReads();
+  if (pending.delete(conversationId)) savePendingReads(pending);
+}
+
+/** يحدّث حالة الرسائل محلياً إلى "مقروءة" فتظهر علامتا القراءة فوراً */
+function markLocalMessagesRead(conversationId) {
+  if (!state.me) return;
+
+  const updated = [];
+  state.messages.forEach((m) => {
+    if (m.conversation_id === conversationId && m.sender_id !== state.me.id && m.status !== "read") {
+      m.status = "read";
+      updated.push(m);
+    }
+  });
+
+  if (!updated.length) return;
+
+  safeAsync("cache:read-status", () => cacheMessages(conversationId, updated));
+
+  if (state.activeConversation?.id === conversationId) {
+    renderMessages({ keepScroll: true });
+  }
+}
+
+/**
+ * تصفير عدّاد غير المقروء لمحادثة + إبلاغ الخادم بأن الرسائل قُرئت.
+ *
+ * الترتيب مقصود:
+ *   1) تصفير فوري في الواجهة (شارة + إجماليات) — لا ينتظر الشبكة إطلاقاً.
+ *   2) إغلاق إشعارات هذه المحادثة من شريط النظام.
+ *   3) تسجيل "نية القراءة" في localStorage — فإن فشل الطلب أو كان الجهاز
+ *      دون اتصال تُنفَّذ عند أول عودة للشبكة (flushPendingReads).
+ *   4) طلب تحديث واحد لكل محادثة (مع منع الطلبات المتزامنة المكرّرة).
+ *
+ * @returns {Promise<boolean>} نجاح التثبيت على الخادم
+ */
+async function markConversationRead(conversationId, { force = false } = {}) {
+  if (!conversationId || !state.me) return false;
+
+  resetUnreadFor(conversationId);
+  closeConversationNotifications(conversationId);
+  queuePendingRead(conversationId);
+
+  if (!state.isOnline) return false;
+
+  const inFlight = readRequestsInFlight.get(conversationId);
+  if (inFlight && !force) return inFlight;
+
+  const task = (async () => {
+    // المسار المفضّل: دالة SQL واحدة تُعيد عدد الرسائل التي صُفّرت (ذرّية)
+    const rpc = await safeQuery("markRead:rpc", () =>
+      supabase.rpc("mark_conversation_read", { p_conversation_id: conversationId })
+    );
+
+    if (rpc.ok && rpc.data !== null && rpc.data !== undefined) {
+      unqueuePendingRead(conversationId);
+      markLocalMessagesRead(conversationId);
+      return true;
+    }
+
+    // المسار الاحتياطي (لو لم تُنفَّذ migration v2.3 بعد)
+    const { ok, error } = await safeQuery("markRead", () =>
+      supabase
+        .from("messages")
+        .update({ status: "read" })
+        .eq("conversation_id", conversationId)
+        .neq("sender_id", state.me.id)
+        .neq("status", "read")
+    );
+
+    if (!ok) {
+      console.warn("[unread] فشل تثبيت القراءة — ستُعاد المحاولة تلقائياً:", error?.message || error);
+      return false;
+    }
+
+    unqueuePendingRead(conversationId);
+    markLocalMessagesRead(conversationId);
+    return true;
+  })()
+    .catch((err) => {
+      console.warn("[unread] خطأ شبكة أثناء تثبيت القراءة:", err);
+      return false;
+    })
+    .finally(() => readRequestsInFlight.delete(conversationId));
+
+  readRequestsInFlight.set(conversationId, task);
+  return task;
+}
+
+/**
+ * ✓✓ رمادي (تم التسليم): يثبّت أن رسائل هذه المحادثة الواردة إلينا وصلت
+ * فعلاً إلى هذا الجهاز (Realtime، أو مزامنة العودة، أو وصول إشعار FCM).
+ *
+ * لماذا نثبّتها على السيرفر؟ لأن المرسل يرى العلامات من قاعدة البيانات؛
+ * فبدون هذا التحديث تبقى رسائله على ✓ واحد رغم وصولها فعلاً.
+ */
+const deliveredRequestsInFlight = new Map();
+
+async function markMessagesDelivered(conversationId, { force = false } = {}) {
+  if (!conversationId || !state.me || !state.isOnline) return false;
+  if (!force && deliveredRequestsInFlight.has(conversationId)) {
+    return deliveredRequestsInFlight.get(conversationId);
+  }
+
+  const task = (async () => {
+    // المسار المفضّل: دالة واحدة ذرّية (migration v2.4)
+    const rpc = await safeQuery("delivered:rpc", () =>
+      supabase.rpc("mark_messages_delivered", { p_conversation_id: conversationId })
+    );
+
+    if (rpc.ok && rpc.data !== null && rpc.data !== undefined) return true;
+
+    // مسار احتياطي: تحديث مباشر لا يمسّ إلا الرسائل الواردة غير المسلَّمة
+    const { ok, error } = await safeQuery("delivered:update", () =>
+      supabase
+        .from("messages")
+        .update({ status: "delivered" })
+        .eq("conversation_id", conversationId)
+        .neq("sender_id", state.me.id)
+        .eq("status", "sent")
+    );
+
+    if (!ok) {
+      console.warn("[status] تعذّر تثبيت حالة التسليم:", error?.message || error);
+      return false;
+    }
+    return true;
+  })()
+    .catch(() => false)
+    .finally(() => {
+      // امنع تكرار الطلب لنفس المحادثة خلال 10 ثوانٍ (كل رسالة تُطلق الطلب)
+      setTimeout(() => deliveredRequestsInFlight.delete(conversationId), 10000);
+    });
+
+  deliveredRequestsInFlight.set(conversationId, task);
+  return task;
+}
+
+/**
+ * تصحيح جماعي لعلامات التسليم بعد أي انقطاع/سكون: أي رسالة واردة إلينا
+ * وبقيت على ✓ واحد تُعلَّم ✓✓. تُستدعى عند الدخول وعند كل مزامنة عودة.
+ */
+let lastDeliveredSweepAt = 0;
+
+async function sweepDeliveredMessages({ force = false } = {}) {
+  if (!state.me || !state.isOnline) return false;
+  if (!force && Date.now() - lastDeliveredSweepAt < 60000) return false;
+  lastDeliveredSweepAt = Date.now();
+
+  const rpc = await safeQuery("delivered:sweep", () =>
+    supabase.rpc("mark_all_messages_delivered")
+  );
+  if (rpc.ok) return true;
+
+  // مسار احتياطي (قبل تنفيذ الترقية): لكل محادثة معروفة على حدة
+  const ids = Object.keys(state.contactRowsByConversation || {});
+  for (const id of ids.slice(0, 20)) {
+    await markMessagesDelivered(id, { force: true });
+  }
+  return false;
+}
+
+/** ينفّذ عمليات القراءة المؤجّلة (بعد عودة الشبكة أو العودة للمقدمة) */
+async function flushPendingReads() {
+  if (!state.me || !state.isOnline) return 0;
+
+  const pending = [...loadPendingReads()];
+  if (!pending.length) return 0;
+
+  let done = 0;
+  for (const conversationId of pending.slice(0, 10)) {
+    const ok = await markConversationRead(conversationId, { force: true });
+    if (ok) done += 1;
+  }
+  return done;
 }
 
 function handleTypingInput() {
@@ -4509,48 +5337,87 @@ async function setTyping(
 function subscribeGlobalPresence() {
   // Realtime throws when .on() is called after subscribe(). This guard also
   // prevents duplicate channels during repeated visibility/network events.
-  if (state.presenceChannel) return;
+  if (state.presenceChannel || !state.me) return;
 
-  const channel = supabase.channel("presence:global", {
-    config: { presence: { key: state.me.id } },
+  state.presenceChannel = createResilientChannel(supabase, {
+    topic: "presence:global",
+    label: "presence",
+    config: { config: { presence: { key: state.me.id } } },
+    handlers: [
+      {
+        type: "presence",
+        filter: { event: "sync" },
+        // القناة تُمرَّر كوسيط ثانٍ — مهم لأن القناة تُبنى من جديد عند الإحياء
+        callback: (payload, channel) => {
+          let presState = {};
+          try {
+            presState = channel?.presenceState?.() || {};
+          } catch {
+            presState = {};
+          }
+
+          state.onlineMap = {};
+          Object.keys(presState).forEach((id) => {
+            state.onlineMap[id] = true;
+          });
+
+          // حضور المشرفين ثابت: نُثبّته هنا فيبقى "متصل الآن" ظاهراً عند
+          // المستخدم العادي حتى لو خرج المشرف من قناة الحضور (سكون/خلفية).
+          (state.contacts || []).forEach((c) => {
+            if (c?.id && isAdminContact(c.id, c)) state.onlineMap[c.id] = true;
+          });
+          if (state.activeConversation?.otherProfile?.id) {
+            const peer = state.activeConversation.otherProfile;
+            if (isAdminContact(peer.id, peer)) state.onlineMap[peer.id] = true;
+          }
+
+          loadContacts();
+          if (state.activeConversation) {
+            refreshPresenceLabel(state.activeConversation.otherProfile.id);
+          }
+        },
+      },
+      {
+        type: "presence",
+        filter: { event: "leave" },
+        callback: async ({ leftPresences = [] }) => {
+          if (!state.activeConversation) return;
+
+          const leftIds = leftPresences.map((presence) => presence.key).filter(Boolean);
+
+          // مغادرة مشرف لقناة الحضور لا تعني أنه غير متصل: تُهمَل ولا تُغيّر
+          // الحالة الظاهرة للمستخدم العادي.
+          leftIds.forEach((id) => {
+            if (isAdminContact(id)) state.onlineMap[id] = true;
+          });
+
+          if (
+            leftIds.includes(state.activeConversation.otherProfile.id) &&
+            !isAdminContact(state.activeConversation.otherProfile.id)
+          ) {
+            await refreshPresenceLabel(state.activeConversation.otherProfile.id);
+          }
+        },
+      },
+    ],
+    onStatus: async (status, error, channel) => {
+      if (status !== "SUBSCRIBED") {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("[realtime] قناة الحضور:", status, error || "");
+        }
+        return;
+      }
+
+      // أعِد تسجيل الحضور بعد كل (إعادة) اشتراك — بدونه يبقى المستخدم
+      // يبدو "غير متصل" للآخرين بعد أي انقطاع للقناة.
+      try {
+        const result = await channel.track({ online_at: new Date().toISOString() });
+        if (result?.error) console.warn("[realtime] تعذّر تحديث حالة الحضور:", result.error);
+      } catch (trackError) {
+        console.warn("[realtime] خطأ في تتبّع الحضور:", trackError);
+      }
+    },
   });
-  state.presenceChannel = channel;
-
-  channel
-    .on("presence", { event: "sync" }, () => {
-      const presState = channel.presenceState();
-      state.onlineMap = {};
-
-      Object.keys(presState).forEach((id) => {
-        state.onlineMap[id] = true;
-      });
-
-      loadContacts();
-      if (state.activeConversation) {
-        refreshPresenceLabel(state.activeConversation.otherProfile.id);
-      }
-    })
-    .on("presence", { event: "leave" }, async ({ leftPresences = [] }) => {
-      if (!state.activeConversation) return;
-
-      const leftIds = leftPresences
-        .map((presence) => presence.key)
-        .filter(Boolean);
-
-      if (leftIds.includes(state.activeConversation.otherProfile.id)) {
-        await refreshPresenceLabel(state.activeConversation.otherProfile.id);
-      }
-    })
-    .subscribe(async (status) => {
-      if (status !== "SUBSCRIBED") return;
-
-      const result = await channel.track({
-        online_at: new Date().toISOString(),
-      });
-      if (result?.error) {
-        console.warn("[realtime] تعذّر تحديث حالة الحضور:", result.error);
-      }
-    });
 }
 
 async function refreshPresenceLabel(
@@ -4560,6 +5427,19 @@ async function refreshPresenceLabel(
     $("#chat-header-status");
 
   if (!label) return;
+
+  // "متصل الآن" ثابت ودائم لكل مشرف — لا يعتمد على قناة الحضور وحدها (قد
+  // تتأخر أو تُقطع نبضتها عند سكون متصفح المشرف) بل على كونه مشرفاً.
+  const peer =
+    state.activeConversation?.otherProfile ||
+    state.contacts?.find((c) => c.id === otherId) ||
+    null;
+
+  if (isAdminContact(otherId, peer)) {
+    state.onlineMap[otherId] = true;
+    label.textContent = state.t?.online || "متصل الآن";
+    return;
+  }
 
   if (
     state.onlineMap[
@@ -4634,98 +5514,127 @@ async function refreshPresenceLabel(
 }
 
 function subscribeInboxUpdates() {
-  state.inboxChannel =
-    supabase
-      .channel(
-        "inbox-updates"
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema:
-            "public",
-          table:
-            "conversations",
-        },
-        (payload) => {
-          const row =
-            payload.new;
+  if (!state.me) return;
 
-          if (
-            row &&
-            (
-              row.user_id ===
-                state.me.id ||
-              row.admin_id ===
-                state.me.id
-            )
-          ) {
+  state.inboxChannel = createResilientChannel(supabase, {
+    topic: "inbox-updates",
+    label: "inbox",
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: { event: "*", schema: "public", table: "conversations" },
+        callback: (payload) => {
+          const row = payload.new;
+          if (row && (row.user_id === state.me.id || row.admin_id === state.me.id)) {
+            // محادثة جديدة/تحديث آخر رسالة → أعِد الترتيب مع تصحيح العدّادات
             loadContacts();
           }
-        }
-      )
-      .subscribe();
+        },
+      },
+    ],
+  });
 }
 
+/**
+ * مراقبة كل الرسائل (عبر RLS: محادثات المستخدم فقط) — شبكة أمان لمؤشّر
+ * غير المقروء وإن لم تكن المحادثة مفتوحة.
+ *
+ * ثلاثة أنواع أحداث:
+ *   INSERT → زيادة فورية للعدّاد + صوت + إشعار نظام (إن لم تكن المحادثة مفتوحة).
+ *   UPDATE → تغيّر حالة الرسالة (read/delivered) → إعادة احتساب العدّاد
+ *            (يُهمّ عند فتح المحادثة من جهاز/تبويب آخر).
+ *   DELETE → حذف إداري → إزالة أثر الرسالة من العدّاد.
+ */
 function subscribeGlobalMessageWatch() {
   if (!state.me) return;
 
-  if (state.globalMsgChannel) {
-    try {
-      supabase.removeChannel(state.globalMsgChannel);
-    } catch {
-      /* تجاهل */
-    }
-  }
+  const reconcile = (conversationIds) => {
+    const ids = [...new Set((conversationIds || []).filter(Boolean))];
+    if (ids.length) scheduleUnreadReconcile(ids);
+  };
 
-  state.globalMsgChannel =
-    supabase
-      .channel(
-        "global-messages-watch"
-      )
-      .on(
-        "postgres_changes",
-        {
-          event:
-            "INSERT",
-          schema:
-            "public",
-          table:
-            "messages",
-        },
-        (payload) => {
-          const msg =
-            payload.new;
+  state.globalMsgChannel = createResilientChannel(supabase, {
+    topic: "global-messages-watch",
+    label: "global-messages",
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: { event: "INSERT", schema: "public", table: "messages" },
+        callback: (payload) => {
+          const msg = payload.new;
+          if (!msg || msg.sender_id === state.me.id) return;
 
-          if (
-            msg.sender_id ===
-            state.me.id
-          ) {
-            return;
-          }
-
-          if (
+          const viewingThisThread =
             state.activeConversation &&
-            msg.conversation_id ===
-              state.activeConversation.id &&
-            document.visibilityState === "visible"
-          ) {
+            msg.conversation_id === state.activeConversation.id &&
+            document.visibilityState === "visible";
+
+          // وصلتنا الرسالة فعلاً عبر Realtime ⇒ ✓✓ رمادي عند المرسل
+          markMessagesDelivered(msg.conversation_id);
+
+          if (viewingThisThread) {
+            // المستخدم يقرأ المحادثة الآن → لا شارة ولا إزعاج
+            resetUnreadFor(msg.conversation_id);
+            markConversationRead(msg.conversation_id);
             return;
           }
 
           // RLS تضمن أن الرسائل الواصلة هنا تخص محادثات المستخدم فقط
-          bumpUnreadBadge(
-            msg.conversation_id,
-            messagePreviewText(msg)
-          );
+          bumpUnreadBadge(msg.conversation_id, messagePreviewText(msg));
+
           if (msg.message_type !== "call") {
             playNotificationSound();
-            showLocalMessageNotification(msg);
+            void showLocalMessageNotification(msg);
           }
-        }
-      )
-      .subscribe();
+        },
+      },
+      {
+        type: "postgres_changes",
+        filter: { event: "UPDATE", schema: "public", table: "messages" },
+        callback: (payload) => {
+          const msg = payload.new;
+          if (!msg || msg.sender_id === state.me.id) return; // رسائلي أنا → لا عدّاد
+          reconcile([msg.conversation_id]);
+        },
+      },
+      {
+        type: "postgres_changes",
+        filter: { event: "DELETE", schema: "public", table: "messages" },
+        callback: (payload) => {
+          const row = payload.old;
+          if (!row) return;
+          reconcile([row.conversation_id]);
+        },
+      },
+    ],
+    onStatus: (status, error) => {
+      if (status === "SUBSCRIBED") {
+        // بعد كل (إعادة) اشتراك: صحّح العدّادات (قد تكون تغيّرت أثناء الانقطاع)
+        reconcile(Object.keys(state.contactRowsByConversation));
+        return;
+      }
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("[realtime] قناة مراقبة الرسائل العامة:", status, error || "");
+      }
+    },
+  });
+}
+
+/**
+ * تصحيح مؤجَّل للعدّادات — يجمع الأحداث المتلاحقة (كثرة تحديثات الحالة)
+ * في طلب واحد بعد 500 مللي ثانية بدل إغراق الشبكة.
+ */
+function scheduleUnreadReconcile(conversationIds) {
+  (conversationIds || []).forEach((id) => unreadReconcileQueue.add(id));
+
+  if (unreadReconcileTimer) return;
+  unreadReconcileTimer = setTimeout(() => {
+    unreadReconcileTimer = null;
+    const ids = [...unreadReconcileQueue];
+    unreadReconcileQueue.clear();
+    if (!ids.length) return;
+    safeAsync("unread:reconcile", () => refreshUnreadBadges(ids));
+  }, 500);
 }
 
 /**
@@ -4735,7 +5644,16 @@ function subscribeGlobalMessageWatch() {
 async function showLocalMessageNotification(msg) {
   try {
     if (!("Notification" in window) || Notification.permission !== "granted") return;
-    if (!("serviceWorker" in navigator)) return;
+    if (!("serviceWorker" in navigator) || !navigator.serviceWorker) return;
+
+    // لا تُزعج المستخدم وهو يقرأ نفس المحادثة أمام الشاشة
+    if (
+      state.activeConversation?.id === msg.conversation_id &&
+      document.visibilityState === "visible"
+    ) {
+      return;
+    }
+
     const sender = state.contacts.find((c) => c.id === msg.sender_id);
     const title = sender?.display_name || "رسالة جديدة";
     const body = messagePreviewText(msg) || "لديك رسالة جديدة";
@@ -4743,14 +5661,31 @@ async function showLocalMessageNotification(msg) {
       (await navigator.serviceWorker.getRegistration("./firebase-cloud-messaging-push-scope")) ||
       (await navigator.serviceWorker.getRegistration()) ||
       (await navigator.serviceWorker.ready);
+
+    // فرصة أخيرة قبل العرض: قد يكون إشعار FCM وصل في نفس اللحظة وبنفس الـ tag
+    const tag = `conversation-${msg.conversation_id}`;
+    try {
+      const existing = await reg.getNotifications({ tag });
+      if (existing?.length) return;
+    } catch {
+      /* getNotifications غير مدعومة في بعض المتصفحات */
+    }
+
     await reg.showNotification(title, {
       body,
       icon: sender?.avatar_url || "./icons/icon.png",
       badge: "./icons/icon.png",
-      tag: `conversation-${msg.conversation_id}`,
+      tag,
       renotify: true,
-      silent: true, // الصوت يُشغَّل من التطبيق نفسه
-      data: { conversationId: msg.conversation_id, type: "message" },
+      // الصوت مسؤولية التطبيق حين يكون ظاهراً، أما في الخلفية فيجب أن
+      // يُصدر النظام صوتاً وإلا بدا الإشعار صامتاً بلا معنى.
+      silent: document.visibilityState === "visible",
+      data: {
+        conversationId: msg.conversation_id,
+        messageId: msg.id,
+        senderId: msg.sender_id,
+        type: "new_message",
+      },
     });
   } catch (err) {
     console.warn("showLocalMessageNotification failed:", err);
@@ -5298,21 +6233,85 @@ function hidePWAInstallButton() {
   );
 }
 
-if (
-  "serviceWorker" in
-  navigator
-) {
-  window.addEventListener(
-    "load",
-    () => {
-      navigator.serviceWorker
-        .register(
-          "./sw.js"
-        )
-        .catch(() => {});
-    }
-  );
+/**
+ * تسجيل Service Worker الواجهة (App Shell).
+ *   • updateViaCache:"none" → المتصفح لا يستخدم نسخة مخزّنة من ملف الـ SW
+ *     نفسه، فيصل أي إصلاح فوراً بدل أن يعلق المستخدم على نسخة قديمة لأسابيع.
+ *   • عند توفّر نسخة جديدة نُفعّلها فوراً (SKIP_WAITING) حتى لا تنتظر
+ *     إغلاق كل التبويبات — وهو سبب شائع لبقاء الأعطال بعد النشر.
+ */
+function registerAppShellWorker() {
+  if (!("serviceWorker" in navigator)) return;
+
+  navigator.serviceWorker
+    .register("./sw.js", { updateViaCache: "none" })
+    .then((registration) => {
+      registration.addEventListener?.("updatefound", () => {
+        const worker = registration.installing;
+        if (!worker) return;
+        worker.addEventListener("statechange", () => {
+          if (worker.state === "installed" && navigator.serviceWorker.controller) {
+            worker.postMessage({ type: "SKIP_WAITING" });
+          }
+        });
+      });
+    })
+    .catch(() => {});
 }
+
+/** يطلب من المتصفح التحقق من وجود تحديث للـ SW (مرة كل ساعة كحد أقصى) */
+function refreshServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  const last = Number(localStorage.getItem("wa_sw_check_at") || 0);
+  if (Date.now() - last < 60 * 60 * 1000) return;
+  try {
+    localStorage.setItem("wa_sw_check_at", String(Date.now()));
+  } catch {
+    /* تجاهل */
+  }
+  navigator.serviceWorker
+    .getRegistration()
+    .then((registration) => registration?.update())
+    .catch(() => {});
+}
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", registerAppShellWorker);
+}
+
+/**
+ * مقبض تشخيصي للدعم الفني (ويُستخدم في الاختبارات الآلية).
+ * لا يكشف أي بيانات حسّاسة — فقط حالة الاتصال والعدّادات، لتشخيص مشاكل
+ * "الإشعار لا يصل" أو "العدّاد لا يتصفّر" من وحدة تحكم المتصفح مباشرة:
+ *   __waDiagnostics()
+ */
+window.__waDiagnostics = () => ({
+  online: state.isOnline,
+  visibility: document.visibilityState,
+  me: state.me ? { id: state.me.id, is_admin: Boolean(state.me.is_admin) } : null,
+  activeConversationId: state.activeConversation?.id || null,
+  subscribedConversationId: state.subscribedConversationId,
+  unread: { ...state.unreadByConversation },
+  unreadTotal: totalUnreadCount(),
+  pendingReads: [...loadPendingReads()],
+  realtime: diagnoseRealtime(supabase),
+  push: {
+    ready: isPushReady(),
+    lastTokenSyncAt: getLastTokenSyncAt(),
+    foregroundListener: Boolean(state.foregroundMessagesUnsub),
+  },
+  background: {
+    watchdogRunning: Boolean(state.realtimeWatchdog),
+    hiddenCatchUpRunning: Boolean(state.hiddenCatchUpTimer),
+  },
+  // حالة الحضور الظاهرة (المشرفون مثبَّتون على "متصل الآن" دائماً)
+  presence: {
+    onlineIds: Object.keys(state.onlineMap || {}),
+    adminPresenceForced: (state.contacts || [])
+      .filter((c) => isAdminContact(c.id, c))
+      .map((c) => c.id),
+  },
+});
 
 // إقلاع آمن: وحدات ES تُنفَّذ مؤجَّلة، وقد يكون DOMContentLoaded قد أُطلق
 // بالفعل (خصوصاً مع الـ Service Worker والتخزين المؤقت) فلا يُستدعى boot أبداً.

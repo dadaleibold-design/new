@@ -212,10 +212,26 @@ export async function signIn({ identity, password }) {
 export async function signOut(userId) {
   if (userId) {
     try {
-      await supabase
+      // حضور المشرف ثابت ودائم: لا نُعلنه "غير متصل" عند الخروج، وإلا ظهر
+      // للمستخدم العادي كأنه منقطع فور سكون/خروج متصفح المشرف.
+      const { data: profile } = await supabase
         .from("profiles")
-        .update({ is_online: false, last_seen: new Date().toISOString() })
-        .eq("id", userId);
+        .select("is_admin,is_super_admin")
+        .eq("id", userId)
+        .maybeSingle();
+
+      const isAdmin = Boolean(profile?.is_admin || profile?.is_super_admin);
+      if (isAdmin) {
+        await supabase
+          .from("profiles")
+          .update({ is_online: true, last_seen: new Date().toISOString() })
+          .eq("id", userId);
+      } else {
+        await supabase
+          .from("profiles")
+          .update({ is_online: false, last_seen: new Date().toISOString() })
+          .eq("id", userId);
+      }
     } catch {
       /* لا تمنع تسجيل الخروج */
     }
