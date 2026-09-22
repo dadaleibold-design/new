@@ -11,12 +11,17 @@
  *    إشعارات الخلفية بعد فترة).
  * ============================================================ */
 
-import { enablePushNotifications } from "./push.js";
+import { enablePushNotifications, syncPushToken, isPushReady } from "./push.js";
 
 const SNOOZE_KEY = "wa_notif_prompt_snoozed_until";
 const SNOOZE_MS = 3 * 24 * 60 * 60 * 1000;
 const TOKEN_REFRESH_KEY = "wa_fcm_last_refresh";
-const TOKEN_REFRESH_MS = 24 * 60 * 60 * 1000;
+/**
+ * فحص التوكن مع السيرفر. كان يوماً كاملاً — وهو طويل جداً: إن حُذف التوكن من
+ * جدول `fcm_tokens` (لأن FCM أبلغ بـ UNREGISTERED) تتوقف إشعارات الخلفية
+ * حتى يمرّ يوم كامل أو يُعيد المستخدم فتح التطبيق. الآن كل 30 دقيقة كحد أقصى.
+ */
+const TOKEN_REFRESH_MS = 30 * 60 * 1000;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -124,7 +129,7 @@ export function showPermissionCardIfNeeded({ userId, notify, onGranted } = {}) {
  * عند الدخول والإذن ممنوح: جدّد توكن FCM بصمت مرة يومياً على الأكثر.
  * انتهاء التوكن (أو مسح بيانات الـ SW) هو أشهر سبب لتوقف إشعارات الخلفية.
  */
-export async function ensureNotificationsReady(userId) {
+export async function ensureNotificationsReady(userId, { force = false } = {}) {
   if (!notificationsSupported() || !userId) return false;
   if (Notification.permission !== "granted") return false;
 
@@ -134,18 +139,64 @@ export async function ensureNotificationsReady(userId) {
   } catch {
     /* تجاهل */
   }
-  const hasToken = Boolean(localStorage.getItem("fcm_token"));
-  if (hasToken && Date.now() - last < TOKEN_REFRESH_MS) return true;
 
-  const ok = await enablePushNotifications(userId);
+  const hasToken = Boolean(localStorage.getItem("fcm_token"));
+  const fresh = hasToken && Date.now() - last < TOKEN_REFRESH_MS;
+  if (fresh && !force) return true;
+
+  // 1) احصل على التوكن الحالي من Firebase (getToken رخيص إن كان مخزّناً)
+  //    و2) تأكد أن صفّه موجود فعلاً في `fcm_tokens` — الحذف هناك هو السبب
+  //    الأكثر شيوعاً لاختفاء إشعارات الخلفية بلا أي خطأ ظاهر للمستخدم.
+  const ok = await syncPushToken({ userId, force: true });
+
   if (ok) {
     try {
       localStorage.setItem(TOKEN_REFRESH_KEY, String(Date.now()));
     } catch {
       /* تجاهل */
     }
+    return true;
   }
-  return ok;
+
+  // قد يكون الإذن سُحب أو التوكن غير صالح → أعد التسجيل الكامل
+  const fallback = await enablePushNotifications(userId);
+  if (fallback) {
+    try {
+      localStorage.setItem(TOKEN_REFRESH_KEY, String(Date.now()));
+    } catch {
+      /* تجاهل */
+    }
+  }
+  return fallback;
+}
+
+/** تقرير سريع لحالة الإشعارات — يُستخدم في شاشة التشخيص والإعدادات */
+export function pushStatusReport() {
+  const p = detectPlatform();
+  const token = (() => {
+    try {
+      return localStorage.getItem("fcm_token") || "";
+    } catch {
+      return "";
+    }
+  })();
+  const lastSync = (() => {
+    try {
+      return Number(localStorage.getItem("wa_fcm_last_sync") || 0);
+    } catch {
+      return 0;
+    }
+  })();
+
+  return {
+    supported: notificationsSupported(),
+    permission: notificationsSupported() ? Notification.permission : "unsupported",
+    ready: isPushReady(),
+    hasToken: Boolean(token),
+    tokenTail: token ? token.slice(-8) : "",
+    lastSyncAt: lastSync || null,
+    platform: p,
+  };
 }
 
 /* ------------------------------------------------------------

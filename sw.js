@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v9";
+const CACHE_NAME = "wa-clone-shell-v12";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -16,6 +16,8 @@ const APP_SHELL = [
   "./js/safety.js",
   "./js/notifications.js",
   "./js/ringtone.js",
+  "./js/realtime.js",
+  "./js/notification-router.js",
   "./manifest.json",
   "./icons/icon.png",
   "./icons/notify.mp3",
@@ -35,6 +37,11 @@ self.addEventListener("activate", (event) => {
     )
   );
   self.clients.claim();
+});
+
+// تطبيق نسخة جديدة فور توفّرها بدل انتظار إغلاق كل التبويبات
+self.addEventListener("message", (event) => {
+  if (event?.data?.type === "SKIP_WAITING") self.skipWaiting();
 });
 
 // Network-first for navigations and API calls, cache-first for static assets.
@@ -118,21 +125,51 @@ self.addEventListener("fetch", (event) => {
 
 // Fallback for foreground notifications shown through the app-shell worker.
 // Background FCM notifications are handled by firebase-messaging-sw.js.
+// ملاحظة: الرابط يُشتق من نطاق التسجيل (يدعم الاستضافة على مسار فرعي)،
+// ويُمرَّر معرّف الرسالة أيضاً ليتمكّن التطبيق من التمرير إليها.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const data = event.notification?.data || {};
-  const url = new URL("/index.html", self.location.origin);
+
+  const raw = event.notification?.data || {};
+  const nested = raw?.FCM_MSG;
+  const data = nested ? { ...nested.data, ...raw } : raw;
   const conversationId = data.conversationId || data.conversation_id || "";
+  const messageId = data.messageId || data.message_id || "";
+
+  const scope = (self.registration.scope || "/").replace(/firebase-cloud-messaging-push-scope\/?$/, "");
+  let url;
+  try {
+    url = new URL("index.html", scope || self.location.origin + "/");
+  } catch {
+    url = new URL("/index.html", self.location.origin);
+  }
   if (conversationId) url.searchParams.set("conversation", conversationId);
+  if (messageId) url.searchParams.set("message", messageId);
 
   event.waitUntil(
     clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
-      for (const client of clientList) {
-        if ("focus" in client) {
-          if (conversationId) client.postMessage({ type: "OPEN_CONVERSATION", conversationId });
-          return client.focus();
+      const appClients = clientList.filter((client) => {
+        try {
+          return new URL(client.url).href.startsWith(url.origin + url.pathname.replace(/index\.html$/, ""));
+        } catch {
+          return false;
         }
+      });
+
+      const target = appClients.find((client) => client.visibilityState === "visible") || appClients[0];
+
+      if (target) {
+        if (conversationId) {
+          target.postMessage({
+            type: "OPEN_CONVERSATION",
+            conversationId,
+            messageId,
+            url: url.href,
+          });
+        }
+        return target.focus();
       }
+
       return clients.openWindow ? clients.openWindow(url.href) : null;
     })
   );

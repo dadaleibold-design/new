@@ -82,8 +82,103 @@ async function getFirebaseAccessToken() {
   return firebaseAccessToken.value;
 }
 
-async function sendToFcm(token: string, data: Record<string, string>, opts: { highPriority?: boolean } = {}) {
+/**
+ * يبني إعدادات الإشعار لـ Web Push.
+ *
+ * لماذا نُرسل `notification` الآن بدل data-only فقط؟
+ *   1) iOS/iPadOS ‏(Safari 16.4+): لا يدعم "الدفع الصامت" (data-only) بشكل
+ *      موثوق — كتّاب Apple يوضّحون أن الإشعار يجب أن يحمل حمولة عرض
+ *      (`notification`) وإلّا لا يظهر المستخدم شيئاً. لذلك كان مستخدمو
+ *      آيفون لا يستلمون إشعارات الخلفية أصلاً.
+ *   2) في أندرويد/كروم يظل السلوك صحيحاً: عند وجود تبويب مرئي تُسلَّم الرسالة
+ *      للصفحة (onMessage) ولا يعرضها الـ SDK، وعند غيابه يعرضها الـ SDK.
+ *   3) التكرار ممنوع عبر الـ `tag` نفسه الذي يستخدمه التطبيق
+ *      (`conversation-<id>` / `call-<roomId>`)، ولمستمع الـ push الاحتياطي في
+ *      firebase-messaging-sw.js فحص getNotifications بالـ tag قبل العرض.
+ *
+ * ملاحظة مهمة: لا نضبط fcmOptions.link ولا click_action حتى لا يعالج الـ SDK
+ * النقرة بنفسه ويفتح نافذة مكرّرة — معالجة النقر مسؤولية
+ * notificationclick في الـ Service Worker.
+ */
+function buildWebPushNotification(
+  data: Record<string, string>,
+  opts: { highPriority?: boolean } = {},
+) {
+  const tag = data.type === "incoming_call"
+    ? `call-${data.roomId || data.conversationId || "incoming"}`
+    : data.type === "call_ended"
+      ? `missed-${data.roomId || Date.now()}`
+      : data.conversationId
+        ? `conversation-${data.conversationId}`
+        : "whatsapp-message";
+
+  const isCall = data.type === "incoming_call";
+
+  return {
+    title: data.title || "رسالة جديدة",
+    body: data.body || "لديك رسالة جديدة",
+    icon: data.icon || undefined,
+    tag,
+    renotify: true,
+    requireInteraction: isCall,
+    silent: false,
+    vibrate: isCall ? [500, 250, 500, 250, 500] : [100, 50, 100],
+    actions: isCall
+      ? [
+          { action: "answer", title: "📞 رد" },
+          { action: "decline", title: "رفض" },
+        ]
+      : [],
+    // نُكرّر حقول التوجيه داخل بيانات الإشعار ليقرأها معالج النقر
+    // مهما كان شكل الحمولة التي يبنيها الـ SDK (FCM_MSG أو مباشرة).
+    data: {
+      type: data.type || "message",
+      conversationId: data.conversationId || "",
+      messageId: data.messageId || "",
+      roomId: data.roomId || "",
+      senderId: data.senderId || data.callerId || "",
+    },
+  };
+}
+
+async function sendToFcm(
+  token: string,
+  data: Record<string, string>,
+  opts: { highPriority?: boolean; withNotification?: boolean } = {},
+) {
   const accessToken = await getFirebaseAccessToken();
+
+  // أولوية عالية للكل: رسائل الدردشة رسائل مرئية للمستخدم يجب أن تصل فوراً،
+  // والأولوية العادية (Urgency: normal) يجوز لمزوّد الدفع تأخيرها على جهاز
+  // في وضع توفير الطاقة/Doze — وهو أحد أسباب "توقّف الإشعارات بعد فترة في
+  // الخلفية". يمكن إرجاع السلوك القديم بمتغيّر البيئة PUSH_NORMAL_URGENCY=1.
+  const urgent = Deno.env.get("PUSH_NORMAL_URGENCY") !== "1";
+
+  const body: Record<string, unknown> = {
+    token,
+    data,
+    android: {
+      priority: urgent ? "high" : "normal",
+      ttl: opts.highPriority ? "60s" : "86400s",
+    },
+    webpush: {
+      headers: {
+        Urgency: urgent ? "high" : "normal",
+        TTL: opts.highPriority ? "60" : "86400",
+      },
+    },
+    apns: {
+      headers: {
+        "apns-priority": urgent ? "10" : "5",
+        "apns-push-type": "alert",
+      },
+    },
+  };
+
+  if (opts.withNotification !== false) {
+    (body.webpush as Record<string, unknown>).notification = buildWebPushNotification(data, opts);
+  }
+
   const response = await fetch(
     `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_PROJECT_ID!)}/messages:send`,
     {
@@ -92,23 +187,7 @@ async function sendToFcm(token: string, data: Record<string, string>, opts: { hi
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        message: {
-          token,
-          // Data-only يمنع Firebase من إنشاء إشعار تلقائي بالتوازي مع
-          // firebase-messaging-sw.js، وبالتالي لا تظهر إشعارات مزدوجة.
-          data,
-          // أولوية عالية + TTL قصير للمكالمات: توقظ الجهاز من Doze وتصل فوراً
-          android: { priority: "high", ttl: opts.highPriority ? "60s" : "86400s" },
-          webpush: {
-            headers: {
-              Urgency: opts.highPriority ? "high" : "normal",
-              TTL: opts.highPriority ? "60" : "86400",
-            },
-          },
-          apns: { headers: { "apns-priority": "10", "apns-push-type": "alert" } },
-        },
-      }),
+      body: JSON.stringify({ message: body }),
     },
   );
 
@@ -224,7 +303,11 @@ Deno.serve(async (req) => {
           };
 
       const results = await Promise.all(tokens.map(async (row) => {
-        const result = await sendToFcm(row.token, data, { highPriority: true });
+        const result = await sendToFcm(row.token, data, {
+          highPriority: true,
+          // مكالمة منتهية/فائتة: لا حاجة لإشعار تفاعلي يبقى على الشاشة
+          withNotification: input.type === "incoming_call",
+        });
         const errorText = JSON.stringify(result.details || {});
         const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
         if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
@@ -264,6 +347,10 @@ Deno.serve(async (req) => {
       senderId,
       title,
       body,
+      // طابع زمني + معرّفات إضافية: تسمح للتطبيق بتجاهل إشعار قديم
+      // (وصل بعد أن قرأ المستخدم الرسالة) وبربط الإشعار بالمحادثة بدقة.
+      timestamp: String(Date.now()),
+      messageType: String(input.message_type || input.attachment_type || "text"),
     };
 
     const results = await Promise.all(tokens.map(async (row) => {
@@ -276,7 +363,27 @@ Deno.serve(async (req) => {
       return { tokenId: row.id, ok: result.ok, status: result.status, removed: invalid };
     }));
 
-    return json({ sent: results.filter((item) => item.ok).length, total: results.length, results });
+    // ✓✓ رمادي (تم التسليم): نجاح إرسال الإشعار من السيرفر يعني أن الرسالة
+    // وصلت إلى جهاز المستلم عبر جهة الدفع — حتى لو كان التطبيق مغلقاً تماماً
+    // (وهذا هو المسار الوحيد المعروف في هذه الحالة، إذ لا يستطيع Service Worker
+    //  الكتابة في قاعدة البيانات بلا جلسة مصادقة). يبقى التحديث محصوراً في
+    // الحالة 'sent' فلا يُنقص أبداً حالة 'read' أو 'delivered' أحدث.
+    const delivered = results.some((item) => item.ok);
+    if (delivered) {
+      const { error: deliveredError } = await supabase
+        .from("messages")
+        .update({ status: "delivered" })
+        .eq("id", messageId)
+        .eq("status", "sent");
+      if (deliveredError) console.warn("mark delivered failed:", deliveredError.message);
+    }
+
+    return json({
+      sent: results.filter((item) => item.ok).length,
+      total: results.length,
+      delivered,
+      results,
+    });
   } catch (error) {
     console.error("send-push failed", error);
     return json({ error: error instanceof Error ? error.message : String(error) }, 500);
