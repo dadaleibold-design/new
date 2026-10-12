@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v12";
+const CACHE_NAME = "wa-clone-shell-v14";
 const APP_SHELL = [
   "./",
   "./index.html",

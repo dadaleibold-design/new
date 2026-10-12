@@ -8,6 +8,8 @@
 // Optional:
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
+//   APP_PUBLIC_URL        (e.g. https://app.example.com — يُضاف كرابط احتياطي للنقرة)
+//   PUSH_NORMAL_URGENCY   ("1" لإعادة الأولوية العادية)
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
@@ -18,6 +20,7 @@ const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID");
 const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL");
 const FIREBASE_PRIVATE_KEY = Deno.env.get("FIREBASE_PRIVATE_KEY")?.replace(/\\n/g, "\n");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
+const APP_PUBLIC_URL = (Deno.env.get("APP_PUBLIC_URL") || "").replace(/\/+$/, "");
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
@@ -83,42 +86,54 @@ async function getFirebaseAccessToken() {
 }
 
 /**
+ * tag الإشعار يحدد أي إشعارات تستبدل بعضها على الجهاز:
+ *   • رسالة: tag لكل محادثة (تتجمّع).
+ *   • مكالمة واردة: tag لكل غرفة (يُغلق عند انتهائها في الـ Service Worker).
+ *   • مكالمة فائتة: tag منفصل (لا تستبدل إشعار الرسائل — كان هذا تداخلاً).
+ *   • اختبار/مسبار: tag فريد (لا يستبدل رسالة حقيقية ولا يُكتم بها).
+ */
+function buildTag(data: Record<string, string>): string {
+  if (data.type === "incoming_call") return `call-${data.roomId || data.conversationId || "incoming"}`;
+  if (data.type === "call_ended") return `missed-${data.roomId || crypto.randomUUID()}`;
+  if (data.type === "test" || data.type === "probe") return `test-${crypto.randomUUID()}`;
+  if (data.conversationId) return `conversation-${data.conversationId}`;
+  if (data.messageId) return `message-${data.messageId}`;
+  return `whatsapp-message-${crypto.randomUUID()}`;
+}
+
+/** رابط النقرة الاحتياطي (يُستخدم فقط إن ضُبط APP_PUBLIC_URL) */
+function buildAppLink(data: Record<string, string>): string | undefined {
+  if (!APP_PUBLIC_URL) return undefined;
+  const url = new URL(`${APP_PUBLIC_URL}/index.html`);
+  if (data.conversationId) url.searchParams.set("conversation", data.conversationId);
+  if (data.messageId) url.searchParams.set("message", data.messageId);
+  if (data.type === "incoming_call" && data.roomId) url.searchParams.set("answer_call", data.roomId);
+  return url.href;
+}
+
+/**
  * يبني إعدادات الإشعار لـ Web Push.
  *
- * لماذا نُرسل `notification` الآن بدل data-only فقط؟
- *   1) iOS/iPadOS ‏(Safari 16.4+): لا يدعم "الدفع الصامت" (data-only) بشكل
- *      موثوق — كتّاب Apple يوضّحون أن الإشعار يجب أن يحمل حمولة عرض
- *      (`notification`) وإلّا لا يظهر المستخدم شيئاً. لذلك كان مستخدمو
- *      آيفون لا يستلمون إشعارات الخلفية أصلاً.
- *   2) في أندرويد/كروم يظل السلوك صحيحاً: عند وجود تبويب مرئي تُسلَّم الرسالة
- *      للصفحة (onMessage) ولا يعرضها الـ SDK، وعند غيابه يعرضها الـ SDK.
- *   3) التكرار ممنوع عبر الـ `tag` نفسه الذي يستخدمه التطبيق
- *      (`conversation-<id>` / `call-<roomId>`)، ولمستمع الـ push الاحتياطي في
- *      firebase-messaging-sw.js فحص getNotifications بالـ tag قبل العرض.
+ * لماذا نُرسل `webpush.notification` (وليس data-only)؟
+ *   1) iOS/iPadOS (Safari 16.4+) لا يدعم الدفع الصامت بموثوقية — يجب أن تحمل
+ *      الدفعة حمولة عرض، وإلا لا يرى المستخدم شيئاً.
+ *   2) Chrome/Android: الدفعة التي لا تُظهر إشعاراً في الخلفية تُعامَل كانتهاك
+ *      لـ userVisibleOnly فيُستبدل الإشعار بنص عام، لذا الإشعار هنا ضروري.
+ *   3) منع الازدواج: الـ SDK يعرض هذا الإشعار تلقائياً، وmessaging.onBackgroundMessage
+ *      والمسار الاحتياطي في firebase-messaging-sw.js يتحققان بالهوية
+ *      (messageId/roomId) قبل أي عرض إضافي.
  *
- * ملاحظة مهمة: لا نضبط fcmOptions.link ولا click_action حتى لا يعالج الـ SDK
- * النقرة بنفسه ويفتح نافذة مكرّرة — معالجة النقر مسؤولية
- * notificationclick في الـ Service Worker.
+ * الحقول المكرّرة في `data` تقرأها نقرة الإشعار في الـ Service Worker، لأن
+ * الـ SDK يلفّ الحمولة داخل notification.data.FCM_MSG.
  */
-function buildWebPushNotification(
-  data: Record<string, string>,
-  opts: { highPriority?: boolean } = {},
-) {
-  const tag = data.type === "incoming_call"
-    ? `call-${data.roomId || data.conversationId || "incoming"}`
-    : data.type === "call_ended"
-      ? `missed-${data.roomId || Date.now()}`
-      : data.conversationId
-        ? `conversation-${data.conversationId}`
-        : "whatsapp-message";
-
+function buildWebPushNotification(data: Record<string, string>) {
   const isCall = data.type === "incoming_call";
 
   return {
     title: data.title || "رسالة جديدة",
     body: data.body || "لديك رسالة جديدة",
     icon: data.icon || undefined,
-    tag,
+    tag: buildTag(data),
     renotify: true,
     requireInteraction: isCall,
     silent: false,
@@ -129,8 +144,6 @@ function buildWebPushNotification(
           { action: "decline", title: "رفض" },
         ]
       : [],
-    // نُكرّر حقول التوجيه داخل بيانات الإشعار ليقرأها معالج النقر
-    // مهما كان شكل الحمولة التي يبنيها الـ SDK (FCM_MSG أو مباشرة).
     data: {
       type: data.type || "message",
       conversationId: data.conversationId || "",
@@ -176,7 +189,9 @@ async function sendToFcm(
   };
 
   if (opts.withNotification !== false) {
-    (body.webpush as Record<string, unknown>).notification = buildWebPushNotification(data, opts);
+    (body.webpush as Record<string, unknown>).notification = buildWebPushNotification(data);
+    const link = buildAppLink(data);
+    if (link) (body.webpush as Record<string, unknown>).fcm_options = { link };
   }
 
   const response = await fetch(
@@ -194,6 +209,96 @@ async function sendToFcm(
   let details: any = null;
   try { details = await response.json(); } catch { /* empty response */ }
   return { ok: response.ok, status: response.status, details };
+}
+
+/* ------------------------------------------------------------------
+ * تعدّد الأجهزة: كل جهاز مسجّل يملك صفاً في fcm_tokens (توكن FCM خاص به).
+ * أي إشعار لمستخدم يُرسَل إلى كل توكنات حسابه — لا إلى أول توكن فقط.
+ * ------------------------------------------------------------------ */
+
+type DeviceRow = { id: string; token: string; platform?: string | null };
+type SendResult = { ok: boolean; status: number; details: any };
+
+const FCM_CONCURRENCY = 10;
+const FCM_MAX_ATTEMPTS = 3;
+const FCM_RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/** كل توكنات الحساب (صف لكل جهاز) بلا تكرار */
+async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
+  const { data, error } = await supabase
+    .from("fcm_tokens")
+    .select("id, token, platform")
+    .eq("user_id", userId);
+  if (error) throw error;
+
+  const seen = new Set<string>();
+  const rows: DeviceRow[] = [];
+  for (const row of (data || []) as DeviceRow[]) {
+    if (!row.token || seen.has(row.token)) continue;
+    seen.add(row.token);
+    rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * هل التوكن ميّت فعلاً (ألغى الجهاز التسجيل أو التوكن غير صالح بنيوياً)؟
+ * لا نحذف عند INVALID_ARGUMENT عام: خطأ في الحمولة يُسقط توكنات الأجهزة كلها بالخطأ.
+ */
+function isDeadToken(status: number, details: any): boolean {
+  if (status === 404) return true;
+  const text = JSON.stringify(details || {});
+  if (/UNREGISTERED|registration-token-not-registered|Requested entity was not found/i.test(text)) {
+    return true;
+  }
+  return /not a valid FCM registration token/i.test(text);
+}
+
+/** إعادة محاولة للأخطاء العابرة (حد المعدّل 429 وأخطاء الخادم 5xx والشبكة) */
+async function sendWithRetry(token: string, data: Record<string, string>, opts: any): Promise<SendResult> {
+  let last: SendResult = { ok: false, status: 0, details: null };
+  for (let attempt = 1; attempt <= FCM_MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = await sendToFcm(token, data, opts);
+      if (result.ok || !FCM_RETRY_STATUSES.has(result.status)) return result;
+      last = result;
+    } catch (error) {
+      last = { ok: false, status: 0, details: { error: String(error) } };
+    }
+    if (attempt < FCM_MAX_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+    }
+  }
+  return last;
+}
+
+/** يرسل إلى كل الأجهزة بتوازٍ محدود، ويحذف التوكنات الميّتة فقط */
+async function sendToAllDevices(rows: DeviceRow[], data: Record<string, string>, opts: any = {}) {
+  const results: Array<{ tokenId: string; ok: boolean; status: number; removed: boolean; error?: string }> = [];
+
+  for (let i = 0; i < rows.length; i += FCM_CONCURRENCY) {
+    const chunk = rows.slice(i, i + FCM_CONCURRENCY);
+    const settled = await Promise.all(
+      chunk.map(async (row) => {
+        const result = await sendWithRetry(row.token, data, opts);
+        const removed = !result.ok && isDeadToken(result.status, result.details);
+        if (removed) {
+          const { error } = await supabase.from("fcm_tokens").delete().eq("id", row.id);
+          if (error) console.warn("token prune failed:", error.message);
+        }
+        return {
+          tokenId: row.id,
+          ok: result.ok,
+          status: result.status,
+          removed,
+          error: result.ok ? undefined : JSON.stringify(result.details || {}).slice(0, 300),
+        };
+      }),
+    );
+    results.push(...settled);
+  }
+
+  return results;
 }
 
 async function getUserFromRequest(req: Request) {
@@ -223,22 +328,14 @@ Deno.serve(async (req) => {
     if (input.type === "test") {
       const user = await getUserFromRequest(req);
       if (!user) return json({ error: "Unauthorized" }, 401);
-      const { data: tokens, error: tokenError } = await supabase
-        .from("fcm_tokens").select("id, token").eq("user_id", user.id);
-      if (tokenError) throw tokenError;
-      if (!tokens?.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب — فعّل الإشعارات أولاً." }, 404);
-      const results = await Promise.all(tokens.map(async (row) => {
-        const result = await sendToFcm(row.token, {
-          type: "test",
-          title: "✅ الإشعارات تعمل",
-          body: "هذا إشعار تجريبي — إن وصلك والتطبيق مغلق فكل شيء سليم.",
-          conversationId: "",
-        }, { highPriority: true });
-        const errorText = JSON.stringify(result.details || {});
-        const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
-        if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
-        return { ok: result.ok, status: result.status, removed: invalid, error: result.ok ? undefined : errorText.slice(0, 300) };
-      }));
+      const tokens = await loadDeviceTokens(user.id);
+      if (!tokens.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب — فعّل الإشعارات أولاً." }, 404);
+      const results = await sendToAllDevices(tokens, {
+        type: "test",
+        title: "✅ الإشعارات تعمل",
+        body: "هذا إشعار تجريبي — إن وصلك والتطبيق مغلق فكل شيء سليم.",
+        conversationId: "",
+      }, { highPriority: true });
       const sent = results.filter((r) => r.ok).length;
       const firstError = results.find((r) => !r.ok)?.error;
       return json({ sent, total: results.length, results, error: sent ? undefined : `FCM رفض كل التوكنات: ${firstError || "unknown"}` }, 200);
@@ -250,20 +347,14 @@ Deno.serve(async (req) => {
     if (input.type === "probe") {
       const userId = String(input.user_id || "");
       if (!userId) return json({ error: "user_id required" }, 400);
-      const { data: tokens } = await supabase.from("fcm_tokens").select("id, token").eq("user_id", userId);
-      if (!tokens?.length) return json({ sent: 0, skipped: "no fcm token" });
-      const results = await Promise.all(tokens.map(async (row) => {
-        const r = await sendToFcm(row.token, {
-          type: "test", title: "✅ مسار الخلفية يعمل",
-          body: "وصل هذا الإشعار عبر قاعدة البيانات → send-push → FCM (نفس مسار الرسائل الحقيقية).",
-          conversationId: "",
-        }, { highPriority: true });
-        const errorText = JSON.stringify(r.details || {});
-        const invalid = r.status === 404 || r.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
-        if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
-        return { ok: r.ok, status: r.status, removed: invalid };
-      }));
-      return json({ sent: results.filter((x) => x.ok).length, total: results.length });
+      const tokens = await loadDeviceTokens(userId);
+      if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
+      const results = await sendToAllDevices(tokens, {
+        type: "test", title: "✅ مسار الخلفية يعمل",
+        body: "وصل هذا الإشعار عبر قاعدة البيانات → send-push → FCM (نفس مسار الرسائل الحقيقية).",
+        conversationId: "",
+      }, { highPriority: true });
+      return json({ sent: results.filter((x) => x.ok).length, total: results.length, results });
     }
 
     // --- إشعار مكالمة واردة / انتهاء مكالمة (يُستدعى من trigger على call_rooms) ---
@@ -273,12 +364,11 @@ Deno.serve(async (req) => {
       const callerId = String(input.caller_id || "");
       if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id are required" }, 400);
 
-      const [{ data: caller }, { data: tokens, error: tokenError }] = await Promise.all([
+      const [{ data: caller }, tokens] = await Promise.all([
         supabase.from("profiles").select("display_name, avatar_url").eq("id", callerId).maybeSingle(),
-        supabase.from("fcm_tokens").select("id, token").eq("user_id", calleeId),
+        loadDeviceTokens(calleeId),
       ]);
-      if (tokenError) throw tokenError;
-      if (!tokens?.length) return json({ sent: 0, skipped: "no fcm token" });
+      if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
       const isVideo = input.call_type === "video";
       const data: Record<string, string> = input.type === "incoming_call"
@@ -302,17 +392,11 @@ Deno.serve(async (req) => {
             icon: caller?.avatar_url || "",
           };
 
-      const results = await Promise.all(tokens.map(async (row) => {
-        const result = await sendToFcm(row.token, data, {
-          highPriority: true,
-          // مكالمة منتهية/فائتة: لا حاجة لإشعار تفاعلي يبقى على الشاشة
-          withNotification: input.type === "incoming_call",
-        });
-        const errorText = JSON.stringify(result.details || {});
-        const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
-        if (invalid) await supabase.from("fcm_tokens").delete().eq("id", row.id);
-        return { tokenId: row.id, ok: result.ok, status: result.status, removed: invalid };
-      }));
+      const results = await sendToAllDevices(tokens, data, {
+        highPriority: true,
+        // مكالمة منتهية/فائتة: لا حاجة لإشعار تفاعلي يبقى على الشاشة
+        withNotification: input.type === "incoming_call",
+      });
       return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
     }
 
@@ -331,12 +415,11 @@ Deno.serve(async (req) => {
     if (conversationError || !conversation) return json({ error: "Conversation not found" }, 404);
 
     const recipientId = conversation.user_id === senderId ? conversation.admin_id : conversation.user_id;
-    const [{ data: sender }, { data: tokens, error: tokenError }] = await Promise.all([
+    const [{ data: sender }, tokens] = await Promise.all([
       supabase.from("profiles").select("display_name").eq("id", senderId).maybeSingle(),
-      supabase.from("fcm_tokens").select("id, token").eq("user_id", recipientId),
+      loadDeviceTokens(recipientId),
     ]);
-    if (tokenError) throw tokenError;
-    if (!tokens?.length) return json({ sent: 0, skipped: "no fcm token" });
+    if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
     const title = sender?.display_name || "رسالة جديدة";
     const body = String(input.content || "📎 مرفق");
@@ -353,21 +436,12 @@ Deno.serve(async (req) => {
       messageType: String(input.message_type || input.attachment_type || "text"),
     };
 
-    const results = await Promise.all(tokens.map(async (row) => {
-      const result = await sendToFcm(row.token, data);
-      const errorText = JSON.stringify(result.details || {});
-      const invalid = result.status === 404 || result.status === 410 || /UNREGISTERED|registration-token-not-registered|INVALID_ARGUMENT/i.test(errorText);
-      if (invalid) {
-        await supabase.from("fcm_tokens").delete().eq("id", row.id);
-      }
-      return { tokenId: row.id, ok: result.ok, status: result.status, removed: invalid };
-    }));
+    // كل أجهزة المستلم (تسجيل دخول على أكثر من هاتف = أكثر من توكن)
+    const results = await sendToAllDevices(tokens, data);
 
-    // ✓✓ رمادي (تم التسليم): نجاح إرسال الإشعار من السيرفر يعني أن الرسالة
-    // وصلت إلى جهاز المستلم عبر جهة الدفع — حتى لو كان التطبيق مغلقاً تماماً
-    // (وهذا هو المسار الوحيد المعروف في هذه الحالة، إذ لا يستطيع Service Worker
-    //  الكتابة في قاعدة البيانات بلا جلسة مصادقة). يبقى التحديث محصوراً في
-    // الحالة 'sent' فلا يُنقص أبداً حالة 'read' أو 'delivered' أحدث.
+    // ✓✓ رمادي (تم التسليم): نجاح إرسال الإشعار إلى جهاز واحد على الأقل
+    // يعني أن الرسالة وصلت إلى جهاز المستلم عبر جهة الدفع.
+    // يبقى التحديث محصوراً في الحالة 'sent' فلا يُنقص أبداً حالة أحدث.
     const delivered = results.some((item) => item.ok);
     if (delivered) {
       const { error: deliveredError } = await supabase
@@ -381,6 +455,7 @@ Deno.serve(async (req) => {
     return json({
       sent: results.filter((item) => item.ok).length,
       total: results.length,
+      removed: results.filter((item) => item.removed).length,
       delivered,
       results,
     });

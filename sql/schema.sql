@@ -320,139 +320,19 @@ create policy "wallpapers public read" on storage.objects
   for select using (bucket_id = 'wallpapers');
 
 -- ------------------------------------------------------------
--- 7. رسالة ترحيبية تلقائية + بوت الردود بالكلمات المفتاحية (أزرار تفاعلية)
+-- 7. الأزرار التفاعلية (بلا رسائل تلقائية — تم إلغاء الترحيب والبوت)
 -- ------------------------------------------------------------
 
 -- عمود لتخزين الأزرار التفاعلية المرفقة برسالة (مصفوفة JSON: [{label, value}, ...])
 alter table public.messages add column if not exists buttons jsonb;
 
--- 7.1 الرسالة الترحيبية تُرسل عند **أول رسالة فعلية من العميل** — لا بمجرد
---     فتحه لصفحة المشرف أو إنشاء صفّ المحادثة. النص يتضمّن الترحيب والتنبيه
---     الإداري المطلوب، والأزرار التفاعلية الأصلية دون أي تغيير.
-create or replace function public.send_welcome_message()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_welcome_text text := 'مرحباً بك! 👋 نحن سعداء بتواصلك معنا.' || chr(10) ||
-    '⚠️ تنبيه مهم: التواصل مع العديد من المكاتب قد يعرّضك للحظر، ونرجو الالتزام بالتعليمات وعدم الفوضى مع فريق العمل.' || chr(10) ||
-    'كيف يمكننا مساعدتك اليوم؟';
-  -- ⚠️ الأزرار التفاعلية الأصلية — بلا أي تغيير
-  v_buttons jsonb := '[
-    {"label":"الاستفسار عن الخدمات","value":"الاستفسار عن الخدمات"},
-    {"label":"الشكاوى والمقترحات","value":"الشكاوى والمقترحات"}
-  ]'::jsonb;
-  v_conv record;
-  v_previous integer := 0;
-begin
-  select user_id, admin_id into v_conv
-  from public.conversations where id = new.conversation_id;
-
-  -- FOUND أدقّ من اختبار السجل عند عدم وجود المحادثة (وتفادياً لأي اختلاف بين الإصدارات)
-  if not found then
-    return new;
-  end if;
-
-  -- رسائل العميل فقط (الطرف user_id)
-  if new.sender_id is distinct from v_conv.user_id then
-    return new;
-  end if;
-
-  if coalesce(new.message_type, 'text') = 'call' then
-    return new;
-  end if;
-
-  if new.content is null or btrim(new.content) = '' then
-    return new;
-  end if;
-
-  -- هل سبق أن أرسل العميل رسالة فعلية؟ (نتجاهل الحالية ورسائل المكالمات)
-  select count(*) into v_previous
-  from public.messages m
-  where m.conversation_id = new.conversation_id
-    and m.sender_id = v_conv.user_id
-    and m.id <> new.id
-    and coalesce(m.message_type, 'text') <> 'call';
-
-  if v_previous > 0 then
-    return new;
-  end if;
-
-  -- حارس ضد التكرار
-  if exists (
-    select 1 from public.messages m
-    where m.conversation_id = new.conversation_id
-      and m.sender_id = v_conv.admin_id
-      and m.buttons is not null
-  ) then
-    return new;
-  end if;
-
-  insert into public.messages (conversation_id, sender_id, content, buttons, status)
-  values (new.conversation_id, v_conv.admin_id, v_welcome_text, v_buttons, 'sent');
-
-  update public.conversations
-     set last_message = v_welcome_text, last_message_at = now()
-   where id = new.conversation_id;
-
-  return new;
-end;
-$$;
-
--- لا مُشغِّل على conversations: الترحيب مرتبط بأول رسالة من العميل
-drop trigger if exists on_conversation_created on public.conversations;
-
--- الاسم يُشغَّل أبجدياً قبل on_message_keyword_autoreply فيصل الترحيب أولاً
+-- لا توجد أي رسائل تلقائية (ترحيب / بوت كلمات مفتاحية): الرسائل تُنشأ فقط عند إرسال المستخدم.
+-- عمود الأزرار يبقى للتوافق مع الرسائل القديمة فقط.
 drop trigger if exists on_message_first_welcome on public.messages;
-create trigger on_message_first_welcome
-  after insert on public.messages
-  for each row execute procedure public.send_welcome_message();
-
--- 7.2 عند وصول رسالة من العميل (سواء بالنقر على أحد الزرين أو كتابة الكلمة يدوياً)
---     يتحقق البوت من تطابق الكلمة المفتاحية ويُرسل رداً تلقائياً فورياً من طرف المشرف
-create or replace function public.handle_keyword_autoreply()
-returns trigger language plpgsql security definer as $$
-declare
-  v_conv record;
-  v_reply text;
-begin
-  if new.content is null then
-    return new;
-  end if;
-
-  select user_id, admin_id into v_conv
-  from public.conversations where id = new.conversation_id;
-
-  -- طبّق البوت فقط على رسائل العميل (وليس المشرف) لمنع أي حلقة تكرارية لا نهائية
-  if new.sender_id is distinct from v_conv.user_id then
-    return new;
-  end if;
-
-  if new.content ilike '%الاستفسار عن الخدمات%' then
-    v_reply := 'شكراً لتواصلك معنا 🌟 يسعدنا تقديم المعلومات الكاملة عن خدماتنا. سيقوم أحد ممثلينا بالتواصل معك خلال دقائق لمساعدتك بكل التفاصيل.';
-  elsif new.content ilike '%الشكاوى%' or new.content ilike '%المقترحات%' then
-    v_reply := 'نأسف لأي إزعاج ونقدّر ملاحظاتك 🙏 يرجى كتابة تفاصيل الشكوى أو الاقتراح وسنعمل على معالجته بأسرع وقت ممكن.';
-  else
-    return new; -- لا توجد كلمة مفتاحية مطابقة، يُترك الرد للمشرف نفسه
-  end if;
-
-  insert into public.messages (conversation_id, sender_id, content, status)
-  values (new.conversation_id, v_conv.admin_id, v_reply, 'sent');
-
-  update public.conversations
-  set last_message = v_reply, last_message_at = now()
-  where id = new.conversation_id;
-
-  return new;
-end;
-$$;
-
 drop trigger if exists on_message_keyword_autoreply on public.messages;
-create trigger on_message_keyword_autoreply
-  after insert on public.messages
-  for each row execute procedure public.handle_keyword_autoreply();
+drop trigger if exists on_conversation_created on public.conversations;
+drop function if exists public.send_welcome_message();
+drop function if exists public.handle_keyword_autoreply();
 
 -- ------------------------------------------------------------
 -- WEB PUSH TRIGGER (اختياري)

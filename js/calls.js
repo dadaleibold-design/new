@@ -609,6 +609,12 @@ export function subscribeToIncomingCalls() {
     .subscribe();
 }
 
+/** هل قناة الإشارات الواردة حيّة (منضمّة/قيد الانضمام)؟ — لتجنّب إعادة بنائها بلا سبب */
+export function isIncomingCallChannelAlive() {
+  const state = callState.signalChannel?.state;
+  return state === "joined" || state === "joining";
+}
+
 export function unsubscribeFromIncomingCalls() {
   const supabase = callState.ctx?.supabase;
   if (supabase && callState.signalChannel) {
@@ -687,6 +693,12 @@ async function logCallEvent(roomId, event, meta = {}) {
 }
 
 /**
+ * بطاقات المكالمات داخل المحادثة = رسائل تلقائية تُنشأ دون إرسال يدوي من المستخدم.
+ * أُلغيت بطلب المنتج؛ لإعادتها غيّر القيمة إلى true فقط.
+ */
+const CALL_CHAT_CARDS_ENABLED = false;
+
+/**
  * يكتب بطاقة سجل المكالمة داخل المحادثة (تظهر للطرفين كرسالة نظامية).
  * status: 'ended' (تم الرد — مع المدة) | 'missed' | 'declined' | 'failed' | 'network_lost'
  */
@@ -694,6 +706,17 @@ async function writeCallMessage(call, status, durationSeconds = 0) {
   const supabase = callState.ctx?.supabase;
   const me = callState.ctx?.getMe?.();
   if (!supabase || !call?.conversationId || !me?.id) return;
+
+  // لا تُنشأ أي رسالة تلقائية في المحادثة: بطاقات المكالمات معطّلة.
+  // سجل المكالمات (call_logs) يبقى كما هو، ويُستدعى onCallLogged كالمعتاد.
+  if (!CALL_CHAT_CARDS_ENABLED) {
+    try {
+      callState.onCallLogged?.({ call, status, durationSeconds });
+    } catch {
+      /* تجاهل */
+    }
+    return;
+  }
   // كلا الطرفين قد يرسل حدث الإنهاء؛ لا تعرض بطاقة المكالمة مرتين.
   const { data: existing } = await supabase
     .from("messages")

@@ -16,7 +16,7 @@ import { register } from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const SCENARIOS = ["ticks", "presence", "welcome-sql"];
+const SCENARIOS = ["ticks", "presence", "automated-off"];
 const requested = process.argv[2] || "all";
 
 if (requested === "all") {
@@ -46,6 +46,12 @@ const MIGRATION = fs.readFileSync(
   "utf8"
 );
 const SEND_PUSH = fs.readFileSync(path.join(ROOT, "supabase/functions/send-push/index.ts"), "utf8");
+const MIGRATION_V26 = fs.readFileSync(
+  path.join(ROOT, "sql/migrations/2026-10-13_v2_6_multidevice_no_automated_messages.sql"),
+  "utf8"
+);
+const CALLS_JS = fs.readFileSync(path.join(ROOT, "js/calls.js"), "utf8");
+const PUSH_JS = fs.readFileSync(path.join(ROOT, "js/push.js"), "utf8");
 
 let fails = 0;
 const check = (name, ok, extra = "") => {
@@ -321,63 +327,82 @@ if (requested === "presence") {
 }
 
 /* ------------------------------------------------------------------
- * 3) منطق الرسالة الترحيبية (SQL + الدالة)
+ * 3) لا رسائل تلقائية (ترحيب / بوت / بطاقات مكالمات) + تعدد الأجهزة
  * ---------------------------------------------------------------- */
-if (requested === "welcome-sql") {
-  const parts = [SCHEMA, MIGRATION];
-
-  parts.forEach((sql, index) => {
-    const label = index === 0 ? "schema.sql" : "migration v2.4";
-
-    check(
-      `${label}: لم يعد هناك مُشغِّل ترحيب على إنشاء المحادثة`,
-      sql.includes("drop trigger if exists on_conversation_created on public.conversations;")
-    );
-    check(
-      `${label}: الترحيب مُشغَّل على إدراج رسالة العميل الأولى`,
-      sql.includes("on_message_first_welcome") && sql.includes("after insert on public.messages")
-    );
-    check(
-      `${label}: النص الترحيبي يحتوي التنبيه المطلوب`,
-      sql.includes("التواصل مع العديد من المكاتب قد يعرّضك للحظر") &&
-        sql.includes("الالتزام بالتعليمات وعدم الفوضى مع فريق العمل")
-    );
-    check(
-      `${label}: الأزرار التفاعلية الأصلية دون تغيير`,
-      sql.includes('{"label":"الاستفسار عن الخدمات","value":"الاستفسار عن الخدمات"}') &&
-        sql.includes('{"label":"الشكاوى والمقترحات","value":"الشكاوى والمقترحات"}')
-    );
-    check(
-      `${label}: يُرسل مرة واحدة فقط (فحص v_previous + حارس الأزرار)`,
-      sql.includes("v_previous > 0") && sql.includes("m.buttons is not null")
-    );
-    check(
-      `${label}: رسائل المكالمات لا تُحتسب كتفاعل أول`,
-      sql.includes("coalesce(m.message_type, 'text') <> 'call'")
-    );
-  });
-
+if (requested === "automated-off") {
   check(
-    "migration v2.4: دالة mark_messages_delivered + mark_all_messages_delivered",
-    MIGRATION.includes("function public.mark_messages_delivered") &&
-      MIGRATION.includes("function public.mark_all_messages_delivered")
+    "schema.sql: لا يُنشئ مُشغِّل ترحيب أو بوت كلمات مفتاحية",
+    !SCHEMA.includes("create or replace function public.send_welcome_message") &&
+      !SCHEMA.includes("create trigger on_message_first_welcome") &&
+      !SCHEMA.includes("create or replace function public.handle_keyword_autoreply") &&
+      !SCHEMA.includes("create trigger on_message_keyword_autoreply")
   );
   check(
-    "migration v2.4: حضور المشرف مفروض بمُشغِّل على جدول profiles",
-    MIGRATION.includes("on_profile_admin_presence") && MIGRATION.includes("new.is_online := true")
+    "schema.sql: يحذف الدوال التلقائية القديمة للتثبيت النظيف",
+    SCHEMA.includes("drop function if exists public.send_welcome_message()") &&
+      SCHEMA.includes("drop function if exists public.handle_keyword_autoreply()")
   );
   check(
-    "migration v2.4: تصحيح فوري لحضور كل المشرفين في قاعدة البيانات",
-    /update public\.profiles p\s+set is_online = true/.test(MIGRATION)
+    "migration v2.6: يحذف المُشغِّلات والدوال التلقائية",
+    MIGRATION_V26.includes("drop trigger if exists on_message_first_welcome") &&
+      MIGRATION_V26.includes("drop trigger if exists on_message_keyword_autoreply") &&
+      MIGRATION_V26.includes("drop function if exists public.send_welcome_message()") &&
+      MIGRATION_V26.includes("drop function if exists public.handle_keyword_autoreply()")
   );
   check(
-    "send-push: يعلّم الرسالة delivered بعد نجاح إرسال الإشعار",
-    SEND_PUSH.includes('update({ status: "delivered" })') && SEND_PUSH.includes('.eq("status", "sent")')
+    "calls.js: بطاقات المكالمات داخل المحادثة معطّلة",
+    /const CALL_CHAT_CARDS_ENABLED = false;/.test(CALLS_JS) &&
+      CALLS_JS.includes("if (!CALL_CHAT_CARDS_ENABLED)")
+  );
+  check(
+    "app.js: لا إدراج تلقائي للرسائل (الإدراج فقط من إرسال المستخدم)",
+    !/welcome|buttons:\s*v_buttons/i.test(APP_JS.replace(/clickedWelcomeButtons/g, ""))
+  );
+  check(
+    "migration v2.6: دالة تسجيل التوكن SECURITY DEFINER تنقل التوكن للمستخدم الحالي",
+    MIGRATION_V26.includes("function public.register_fcm_token") &&
+      MIGRATION_V26.includes("security definer") &&
+      MIGRATION_V26.includes("on conflict (token) do update") &&
+      MIGRATION_V26.includes("set user_id = excluded.user_id")
+  );
+  check(
+    "push.js: التسجيل عبر RPC مع توافق رجعي مع upsert",
+    PUSH_JS.includes('supabase.rpc("register_fcm_token"') && PUSH_JS.includes('from("fcm_tokens").upsert(')
+  );
+  check(
+    "app.js: تسجيل الخروج يحذف توكن الجهاز قبل signOut",
+    /disablePushNotifications\(\);\s*\n\s*\}\s*catch[\s\S]*?signOut\(state\.me\?\.id\)/.test(APP_JS)
+  );
+  check(
+    "send-push: يرسل إلى كل توكنات الحساب (تعدد الأجهزة) عبر sendToAllDevices",
+    SEND_PUSH.includes("async function loadDeviceTokens") &&
+      SEND_PUSH.includes("async function sendToAllDevices") &&
+      (SEND_PUSH.match(/sendToAllDevices\(/g) || []).length >= 5
+  );
+  check(
+    "send-push: لا يحذف التوكن عند INVALID_ARGUMENT العام",
+    !/UNREGISTERED\|registration-token-not-registered\|INVALID_ARGUMENT/i.test(SEND_PUSH)
+  );
+  check(
+    "app.js: معالجة الرسائل الواردة مُزالة من الازدواج (dedupe) ومطبّقة على القائمة",
+    APP_JS.includes("markRealtimeMessageSeen(msg.id)") && APP_JS.includes("patchConversationRow(")
+  );
+  check(
+    "app.js: قناة الـ inbox تطبّق تحديث conversations مباشرة قبل إعادة التحميل",
+    /payload\.eventType === "UPDATE"[\s\S]*?patchConversationRow\(row\.id/.test(APP_JS)
+  );
+  check(
+    "app.js: loadContacts لا يُسقط تغييراً وصل أثناء الجلب (إعادة تشغيل)",
+    APP_JS.includes("loadContactsRerun = true")
   );
   check(
     "schema.sql: دالتا التسليم موجودتان للتثبيت الجديد",
     SCHEMA.includes("function public.mark_messages_delivered") &&
       SCHEMA.includes("function public.mark_all_messages_delivered")
+  );
+  check(
+    "send-push: يعلّم الرسالة delivered بعد نجاح إرسال الإشعار",
+    SEND_PUSH.includes('update({ status: "delivered" })') && SEND_PUSH.includes('.eq("status", "sent")')
   );
   check(
     "app.js: منطق العلامات مطابق للقاعدة (sent/delivered → ✓✓، read → أزرق)",
