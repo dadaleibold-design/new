@@ -20,6 +20,7 @@ import {
   listenForForegroundMessages,
   sendTestNotification,
   syncPushToken,
+  disablePushNotifications,
   watchTokenRefresh,
   isPushReady,
   getLastTokenSyncAt,
@@ -947,6 +948,13 @@ function wireChrome() {
   });
 
   $("#btn-logout")?.addEventListener("click", async () => {
+    // حذف توكن هذا الجهاز من الخادم أولاً (وما دامت الجلسة سارية) حتى لا
+    // يستمر وصول إشعارات الحساب إلى جهاز خرج منه.
+    try {
+      await disablePushNotifications();
+    } catch (error) {
+      console.warn("[logout] تعذّر حذف توكن الإشعارات:", error);
+    }
     await signOut(state.me?.id);
     location.reload();
   });
@@ -1873,25 +1881,36 @@ function applyThemeVars() {
   }
 }
 
-// يمنع تشغيل loadContacts عشرات المرات عند تدفّق أحداث الـ presence
+// يمنع تشغيل loadContacts عشرات المرات عند تدفّق أحداث الـ presence/الرسائل.
+// - النداءات المتقاربة تُدمج في تنفيذ واحد (debounce).
+// - إن وصل نداء أثناء جلب قائم فلن يُتجاهل: يُعاد الجلب مرة أخرى بعد انتهائه
+//   (كان الوعد القائم يُعاد فيضيع التغيير الجديد حتى الحدث التالي).
 let loadContactsPending = null;
 let loadContactsTimer = null;
+let loadContactsInFlight = false;
+let loadContactsRerun = false;
 
-async function loadContacts() {
-  // إزالة الارتداد (debounce): تجميع النداءات المتقاربة في نداء واحد
-  if (loadContactsTimer) clearTimeout(loadContactsTimer);
-
+function loadContacts() {
+  if (loadContactsInFlight) {
+    loadContactsRerun = true;
+    return loadContactsPending;
+  }
   if (loadContactsPending) return loadContactsPending;
 
   loadContactsPending = new Promise((resolve) => {
     loadContactsTimer = setTimeout(async () => {
       loadContactsTimer = null;
+      loadContactsInFlight = true;
       try {
-        await loadContactsInternal();
+        do {
+          loadContactsRerun = false;
+          await loadContactsInternal();
+        } while (loadContactsRerun);
       } catch (error) {
         // لا تترك الوعد معلّقاً؛ الدورة التالية تعيد المحاولة بهدوء.
         console.warn("[contacts] refresh failed:", error);
       } finally {
+        loadContactsInFlight = false;
         loadContactsPending = null;
         resolve();
       }
@@ -2469,6 +2488,8 @@ function buildContactRow(c, opts) {
     row.dataset.unread =
       String(c._unread || 0);
 
+    row.dataset.lastAt = c._lastAt || "";
+
     state.contactRowsByConversation[
       c._conversationId
     ] = row;
@@ -2496,18 +2517,71 @@ function formatContactTime(iso) {
 }
 
 /**
+ * تحديث صف محادثة في القائمة مباشرةً (بلا أي طلب شبكة):
+ * المعاينة + وقت آخر رسالة + إعادة وضع الصف في مكانه حسب الترتيب الزمني.
+ * يعيد false إذا لم يكن الصف معروضاً (فيلزم إعادة بناء القائمة).
+ */
+function patchConversationRow(conversationId, { lastMessage, lastAt } = {}) {
+  if (!conversationId) return false;
+
+  const entry = state.contacts?.find((c) => c._conversationId === conversationId);
+  if (entry) {
+    if (lastMessage !== undefined) entry._lastMessage = lastMessage || "";
+    if (lastAt) entry._lastAt = lastAt;
+  }
+
+  const row = state.contactRowsByConversation[conversationId];
+  if (!row || !row.isConnected) return false;
+
+  if (lastMessage !== undefined) {
+    const sub = row.querySelector(".contact-sub");
+    if (sub) sub.textContent = lastMessage || "";
+  }
+
+  if (lastAt) {
+    row.dataset.lastAt = lastAt;
+    let timeEl = row.querySelector(".contact-time");
+    if (!timeEl) {
+      timeEl = document.createElement("div");
+      timeEl.className = "contact-time";
+      row.querySelector(".contact-info")?.after(timeEl);
+    }
+    timeEl.textContent = formatContactTime(lastAt);
+    placeRowByTime(row);
+  }
+
+  return true;
+}
+
+/** يضع الصف في موضعه الصحيح بين صفوف قسمه (الأحدث أولاً) دون إعادة رسم القائمة */
+function placeRowByTime(row) {
+  const parent = row.parentElement;
+  if (!parent) return;
+
+  const siblings = [...parent.children].filter(
+    (el) => el !== row && el.classList.contains("contact-row")
+  );
+  const t = Date.parse(row.dataset.lastAt || "") || 0;
+
+  const before = siblings.find((el) => (Date.parse(el.dataset.lastAt || "") || 0) < t);
+  if (before) {
+    if (before.previousElementSibling !== row) before.before(row);
+  } else if (siblings.length) {
+    const last = siblings[siblings.length - 1];
+    if (last.nextElementSibling !== row) last.after(row);
+  }
+}
+
+/**
  * زيادة فورية لعدّاد غير المقروء عند وصول رسالة (قبل أي طلب شبكة).
  * المصدر الرسمي للعدّاد يبقى قاعدة البيانات، ويُصحَّح عبر refreshUnreadBadges.
  */
-function bumpUnreadBadge(conversationId, preview) {
+function bumpUnreadBadge(conversationId, preview, lastAt) {
   if (state.activeConversation?.id === conversationId && document.visibilityState === "visible") {
     return;
   }
 
-  const row =
-    state.contactRowsByConversation[
-      conversationId
-    ];
+  const row = state.contactRowsByConversation[conversationId];
 
   if (!row) {
     // المحادثة غير معروضة (جديدة) → أعد بناء القائمة ثم صحّح العدّاد
@@ -2520,20 +2594,28 @@ function bumpUnreadBadge(conversationId, preview) {
     (state.unreadByConversation[conversationId] ??
       parseInt(row.dataset.unread || "0", 10)) + 1;
 
-  setConversationUnread(conversationId, current, { preview });
+  patchConversationRow(conversationId, {
+    lastMessage: preview,
+    lastAt: lastAt || new Date().toISOString(),
+  });
+  setConversationUnread(conversationId, current);
+}
 
-  // انقل المحادثة إلى أعلى قائمتها (آخر تفاعل) وحدّث وقتها
-  if (preview !== undefined) {
-    let timeEl = row.querySelector(".contact-time");
-    if (!timeEl) {
-      timeEl = document.createElement("div");
-      timeEl.className = "contact-time";
-      row.appendChild(timeEl);
-    }
-    timeEl.textContent = formatContactTime(new Date().toISOString());
+/**
+ * منع العدّ المزدوج: كل رسالة تُحتسب مرة واحدة فقط مهما تكرر وصول حدثها
+ * (إعادة اشتراك، أو وصولها عبر قناتين). يعيد false إذا سبق عدّها.
+ */
+const seenRealtimeMessageIds = new Set();
+const SEEN_REALTIME_LIMIT = 500;
+
+function markRealtimeMessageSeen(messageId) {
+  if (!messageId) return true;
+  if (seenRealtimeMessageIds.has(messageId)) return false;
+  seenRealtimeMessageIds.add(messageId);
+  if (seenRealtimeMessageIds.size > SEEN_REALTIME_LIMIT) {
+    seenRealtimeMessageIds.delete(seenRealtimeMessageIds.values().next().value);
   }
-  const parent = row.parentElement;
-  if (parent && parent.firstElementChild !== row) parent.prepend(row);
+  return true;
 }
 
 function clearUnreadBadge(conversationId) {
@@ -5725,11 +5807,26 @@ function subscribeInboxUpdates() {
         type: "postgres_changes",
         filter: { event: "*", schema: "public", table: "conversations" },
         callback: (payload) => {
-          const row = payload.new;
-          if (row && (row.user_id === state.me.id || row.admin_id === state.me.id)) {
-            // محادثة جديدة/تحديث آخر رسالة → أعِد الترتيب مع تصحيح العدّادات
+          // قاعدة البيانات تحدّث conversations.last_message مع كل رسالة (trigger)،
+          // فالتحديث يحمل المعاينة ووقت آخر رسالة → نطبّقه مباشرة على الصف.
+          if (payload.eventType === "DELETE") {
             loadContacts();
+            return;
           }
+          const row = payload.new;
+          if (!row || !(row.user_id === state.me.id || row.admin_id === state.me.id)) return;
+
+          if (
+            payload.eventType === "UPDATE" &&
+            patchConversationRow(row.id, {
+              lastMessage: row.last_message || "",
+              lastAt: row.last_message_at || null,
+            })
+          ) {
+            return;
+          }
+          // محادثة جديدة أو غير معروضة → أعِد بناء القائمة
+          loadContacts();
         },
       },
     ],
@@ -5765,7 +5862,20 @@ function subscribeGlobalMessageWatch() {
         filter: { event: "INSERT", schema: "public", table: "messages" },
         callback: (payload) => {
           const msg = payload.new;
-          if (!msg || msg.sender_id === state.me.id) return;
+          if (!msg?.conversation_id) return;
+          // نفس الرسالة قد تصل مرتين (قناتان / إعادة اشتراك) → تُعالج مرة واحدة
+          if (!markRealtimeMessageSeen(msg.id)) return;
+
+          const preview = messagePreviewText(msg);
+          const lastAt = msg.created_at || new Date().toISOString();
+
+          // رسالة من جهاز آخر لنفس الحساب: تحديث المعاينة فقط، بلا عدّاد غير مقروء
+          if (msg.sender_id === state.me.id) {
+            if (!patchConversationRow(msg.conversation_id, { lastMessage: preview, lastAt })) {
+              loadContacts();
+            }
+            return;
+          }
 
           const viewingThisThread =
             state.activeConversation &&
@@ -5776,14 +5886,15 @@ function subscribeGlobalMessageWatch() {
           markMessagesDelivered(msg.conversation_id);
 
           if (viewingThisThread) {
-            // المستخدم يقرأ المحادثة الآن → لا شارة ولا إزعاج
+            // المستخدم يقرأ المحادثة الآن → لا شارة ولا إزعاج، فقط تحديث المعاينة
+            patchConversationRow(msg.conversation_id, { lastMessage: preview, lastAt });
             resetUnreadFor(msg.conversation_id);
             markConversationRead(msg.conversation_id);
             return;
           }
 
           // RLS تضمن أن الرسائل الواصلة هنا تخص محادثات المستخدم فقط
-          bumpUnreadBadge(msg.conversation_id, messagePreviewText(msg));
+          bumpUnreadBadge(msg.conversation_id, preview, lastAt);
 
           if (msg.message_type !== "call") {
             playNotificationSound();

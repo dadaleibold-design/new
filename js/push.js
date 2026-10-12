@@ -396,17 +396,27 @@ export async function syncPushToken({ userId = null, force = false, minIntervalM
 
       const { supabase } = await import("./supabaseClient.js");
 
-      // ملاحظة: نُرسل الأعمدة الأساسية فقط حتى لا يفشل الإدراج إذا لم تُنفَّذ
-      // هجرات لاحقة أضافت أعمدة جديدة إلى fcm_tokens.
-      const { error } = await supabase.from("fcm_tokens").upsert(
-        {
-          user_id: targetUser,
-          token,
-          platform: detectPlatformLabel(),
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "token" }
-      );
+      // تسجيل التوكن عبر RPC آمنة (SECURITY DEFINER) تنقل التوكن إلى المستخدم الحالي
+      // مباشرة — هذا يضمن تسجيل كل جهاز لحسابه حتى لو كان التوكن مسجلاً سابقاً
+      // لحساب آخر على الجهاز نفسه (upsert عادي كانت ستحجبه سياسة RLS بصمت).
+      const platform = detectPlatformLabel();
+      let { error } = await supabase.rpc("register_fcm_token", {
+        p_token: token,
+        p_platform: platform,
+      });
+
+      // توافق رجعي: قبل تطبيق الهجرة v2.6 تكون الدالة غير موجودة → upsert عادي
+      if (error && /PGRST202|42883|schema cache|does not exist/i.test(`${error.code || ""} ${error.message || ""}`)) {
+        ({ error } = await supabase.from("fcm_tokens").upsert(
+          {
+            user_id: targetUser,
+            token,
+            platform,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "token" }
+        ));
+      }
 
       if (error) {
         console.error("[FCM] فشل حفظ التوكن في Supabase:", error);
