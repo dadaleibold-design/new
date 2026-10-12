@@ -609,6 +609,12 @@ export function subscribeToIncomingCalls() {
     .subscribe();
 }
 
+/** هل قناة الإشارات الواردة حيّة (منضمّة/قيد الانضمام)؟ — لتجنّب إعادة بنائها بلا سبب */
+export function isIncomingCallChannelAlive() {
+  const state = callState.signalChannel?.state;
+  return state === "joined" || state === "joining";
+}
+
 export function unsubscribeFromIncomingCalls() {
   const supabase = callState.ctx?.supabase;
   if (supabase && callState.signalChannel) {

@@ -2,20 +2,24 @@
  * firebase-messaging-sw.js
  * Service Worker لإشعارات Firebase Cloud Messaging (Web Push).
  *
- * قواعد الموثوقية المطبَّقة هنا:
- *  1) لا يفشل السكربت كاملاً إذا تعذّر importScripts (شبكة/حجب gstatic):
- *     يُغلَّف ب try/catch ويبقى مستمع `push` الاحتياطي قادراً على عرض
- *     الإشعار من الحمولة الخام — وهي حالة واقعية لاختفاء الإشعارات.
- *  2) مستمع push احتياطي مستقل عن Firebase SDK، لا يعرض إشعاراً مكرراً
- *     (يفحص getNotifications بنفس الـ tag قبل العرض).
- *  3) تدفّق نقر الإشعار (notificationclick) يفتح *المحادثة الصحيحة* دائماً:
- *     يُرسل postMessage للنافذة الموجودة (بالمعرّف + معرّف الرسالة)، وإن
- *     تعذّر ذلك يوجّه النافذة أو يفتح نافذة جديدة على رابط صحيح مشتق من
- *     نطاق التسجيل (يدعم الاستضافة على مسار فرعي، لا يفترض الجذر).
- *  4) pushsubscriptionchange → إعادة اشتراك + تنبيه التطبيق ليحدّث التوكن.
+ * قواعد الموثوقية المطبَّقة:
+ *  1) نقرة الإشعار: معالجنا مُسجَّل بمرحلة الالتقاط (capture) فيعمل قبل
+ *     معالج Firebase SDK. الـ SDK يستدعي stopImmediatePropagation() عند
+ *     عدم وجود رابط (fcm_options.link) فيبتلع النقرة — وهذا كان يمنع فتح
+ *     المحادثة نهائياً. الآن نوقف الانتشار بأنفسنا ونعالج النقرة دائماً.
+ *  2) الحمولة تأتي بأشكال متعددة: FCM_MSG (تغلّفها Firebase داخل
+ *     notification.data)، أو data مباشرة. normalizePayload يوحّدها كلها —
+ *     بما فيها بيانات النقرة (event.notification.data = { FCM_MSG: … }).
+ *  3) منع التكرار بمفتاح الرسالة (messageId / roomId)، لا بالـ tag وحده.
+ *     الـ tag وحده كان يُسقط رسالة جديدة إذا بقي إشعار سابق بنفس
+ *     المحادثة في الصينية (الإشعار القديم يحمل نفس الـ tag).
+ *  4) كل تسليم push يُنتج إشعاراً مرئياً عندما يكون التطبيق في الخلفية
+ *     (شرط userVisibleOnly في Chrome/Android)، بما فيها إنهاء المكالمة.
+ *  5) مكالمة فائتة لها tag خاص (missed-<room>) لا يستبدل إشعار المحادثة.
+ *  6) pushsubscriptionchange → إعادة اشتراك + تنبيه التطبيق لتحديث التوكن.
  * ============================================================ */
 
-const SW_BUILD = "2026-09-21.1";
+const SW_BUILD = "2026-10-12.1";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
 
 let firebaseReady = false;
@@ -27,7 +31,7 @@ try {
   );
   firebaseReady = true;
 } catch (error) {
-  // شبكة مقطوعة / حجب / CSP: نُكمل بمستمع push المستقل بدل سقوط الـ SW كله
+  // شبكة مقطوعة / حجب / CSP: نُكمل بالمسار الاحتياطي المستقل بدل سقوط الـ SW
   console.error("[messaging-sw] تعذّر تحميل Firebase SDK — سيُستخدم المسار الاحتياطي:", error);
 }
 
@@ -78,12 +82,14 @@ function iconUrl(hint) {
 }
 
 /**
- * يوحّد شكل الحمولة: يدعم data-only، وnotification، وFCM_MSG (تعرضها
- * Firebase عند الإشعارات التلقائية داخل كائن notification.data).
+ * يوحّد شكل الحمولة من أي مصدر:
+ *   • push خام من FCM:            { data:{…}, notification:{…} }
+ *   • كائن إشعار معروض (SDK):     { data:{ FCM_MSG:{ data:{…}, notification:{…} } } }
+ *   • حمولة onBackgroundMessage:  { data:{…}, notification:{…} }
  */
 function normalizePayload(raw = {}) {
-  const nested = raw?.notification?.data?.FCM_MSG;
-  const source = nested ? { ...raw, ...nested } : raw;
+  const wrapped = raw?.FCM_MSG || raw?.data?.FCM_MSG || raw?.notification?.data?.FCM_MSG || null;
+  const source = wrapped ? { ...raw, ...wrapped } : raw;
 
   const data = source?.data || source?.notification?.data || {};
   const notification = source?.notification || {};
@@ -110,21 +116,42 @@ function normalizePayload(raw = {}) {
   };
 }
 
+/**
+ * tag الإشعار: يحدد أيّ إشعارات تستبدل بعضها على الجهاز.
+ *   • رسائل المحادثة: tag لكل محادثة (تتجمّع كما في واتساب).
+ *   • المكالمة الواردة: tag لكل غرفة (تُغلق عند انتهائها).
+ *   • المكالمة الفائتة: tag منفصل — لا تستبدل إشعار الرسائل.
+ */
 function notificationTag(payload) {
   if (payload.isCall) return `call-${payload.roomId || payload.conversationId || "incoming"}`;
+  if (payload.isCallEnded) return `missed-${payload.roomId || Date.now()}`;
   if (payload.conversationId) return `conversation-${payload.conversationId}`;
-  return "whatsapp-message";
+  if (payload.messageId) return `message-${payload.messageId}`;
+  return `whatsapp-message-${Date.now()}`;
+}
+
+/**
+ * مفتاح الهوية للمنع من التكرار: كل إشعار يُمثّل حدثاً واحداً (رسالة أو
+ * غرفة مكالمة). يُقارَن بالإشعارات المعروضة فعلاً وليس بالـ tag.
+ */
+function identityKey(data = {}) {
+  const d = data?.FCM_MSG?.data || data || {};
+  if (d.messageId || d.message_id) return `msg:${d.messageId || d.message_id}`;
+  if (d.roomId || d.room_id) return `room:${d.type || "call"}:${d.roomId || d.room_id}`;
+  return "";
 }
 
 function buildNotificationOptions(payload) {
   const tag = notificationTag(payload);
+  const isCall = payload.isCall;
   const options = {
     body: payload.body,
     icon: iconUrl(payload.icon),
     badge: iconUrl(),
     tag,
+    // renotify: إعادة التنبيه (صوت/اهتزاز) حتى مع وجود إشعار بنفس الـ tag
     renotify: true,
-    requireInteraction: payload.isCall,
+    requireInteraction: isCall,
     silent: false,
     timestamp: Date.now(),
     data: {
@@ -135,26 +162,93 @@ function buildNotificationOptions(payload) {
       roomId: payload.roomId,
       url: appUrl(payload.conversationId, payload.messageId),
     },
-    vibrate: payload.isCall ? [500, 250, 500, 250, 500, 250, 500] : [100, 50, 100],
-    actions: payload.isCall ? [
-      { action: "answer", title: "📞 رد" },
-      { action: "decline", title: "رفض" },
-    ] : [],
+    vibrate: isCall ? [500, 250, 500, 250, 500, 250, 500] : [100, 50, 100],
+    actions: isCall
+      ? [
+          { action: "answer", title: "📞 رد" },
+          { action: "decline", title: "رفض" },
+        ]
+      : [],
   };
   return { tag, options };
 }
 
-/** يعرض الإشعار إن لم يوجد إشعار بنفس الـ tag (يمنع الازدواج) */
-async function showNotificationOnce(payload) {
-  const { tag, options } = buildNotificationOptions(payload);
-  try {
-    const existing = await self.registration.getNotifications({ tag });
-    if (existing && existing.length) return false;
-  } catch {
-    /* getNotifications غير مدعومة — أكمل */
+/* ------------------------------------------------------------
+ * العرض: تسلسل داخلي + منع تكرار بالهوية
+ * ---------------------------------------------------------- */
+
+// المستمعان (Firebase SDK + المسار الاحتياطي) يعملان في نفس الـ SW؛ نُسلسل
+// فحص "هل عُرض؟" + "اعرض" كي لا يفحص كلاهما قبل أن يعرض أيّ منهما.
+let displayChain = Promise.resolve();
+
+function enqueueDisplay(task) {
+  const run = displayChain.then(task, task);
+  displayChain = run.catch(() => {});
+  return run;
+}
+
+/** يعرض الإشعار إن لم يكن هذا الحدث معروضاً بالفعل. يعيد true إن عرض. */
+function showNotificationOnce(payload) {
+  return enqueueDisplay(async () => {
+    const { tag, options } = buildNotificationOptions(payload);
+    const key = identityKey(payload.data);
+    if (key) {
+      try {
+        const existing = await self.registration.getNotifications({ tag });
+        if (existing.some((n) => identityKey(n.data) === key)) return false;
+      } catch {
+        /* getNotifications غير مدعومة — أكمل */
+      }
+    }
+    await self.registration.showNotification(payload.title, options);
+    return true;
+  });
+}
+
+/**
+ * إنهاء مكالمة: يُغلق رنين المكالمة الواردة. ولأن قواعد Push تُلزم بإظهار
+ * إشعار لكل دفعة في الخلفية، فإن لم تكن فائتة نعرض إشعاراً صامتاً يستبدل
+ * الرنين ثم يُغلق بعد لحظة قصيرة.
+ */
+async function handleCallEnded(payload) {
+  const roomId = payload.roomId || "";
+  const missed = String(payload.data.missed) === "true";
+
+  if (missed) {
+    await showNotificationOnce({
+      ...payload,
+      title: payload.title || "مكالمة فائتة",
+      body: payload.body || "لديك مكالمة فائتة",
+    });
+    // أغلق رنين المكالمة الواردة
+    try {
+      const ringing = await self.registration.getNotifications({ tag: `call-${roomId}` });
+      ringing.forEach((n) => n.close());
+    } catch {
+      /* تجاهل */
+    }
+    return;
   }
-  await self.registration.showNotification(payload.title, options);
-  return true;
+
+  // غير فائتة: استبدل الرنين بإشعار صامت قصير ثم أغلقه
+  await enqueueDisplay(async () => {
+    await self.registration.showNotification(payload.title || "انتهت المكالمة", {
+      body: payload.body || "انتهت المكالمة",
+      icon: iconUrl(payload.icon),
+      badge: iconUrl(),
+      tag: `call-${roomId || "ended"}`,
+      renotify: false,
+      silent: true,
+      data: { ...payload.data, type: "call_ended", roomId },
+    });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  try {
+    const shown = await self.registration.getNotifications({ tag: `call-${roomId || "ended"}` });
+    shown.forEach((n) => n.close());
+  } catch {
+    /* تجاهل */
+  }
 }
 
 async function hasVisibleClient() {
@@ -177,7 +271,7 @@ const firebaseConfig = {
   storageBucket: "studio-6422025604-b97aa.firebasestorage.app",
   messagingSenderId: "599267399266",
   appId: "1:599267399266:web:4cd19dbf69068019f5e33b",
-  measurementId: "G-FFX14GZB51"
+  measurementId: "G-FFX14GZB51",
 };
 
 let messaging = null;
@@ -193,28 +287,12 @@ if (firebaseReady) {
 }
 
 if (messaging) {
+  // يُستدعى من الـ SDK فقط عندما لا توجد نافذة ظاهرة (وإلا تُرسَل الرسالة للصفحة)
   messaging.onBackgroundMessage(async (payload) => {
-    console.log("[messaging-sw] Background message:", payload);
     const normalized = normalizePayload(payload);
 
-    // انتهت المكالمة/فائتة: أغلق إشعار الرنين واعرض "مكالمة فائتة"
     if (normalized.isCallEnded) {
-      try {
-        const list = await self.registration.getNotifications({
-          tag: `call-${normalized.roomId || ""}`,
-        });
-        list.forEach((n) => n.close());
-      } catch {
-        /* تجاهل */
-      }
-      if (String(normalized.data.missed) === "true") {
-        await showNotificationOnce({
-          ...normalized,
-          title: normalized.title || "مكالمة فائتة",
-          body: normalized.body || "لديك مكالمة فائتة",
-          data: { ...normalized.data, conversationId: normalized.conversationId },
-        });
-      }
+      await handleCallEnded(normalized);
       return;
     }
 
@@ -222,8 +300,8 @@ if (messaging) {
   });
 }
 
-// شبكة أمان: إن لم يعرض Firebase SDK إشعاراً (نسخة قديمة، خطأ تهيئة، أو
-// تعذّر تحميل importScripts) نعرضه من الحمولة الخام حتى لا يضيع الإشعار.
+// المسار الاحتياطي المستقل: يعمل إن لم يعرض الـ SDK شيئاً (SDK غير متاح،
+// أو نسخة قديمة، أو دفعة data-only). الفحص بالهوية يمنع الازدواج.
 self.addEventListener("push", (event) => {
   if (!event.data) return;
 
@@ -240,15 +318,18 @@ self.addEventListener("push", (event) => {
   if (!raw) return;
 
   const payload = normalizePayload(raw);
-  if (payload.isCallEnded) return; // يعالجه onBackgroundMessage
 
   event.waitUntil((async () => {
-    // إن كان هناك تبويب ظاهر فالتطبيق نفسه مسؤول عن العرض (يمنع الازدواج
-    // ويحترم قرار الواجهة بعدم الإزعاج أثناء قراءة نفس المحادثة).
+    // نافذة ظاهرة: الصفحة تتولّى العرض (onMessage) ولا نُزعج المستخدم مرتين
     if (await hasVisibleClient()) return;
 
-    // امنح Firebase SDK فرصة أولاً حتى لا يظهر الإشعار مرتين
+    // امنح الـ SDK فرصة أولاً ثم تحقق من الهوية قبل العرض
     await new Promise((resolve) => setTimeout(resolve, 600));
+
+    if (payload.isCallEnded) {
+      await handleCallEnded(payload);
+      return;
+    }
     await showNotificationOnce(payload);
   })());
 });
@@ -344,11 +425,18 @@ async function focusOrOpenClient(payload, event) {
   return null;
 }
 
-self.addEventListener("notificationclick", (event) => {
-  event.notification.close();
-  const payload = normalizePayload(event.notification?.data || {});
-  event.waitUntil(focusOrOpenClient(payload, event));
-});
+// مرحلة الالتقاط (capture=true) + stopImmediatePropagation:
+// يضمن أن معالجنا يعمل قبل معالج Firebase SDK الذي يبتلع النقرة بلا رابط.
+self.addEventListener(
+  "notificationclick",
+  (event) => {
+    event.stopImmediatePropagation();
+    event.notification.close();
+    const payload = normalizePayload(event.notification?.data || {});
+    event.waitUntil(focusOrOpenClient(payload, event));
+  },
+  { capture: true }
+);
 
 self.addEventListener("notificationclose", () => {
   // no-op: الإشعارات تُدار بالـ tag من التطبيق نفسه

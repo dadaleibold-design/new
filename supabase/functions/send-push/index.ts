@@ -8,6 +8,8 @@
 // Optional:
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
+//   APP_PUBLIC_URL        (e.g. https://app.example.com — يُضاف كرابط احتياطي للنقرة)
+//   PUSH_NORMAL_URGENCY   ("1" لإعادة الأولوية العادية)
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
@@ -18,6 +20,7 @@ const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID");
 const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL");
 const FIREBASE_PRIVATE_KEY = Deno.env.get("FIREBASE_PRIVATE_KEY")?.replace(/\\n/g, "\n");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
+const APP_PUBLIC_URL = (Deno.env.get("APP_PUBLIC_URL") || "").replace(/\/+$/, "");
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
@@ -83,42 +86,54 @@ async function getFirebaseAccessToken() {
 }
 
 /**
+ * tag الإشعار يحدد أي إشعارات تستبدل بعضها على الجهاز:
+ *   • رسالة: tag لكل محادثة (تتجمّع).
+ *   • مكالمة واردة: tag لكل غرفة (يُغلق عند انتهائها في الـ Service Worker).
+ *   • مكالمة فائتة: tag منفصل (لا تستبدل إشعار الرسائل — كان هذا تداخلاً).
+ *   • اختبار/مسبار: tag فريد (لا يستبدل رسالة حقيقية ولا يُكتم بها).
+ */
+function buildTag(data: Record<string, string>): string {
+  if (data.type === "incoming_call") return `call-${data.roomId || data.conversationId || "incoming"}`;
+  if (data.type === "call_ended") return `missed-${data.roomId || crypto.randomUUID()}`;
+  if (data.type === "test" || data.type === "probe") return `test-${crypto.randomUUID()}`;
+  if (data.conversationId) return `conversation-${data.conversationId}`;
+  if (data.messageId) return `message-${data.messageId}`;
+  return `whatsapp-message-${crypto.randomUUID()}`;
+}
+
+/** رابط النقرة الاحتياطي (يُستخدم فقط إن ضُبط APP_PUBLIC_URL) */
+function buildAppLink(data: Record<string, string>): string | undefined {
+  if (!APP_PUBLIC_URL) return undefined;
+  const url = new URL(`${APP_PUBLIC_URL}/index.html`);
+  if (data.conversationId) url.searchParams.set("conversation", data.conversationId);
+  if (data.messageId) url.searchParams.set("message", data.messageId);
+  if (data.type === "incoming_call" && data.roomId) url.searchParams.set("answer_call", data.roomId);
+  return url.href;
+}
+
+/**
  * يبني إعدادات الإشعار لـ Web Push.
  *
- * لماذا نُرسل `notification` الآن بدل data-only فقط؟
- *   1) iOS/iPadOS ‏(Safari 16.4+): لا يدعم "الدفع الصامت" (data-only) بشكل
- *      موثوق — كتّاب Apple يوضّحون أن الإشعار يجب أن يحمل حمولة عرض
- *      (`notification`) وإلّا لا يظهر المستخدم شيئاً. لذلك كان مستخدمو
- *      آيفون لا يستلمون إشعارات الخلفية أصلاً.
- *   2) في أندرويد/كروم يظل السلوك صحيحاً: عند وجود تبويب مرئي تُسلَّم الرسالة
- *      للصفحة (onMessage) ولا يعرضها الـ SDK، وعند غيابه يعرضها الـ SDK.
- *   3) التكرار ممنوع عبر الـ `tag` نفسه الذي يستخدمه التطبيق
- *      (`conversation-<id>` / `call-<roomId>`)، ولمستمع الـ push الاحتياطي في
- *      firebase-messaging-sw.js فحص getNotifications بالـ tag قبل العرض.
+ * لماذا نُرسل `webpush.notification` (وليس data-only)؟
+ *   1) iOS/iPadOS (Safari 16.4+) لا يدعم الدفع الصامت بموثوقية — يجب أن تحمل
+ *      الدفعة حمولة عرض، وإلا لا يرى المستخدم شيئاً.
+ *   2) Chrome/Android: الدفعة التي لا تُظهر إشعاراً في الخلفية تُعامَل كانتهاك
+ *      لـ userVisibleOnly فيُستبدل الإشعار بنص عام، لذا الإشعار هنا ضروري.
+ *   3) منع الازدواج: الـ SDK يعرض هذا الإشعار تلقائياً، وmessaging.onBackgroundMessage
+ *      والمسار الاحتياطي في firebase-messaging-sw.js يتحققان بالهوية
+ *      (messageId/roomId) قبل أي عرض إضافي.
  *
- * ملاحظة مهمة: لا نضبط fcmOptions.link ولا click_action حتى لا يعالج الـ SDK
- * النقرة بنفسه ويفتح نافذة مكرّرة — معالجة النقر مسؤولية
- * notificationclick في الـ Service Worker.
+ * الحقول المكرّرة في `data` تقرأها نقرة الإشعار في الـ Service Worker، لأن
+ * الـ SDK يلفّ الحمولة داخل notification.data.FCM_MSG.
  */
-function buildWebPushNotification(
-  data: Record<string, string>,
-  opts: { highPriority?: boolean } = {},
-) {
-  const tag = data.type === "incoming_call"
-    ? `call-${data.roomId || data.conversationId || "incoming"}`
-    : data.type === "call_ended"
-      ? `missed-${data.roomId || Date.now()}`
-      : data.conversationId
-        ? `conversation-${data.conversationId}`
-        : "whatsapp-message";
-
+function buildWebPushNotification(data: Record<string, string>) {
   const isCall = data.type === "incoming_call";
 
   return {
     title: data.title || "رسالة جديدة",
     body: data.body || "لديك رسالة جديدة",
     icon: data.icon || undefined,
-    tag,
+    tag: buildTag(data),
     renotify: true,
     requireInteraction: isCall,
     silent: false,
@@ -129,8 +144,6 @@ function buildWebPushNotification(
           { action: "decline", title: "رفض" },
         ]
       : [],
-    // نُكرّر حقول التوجيه داخل بيانات الإشعار ليقرأها معالج النقر
-    // مهما كان شكل الحمولة التي يبنيها الـ SDK (FCM_MSG أو مباشرة).
     data: {
       type: data.type || "message",
       conversationId: data.conversationId || "",
@@ -176,7 +189,9 @@ async function sendToFcm(
   };
 
   if (opts.withNotification !== false) {
-    (body.webpush as Record<string, unknown>).notification = buildWebPushNotification(data, opts);
+    (body.webpush as Record<string, unknown>).notification = buildWebPushNotification(data);
+    const link = buildAppLink(data);
+    if (link) (body.webpush as Record<string, unknown>).fcm_options = { link };
   }
 
   const response = await fetch(

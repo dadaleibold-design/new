@@ -32,6 +32,7 @@ import {
   isCallActive,
   endCall,
   startCallWith,
+  isIncomingCallChannelAlive,
 } from "./calls.js";
 import {
   showPermissionCardIfNeeded,
@@ -53,6 +54,7 @@ import {
   ensureRealtimeConnected,
   startRealtimeWatchdog,
   diagnoseRealtime,
+  isChannelAlive,
 } from "./realtime.js";
 import {
   initNotificationRouter,
@@ -203,11 +205,7 @@ async function boot() {
         /* تجاهل */
       }
       state.foregroundMessagesUnsub = null;
-      try {
-        unsubscribeFromIncomingCalls();
-      } catch (err) {
-        console.error("unsubscribeFromIncomingCalls failed:", err);
-      }
+      teardownAllRealtime();
       showAuthScreen();
     }
   });
@@ -365,6 +363,13 @@ function openConversationUIState(conversationId) {
 
 function closeChatView() {
   document.body.classList.remove("viewing-chat");
+
+  // مغادرة المحادثة = إغلاق قنواتها (مستمعو الرسائل/الكتابة/التفاعلات).
+  // قائمة المحادثات تبقى مشتركة عبر globalMsgChannel وinboxChannel.
+  teardownChannel("msgChannel");
+  teardownChannel("typingChannel");
+  teardownChannel("reactionsChannel");
+  state.subscribedConversationId = null;
 
   $("#chat-panel")?.classList.remove("mobile-visible");
   $("#sidebar")?.classList.remove("mobile-hidden");
@@ -4966,48 +4971,103 @@ function teardownChannel(key) {
   }
 }
 
+/** هل القناة المُدارة في الحالة حيّة (منضمّة/قيد الانضمام + الاتصال متصل)؟ */
+function channelAlive(holder) {
+  if (!holder || holder.stopped) return false;
+  return isChannelAlive(supabase, holder.channel);
+}
+
 /**
- * إعادة بناء كل اشتراكات Realtime بعد انقطاع/تجميد.
- * تُستدعى عند: العودة للمقدمة، resume، عودة الشبكة، أو نبضة اليقظة.
- * مُسلسَلة عبر realtimeResubscribePromise لمنع إنشاء قنوات بنفس الـ topic بالتوازي.
+ * إغلاق كل اشتراكات Realtime (تسجيل الخروج / إنهاء الجلسة).
+ * بدونه تبقى القنوات حيّة وتتكرّر بعد تسجيل دخول جديد.
+ */
+function teardownAllRealtime() {
+  [
+    "presenceChannel",
+    "inboxChannel",
+    "globalMsgChannel",
+    "callsChannel",
+    "msgChannel",
+    "typingChannel",
+    "reactionsChannel",
+  ].forEach(teardownChannel);
+  state.subscribedConversationId = null;
+  clearTimeout(presenceReloadTimer);
+  presenceReloadTimer = null;
+  try {
+    unsubscribeFromIncomingCalls();
+  } catch (error) {
+    console.warn("[realtime] تعذّر إغلاق قناة المكالمات:", error);
+  }
+}
+
+/**
+ * إعادة الاشتراك — بالتدريج لا بالجملة:
+ *   • القناة السليمة (منضمّة) لا تُمسّ إطلاقاً.
+ *   • القناة الميتة فقط تُغلق وتُبنى من جديد.
+ * كان الكود السابق يهدم كل القنوات ويبنيها عند كل حدث (عودة للمقدمة، focus،
+ * pageshow، online، نبضة اليقظة) وهو مصدر حلقة CLOSED/CHANNEL_ERROR.
+ * مُسلسَلة عبر realtimeResubscribePromise لمنع البناء المتوازي.
  */
 function resubscribeRealtime(reason = "manual") {
   if (!state.me) return Promise.resolve();
   if (state.realtimeResubscribePromise) return state.realtimeResubscribePromise;
 
-  console.log(`[realtime] إعادة بناء الاشتراكات (${reason})`);
+  // القناة المرفوضة نهائياً من الخادم (failed) لا يعيد بناءها إلا نبضة اليقظة
+  // (بتراجع زمني). أحداث المقدمة/focus لا تفعل ذلك — وإلا تكررت المحاولات.
+  const retryFailed = String(reason).startsWith("watchdog") || reason === "manual";
+  const needsRebuild = (holder) => !channelAlive(holder) && (retryFailed || !holder?.failed);
 
   state.realtimeResubscribePromise = (async () => {
-    // 0) تأكد أن الاتصال الأساسي حيّ قبل إعادة الاشتراك
+    // 0) تأكد أن الاتصال الأساسي حيّ قبل أي قرار
     ensureRealtimeConnected(supabase);
 
-    // removeChannel غير متزامنة — لا نربط مستمعي قناة جديدة قبل إغلاق القديمة
-    teardownChannel("presenceChannel");
-    subscribeGlobalPresence();
+    const rebuilt = [];
 
-    teardownChannel("inboxChannel");
-    subscribeInboxUpdates();
+    if (needsRebuild(state.presenceChannel)) {
+      teardownChannel("presenceChannel");
+      subscribeGlobalPresence();
+      rebuilt.push("presence");
+    }
 
-    teardownChannel("globalMsgChannel");
-    subscribeGlobalMessageWatch();
+    if (needsRebuild(state.inboxChannel)) {
+      teardownChannel("inboxChannel");
+      subscribeInboxUpdates();
+      rebuilt.push("inbox");
+    }
 
+    if (needsRebuild(state.globalMsgChannel)) {
+      teardownChannel("globalMsgChannel");
+      subscribeGlobalMessageWatch();
+      rebuilt.push("global-messages");
+    }
+
+    // قناة غرف المكالمات وقناة الإشارات مقدّستان أثناء مكالمة جارية
     if (!isCallActive()) {
-      teardownChannel("callsChannel");
-      subscribeCallRoomsWatch();
-
-      try {
-        unsubscribeFromIncomingCalls();
-        subscribeToIncomingCalls();
-      } catch (error) {
-        console.warn("[realtime] تعذّر إعادة الاشتراك بقناة المكالمات:", error);
+      if (needsRebuild(state.callsChannel)) {
+        teardownChannel("callsChannel");
+        subscribeCallRoomsWatch();
+        rebuilt.push("call-rooms");
+      }
+      if (!isIncomingCallChannelAlive()) {
+        try {
+          unsubscribeFromIncomingCalls();
+          subscribeToIncomingCalls();
+          rebuilt.push("incoming-calls");
+        } catch (error) {
+          console.warn("[realtime] تعذّر إعادة الاشتراك بقناة المكالمات:", error);
+        }
       }
     }
 
-    if (state.activeConversation) {
-      state.subscribedConversationId = null;
+    // المحادثة المفتوحة: subscribeToConversation idempotent — يعيد البناء فقط
+    // إن كانت إحدى قنواتها الثلاث ميتة. resync الرسائل يتم من onStatus عند SUBSCRIBED.
+    // فقط إن كانت المحادثة معروضة فعلاً (المغلقة تملك قنواتها منذ إغلاقها)
+    if (state.activeConversation && document.body.classList.contains("viewing-chat")) {
       subscribeToConversation(state.activeConversation.id);
-      await loadMessages(state.activeConversation.id, { silent: true });
     }
+
+    if (rebuilt.length) console.log(`[realtime] أُعيد بناء (${rebuilt.join(", ")}) — السبب: ${reason}`);
   })()
     .catch((error) => {
       console.warn("[realtime] فشل إعادة بناء الاشتراكات:", error);
@@ -5017,6 +5077,16 @@ function resubscribeRealtime(reason = "manual") {
     });
 
   return state.realtimeResubscribePromise;
+}
+
+/** يجمع أحداث حضور المشرفين/المستخدمين ويحمّل جهات الاتصال مرة واحدة */
+let presenceReloadTimer = null;
+function scheduleContactsReloadFromPresence() {
+  if (presenceReloadTimer) return;
+  presenceReloadTimer = setTimeout(() => {
+    presenceReloadTimer = null;
+    loadContacts();
+  }, 800);
 }
 
 /**
@@ -5031,8 +5101,13 @@ function subscribeToConversation(
 ) {
   if (!conversationId || !state.me) return;
 
-  // نفس المحادثة وقناة حيّة → لا تُهدر إعادة اشتراك
-  if (state.subscribedConversationId === conversationId && state.msgChannel?.channel) {
+  // نفس المحادثة وكل قنواتها الثلاث حيّة → لا شيء (لا إعادة اشتراك بلا سبب)
+  if (
+    state.subscribedConversationId === conversationId &&
+    channelAlive(state.msgChannel) &&
+    channelAlive(state.typingChannel) &&
+    channelAlive(state.reactionsChannel)
+  ) {
     return;
   }
 
@@ -5458,9 +5533,10 @@ async function setTyping(
 }
 
 function subscribeGlobalPresence() {
-  // Realtime throws when .on() is called after subscribe(). This guard also
-  // prevents duplicate channels during repeated visibility/network events.
-  if (state.presenceChannel || !state.me) return;
+  // idempotent: قناة حيّة ⇒ لا شيء. قناة ميتة ⇒ تُغلق وتُبنى (لا تُترك معلّقة).
+  if (!state.me) return;
+  if (channelAlive(state.presenceChannel)) return;
+  teardownChannel("presenceChannel");
 
   state.presenceChannel = createResilientChannel(supabase, {
     topic: "presence:global",
@@ -5494,7 +5570,7 @@ function subscribeGlobalPresence() {
             if (isAdminContact(peer.id, peer)) state.onlineMap[peer.id] = true;
           }
 
-          loadContacts();
+          scheduleContactsReloadFromPresence();
           if (state.activeConversation) {
             refreshPresenceLabel(state.activeConversation.otherProfile.id);
           }
@@ -5638,6 +5714,8 @@ async function refreshPresenceLabel(
 
 function subscribeInboxUpdates() {
   if (!state.me) return;
+  if (channelAlive(state.inboxChannel)) return;
+  teardownChannel("inboxChannel");
 
   state.inboxChannel = createResilientChannel(supabase, {
     topic: "inbox-updates",
@@ -5670,6 +5748,8 @@ function subscribeInboxUpdates() {
  */
 function subscribeGlobalMessageWatch() {
   if (!state.me) return;
+  if (channelAlive(state.globalMsgChannel)) return;
+  teardownChannel("globalMsgChannel");
 
   const reconcile = (conversationIds) => {
     const ids = [...new Set((conversationIds || []).filter(Boolean))];

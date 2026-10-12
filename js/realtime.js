@@ -4,19 +4,20 @@
  *
  * المشكلة التي تحلّها:
  *   متصفحات الجوال (Chrome/Android وSafari/iOS) تُجمّد (Freeze) التبويب
- *   الخلفي بعد نحو 5 دقائق من إخفائه، فيموت WebSocket بصمت:
- *     • لا حدث `offline` في الواجهة.
- *     • لا خطأ من مكتبة Realtime.
- *     • المؤقتات العادية (setInterval) تُخنَق إلى نبضة كل دقيقة.
- *   النتيجة: يتوقّف استقبال الرسائل الحقيقية (Realtime) حتى يعود المستخدم
- *   للتبويب، ويبدو التطبيق "ميتاً" في الخلفية.
+ *   الخلفي بعد نحو 5 دقائق من إخفائه، فيموت WebSocket بصمت.
  *
- * الحل هنا:
- *   • realtimeConnectionState / diagnoseRealtime : تشخيص فوري للحالة.
- *   • createResilientChannel : قناة تُعيد الاشتراك تلقائياً عند
- *     CHANNEL_ERROR / TIMED_OUT / CLOSED بخلفية تصاعدية (backoff مع jitter).
- *   • startRealtimeWatchdog : نبضة يقظة تكتشف موت الاتصال — حتى في الخلفية —
- *     وتستدعي onRevive لإعادة بناء الاشتراكات + مزامنة تفاضلية للبيانات.
+ * ضمانات هذه الطبقة (بعد إصلاح حلقة التكرار):
+ *   1) نمط Singleton لكل topic: لا تُفتح قناتان بنفس الاسم أبداً.
+ *      إنشاء قناة جديدة بنفس الـ topic يُغلق القديمة أولاً.
+ *   2) حارس الإلغاء (stale guard): أي حدث حالة يأتي من قناة أُزيلت أو
+ *      استُبدلت يُتجاهَل. هذا هو سبب الحلقة الأصلية: إزالة القناة القديمة
+ *      كانت تُطلق CLOSED ⇒ جدولة إعادة ⇒ إزالة القناة الجديدة ⇒ CLOSED …
+ *   3) لا إعادة بناء للقناة السليمة: ensureHealthy() يعيد البناء فقط إن
+ *      كانت القناة ميتة (errored/closed) أو غير متصلة.
+ *   4) حدّ للمحاولات: بعد maxRetries تُعلَّم القناة failed ولا تعود تلقائياً
+ *      إلا بإعادة بناء صريحة (rebuild) — فلا حلقة لا نهائية على خطأ دائم
+ *      في الخادم (مثل جدول غير منشور في supabase_realtime).
+ *   5) نبضة يقظة مع تراجع أُسّي (exponential backoff) لعمليات الإحياء.
  * ============================================================ */
 
 /** حالة اتصال الـ WebSocket الأساسي: connected | connecting | disconnected | unknown */
@@ -41,6 +42,13 @@ export function channelState(channel) {
   } catch {
     return "unknown";
   }
+}
+
+/** القناة «حيّة»: منضمّة أو قيد الانضمام، والاتصال الأساسي متصل */
+export function isChannelAlive(supabase, channel) {
+  if (!channel) return false;
+  const state = channelState(channel);
+  return (state === "joined" || state === "joining") && isRealtimeConnected(supabase);
 }
 
 function listChannels(supabase) {
@@ -86,8 +94,22 @@ function jitter(ms) {
   return ms + Math.floor(Math.random() * 350);
 }
 
+/** سجلّ القنوات المُدارة: topic → handle (نمط Singleton) */
+const managedChannels = new Map();
+
+/** إزالات قيد التنفيذ: topic → Promise — لا تُنشأ قناة بنفس الاسم قبل انتهائها */
+const pendingRemovals = new Map();
+
+/** يعيد القناة المُدارة الحالية لهذا الـ topic إن وُجدت (للتشخيص/الاختبار) */
+export function getManagedChannel(topic) {
+  return managedChannels.get(topic) || null;
+}
+
 /**
  * ينشئ قناة Realtime تعيد الاشتراك تلقائياً عند أي خطأ/انقطاع.
+ *
+ * ⚠️ نمط Singleton: إن وُجدت قناة مُدارة نشطة بنفس الـ topic تُغلَق أولاً،
+ * فلا تتكرّر القنوات على الـ socket الواحد أبداً.
  *
  * @param {object} supabase
  * @param {object} options
@@ -100,7 +122,6 @@ function jitter(ms) {
  * @param {number} [options.maxRetries=8]
  * @param {number} [options.minDelayMs=1200]
  * @param {number} [options.maxDelayMs=30000]
- * @returns {{channel:any, ready:Promise<any>, rebuild:()=>Promise<any>, stop:()=>void, topic:string}}
  */
 export function createResilientChannel(supabase, options = {}) {
   const {
@@ -114,10 +135,16 @@ export function createResilientChannel(supabase, options = {}) {
     maxDelayMs = 30000,
   } = options;
 
+  // Singleton: أغلق أي نسخة سابقة بنفس الـ topic قبل إنشاء الجديدة
+  const previous = managedChannels.get(topic);
+  if (previous && !previous.stopped) previous.stop();
+
   let channel = null;
   let stopped = false;
   let attempt = 0;
+  let failed = false;
   let retryTimer = null;
+  let generation = 0; // يزداد مع كل بناء/إيقاف — لإبطال الاستدعاءات القديمة
   let queue = Promise.resolve();
 
   const handle = {
@@ -125,8 +152,15 @@ export function createResilientChannel(supabase, options = {}) {
     get channel() {
       return channel;
     },
+    get stopped() {
+      return stopped;
+    },
+    get failed() {
+      return failed;
+    },
     ready: null,
     rebuild: null,
+    ensureHealthy: null,
     stop: null,
   };
 
@@ -154,7 +188,8 @@ export function createResilientChannel(supabase, options = {}) {
   function scheduleRetry() {
     if (stopped || retryTimer) return;
     if (attempt >= maxRetries) {
-      log(`توقّفت محاولات إعادة الاشتراك بعد ${maxRetries} محاولة — سيُعاد عند العودة للمقدمة`);
+      failed = true;
+      log(`توقّفت المحاولات التلقائية بعد ${maxRetries} محاولة — تُعاد عند الحاجة (rebuild)`);
       return;
     }
     const delay = jitter(Math.min(maxDelayMs, minDelayMs * 2 ** attempt));
@@ -167,24 +202,35 @@ export function createResilientChannel(supabase, options = {}) {
 
   async function build() {
     if (stopped) return null;
+    const gen = ++generation;
 
-    // removeChannel غير متزامنة — لا تُنشئ قناة بنفس الـ topic قبل إغلاق القديمة
-    const previous = channel;
+    // إزالة القناة القديمة: قد تُطلق CLOSED عليها — لكن استدعاءاتها صارت
+    // قديمة (channel = null) فيتجاهلها حارس الإلغاء أدناه.
+    const old = channel;
     channel = null;
-    if (previous) {
+    if (old) {
       try {
-        await supabase.removeChannel(previous);
+        await supabase.removeChannel(old);
       } catch (error) {
         log("تعذّر إغلاق القناة القديمة", error);
       }
     }
-    if (stopped) return null;
+    if (stopped || gen !== generation) return null;
+
+    // لا تُنشئ قناة بنفس الـ topic قبل اكتمال إزالة القديمة (سباق Singleton)
+    if (pendingRemovals.has(topic)) {
+      await pendingRemovals.get(topic);
+      if (stopped || gen !== generation) return null;
+    }
 
     const ch = supabase.channel(topic, config);
     channel = ch;
     attach(ch);
 
     ch.subscribe((status, error) => {
+      // حارس الإلغاء: تجاهل أي حدث من قناة أُزيلت أو استُبدلت أو أُوقفت
+      if (stopped || gen !== generation || ch !== channel) return;
+
       try {
         onStatus?.(status, error, ch);
       } catch (callbackError) {
@@ -193,6 +239,7 @@ export function createResilientChannel(supabase, options = {}) {
 
       if (status === "SUBSCRIBED") {
         attempt = 0;
+        failed = false;
         return;
       }
       if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
@@ -204,9 +251,14 @@ export function createResilientChannel(supabase, options = {}) {
     return ch;
   }
 
-  handle.rebuild = () => {
+  /** إعادة بناء صريحة: تُصفِّر العدّاد وتتجاوز حد المحاولات */
+  handle.rebuild = ({ force = false } = {}) => {
     if (stopped) return Promise.resolve(null);
+    if (!force && isChannelAlive(supabase, channel) && channelState(channel) === "joined") {
+      return Promise.resolve(channel);
+    }
     attempt = 0;
+    failed = false;
     if (retryTimer) {
       clearTimeout(retryTimer);
       retryTimer = null;
@@ -215,23 +267,42 @@ export function createResilientChannel(supabase, options = {}) {
     return queue;
   };
 
+  /** يعيد البناء فقط إن كانت القناة ميتة — لا يمسّ القناة السليمة */
+  handle.ensureHealthy = () => {
+    if (stopped) return Promise.resolve(null);
+    if (isChannelAlive(supabase, channel)) return Promise.resolve(channel);
+    return handle.rebuild({ force: true });
+  };
+
   handle.stop = () => {
+    if (stopped) return;
     stopped = true;
+    generation += 1;
     if (retryTimer) {
       clearTimeout(retryTimer);
       retryTimer = null;
     }
+    if (managedChannels.get(topic) === handle) managedChannels.delete(topic);
     const ch = channel;
     channel = null;
     if (ch) {
+      let removal;
       try {
-        supabase.removeChannel(ch);
+        removal = Promise.resolve(supabase.removeChannel(ch)).catch((error) => {
+          log("تعذّر إغلاق القناة", error);
+        });
       } catch (error) {
         log("تعذّر إغلاق القناة", error);
+        removal = Promise.resolve();
       }
+      const tracked = removal.finally(() => {
+        if (pendingRemovals.get(topic) === tracked) pendingRemovals.delete(topic);
+      });
+      pendingRemovals.set(topic, tracked);
     }
   };
 
+  managedChannels.set(topic, handle);
   handle.ready = build();
 
   return handle;
@@ -240,19 +311,20 @@ export function createResilientChannel(supabase, options = {}) {
 /**
  * نبضة يقظة (Watchdog) لاتصال Realtime.
  *
- * لا تعتمد على `visibilitychange` فقط، لأن التبويب المجمّد (Frozen) لا يستقبل
- * أحداثاً أصلاً. تعمل بمؤقت متكيّف: سريع في المقدمة، بطيء في الخلفية (حيث
- * تُخنَق المؤقتات إلى نبضة/دقيقة، لذا 45 ثانية عملية تماماً).
+ * تعمل بمؤقت متكيّف: سريع في المقدمة، بطيء في الخلفية. وعمليات الإحياء
+ * تتراجع أُسّياً (reviveCooldownMs × 2^n حتى maxReviveCooldownMs) إن لم تعُد
+ * القنوات سليمة — فلا تتحول قناة معطوبة إلى حلقة إحياء كل 30 ثانية.
  *
  * @param {object} options
  * @param {object} options.supabase
  * @param {() => boolean} [options.isEnabled]
- * @param {(reason:string) => any} [options.onRevive]  إعادة بناء الاشتراكات + مزامنة
+ * @param {(reason:string) => any} [options.onRevive]
  * @param {(info:object) => void} [options.onConnectionLost]
  * @param {number} [options.visibleIntervalMs=20000]
  * @param {number} [options.hiddenIntervalMs=45000]
- * @param {number} [options.lostThreshold=2]           عدد النبضات قبل إعلان الفقد
+ * @param {number} [options.lostThreshold=2]
  * @param {number} [options.reviveCooldownMs=30000]
+ * @param {number} [options.maxReviveCooldownMs=300000]
  */
 export function startRealtimeWatchdog(options = {}) {
   const {
@@ -264,12 +336,14 @@ export function startRealtimeWatchdog(options = {}) {
     hiddenIntervalMs = 45000,
     lostThreshold = 2,
     reviveCooldownMs = 30000,
+    maxReviveCooldownMs = 300000,
   } = options;
 
   let timer = null;
   let stopped = false;
   let misses = 0;
   let lastReviveAt = 0;
+  let reviveFailures = 0;
 
   function schedule() {
     if (stopped) return;
@@ -281,9 +355,11 @@ export function startRealtimeWatchdog(options = {}) {
 
   async function revive(reason) {
     if (typeof onRevive !== "function") return;
-    if (Date.now() - lastReviveAt < reviveCooldownMs) return;
+    const cooldown = Math.min(reviveCooldownMs * 2 ** reviveFailures, maxReviveCooldownMs);
+    if (Date.now() - lastReviveAt < cooldown) return;
     lastReviveAt = Date.now();
-    console.warn(`[realtime:watchdog] إحياء الاتصال (${reason})`);
+    reviveFailures += 1;
+    console.warn(`[realtime:watchdog] إحياء الاتصال (${reason}) — محاولة #${reviveFailures}`);
     try {
       await onRevive(reason);
     } catch (error) {
@@ -315,7 +391,12 @@ export function startRealtimeWatchdog(options = {}) {
         } else {
           misses = 0;
           const report = diagnoseRealtime(supabase);
-          if (report.unhealthy.length) await revive("channel-unhealthy");
+          if (report.unhealthy.length) {
+            await revive("channel-unhealthy");
+          } else {
+            // كل شيء سليم ⇒ صفّر تراجع الإحياء
+            reviveFailures = 0;
+          }
         }
       }
     } catch (error) {
@@ -339,6 +420,9 @@ export function startRealtimeWatchdog(options = {}) {
     },
     get lastReviveAt() {
       return lastReviveAt;
+    },
+    get reviveFailures() {
+      return reviveFailures;
     },
   };
 }
