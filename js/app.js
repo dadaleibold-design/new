@@ -35,6 +35,8 @@ import {
   startCallWith,
   isIncomingCallChannelAlive,
 } from "./calls.js";
+// عزل التنبيهات (v2.9): لا صوت ولا إشعار إلا لطرف مباشر في المحادثة
+import { shouldAlertForMessage, isConversationParty } from "./notification-scope.js";
 import {
   showPermissionCardIfNeeded,
   ensureNotificationsReady,
@@ -81,6 +83,8 @@ const state = {
 
   contacts: [],
   contactRowsByConversation: {},
+  // أطراف كل محادثة (conversationId → {user_id, admin_id}) — لقرار الإشعارات الصامتة
+  conversationParties: {},
 
   activeConversation: null,
   messages: [],
@@ -262,6 +266,7 @@ async function boot() {
       stopHiddenCatchUp();
       clearPendingRoutes();
       state.unreadByConversation = {};
+      state.conversationParties = {};
       try {
         state.tokenRefreshUnsub?.();
       } catch {
@@ -1613,6 +1618,8 @@ async function openConversationById(conversationId, { messageId = null, attempt 
     return false;
   }
 
+  rememberConversationParties(data);
+
   const otherId = data.user_id === state.me.id ? data.admin_id : data.user_id;
 
   // الاسم/الصورة من القائمة المحلية إن وُجدت، وإلا من الشبكة
@@ -2469,6 +2476,7 @@ function renderContactsFromCache(cached) {
 
 async function loadContactsFromNetwork() {
   state.contactRowsByConversation = {};
+  state.conversationParties = {};
 
   if (!state.me.is_admin) {
     // المستخدم العادي: قائمة المشرفين + عدّاد غير المقروء + ترتيب حسب آخر تفاعل
@@ -2483,6 +2491,8 @@ async function loadContactsFromNetwork() {
 
     const convByAdmin = new Map((myConvs || []).map((c) => [c.admin_id, c]));
     const convIds = (myConvs || []).map((c) => c.id);
+    // المستخدم العادي: محادثاته هو (user_id = أنا) — تُحفظ الأطراف لقرار الإشعارات
+    (myConvs || []).forEach((c) => rememberConversationParties({ ...c, user_id: state.me.id }));
     const unreadByConversation = await fetchUnreadCounts(convIds);
 
     state.contacts = (adminProfiles || [])
@@ -2563,6 +2573,9 @@ async function loadContactsFromNetwork() {
       convsError = fallback.error;
     }
 
+    // أطراف كل المحادثات (سوبر أدمن = كل المحادثات، مشرف = محادثاته فقط)
+    (convs || []).forEach((c) => rememberConversationParties(c));
+
     // السوبر أدمن: اسم المشرف المالك لكل محادثة (من الـ join أو من قائمة المشرفين)
     const adminNameById = new Map((otherAdmins || []).map((a) => [a.id, a.display_name]));
     adminNameById.set(state.me.id, state.me.display_name);
@@ -2585,6 +2598,7 @@ async function loadContactsFromNetwork() {
     (adminConvs || []).forEach((c) => {
       const peer = c.user_id === state.me.id ? c.admin_id : c.user_id;
       adminConvByPeer.set(peer, c);
+      rememberConversationParties(c);
     });
     const adminConvIds = [...adminConvByPeer.values()].map((c) => c.id).filter((id) => !conversationIds.includes(id));
     const adminUnread = await fetchUnreadCounts(adminConvIds);
@@ -3080,6 +3094,29 @@ function placeRowByTime(row) {
 }
 
 /**
+ * تذكّر طرفي المحادثة (user_id / admin_id) محلياً — يُستخدم في قرار الإشعار
+ * الصامت: لا صوت ولا إشعار إلا إذا كان المستخدم الحالي أحد هذين الطرفين.
+ */
+function rememberConversationParties(conversation) {
+  if (!conversation?.id) return;
+  state.conversationParties[conversation.id] = {
+    user_id: conversation.user_id || null,
+    admin_id: conversation.admin_id || null,
+  };
+}
+
+/**
+ * هل نحن «مراقب» لهذه المحادثة (نراها لأننا مشرف عام، ولَسنا طرفاً فيها)؟
+ * تُستخدم لتجميد كل ما يغيّر حالة أصحابها الحقيقيين (قراءة/تسليم) أثناء المراقبة.
+ * تُعيد false إن كانت الأطراف غير معروفة محلياً — فلا نغيّر أي سلوك قائم.
+ */
+function isObserverOfConversation(conversationId) {
+  const parties = state.conversationParties[conversationId];
+  if (!parties || !state.me?.id) return false;
+  return !isConversationParty(parties, state.me.id);
+}
+
+/**
  * زيادة فورية لعدّاد غير المقروء عند وصول رسالة (قبل أي طلب شبكة).
  * المصدر الرسمي للعدّاد يبقى قاعدة البيانات، ويُصحَّح عبر refreshUnreadBadges.
  */
@@ -3191,6 +3228,10 @@ async function openConversation(otherProfile, { messageId = null } = {}) {
       if (existing) {
         conversationId =
           existing.id;
+
+        rememberConversationParties(
+          existing
+        );
       } else {
         const {
           data: created,
@@ -3210,6 +3251,10 @@ async function openConversation(otherProfile, { messageId = null } = {}) {
 
         conversationId =
           created.id;
+
+        rememberConversationParties(
+          created
+        );
       }
     }
 
@@ -5751,7 +5796,14 @@ function subscribeToConversation(
           cacheMessages(conversationId, [payload.new]);
 
           if (payload.new.sender_id !== state.me.id) {
-            if (payload.new.message_type !== "call") playNotificationSound();
+            // لا صوت إلا لرسالة في محادثة أنا طرف مباشر فيها (وضع المراقبة صامت)
+            const scope = shouldAlertForMessage({
+              message: payload.new,
+              conversation: state.conversationParties[conversationId] || null,
+              meId: state.me.id,
+              isSuperAdmin: Boolean(state.me.is_super_admin),
+            });
+            if (scope.alert) playNotificationSound();
 
             if (document.visibilityState === "visible") {
               // فتح المحادثة = قراءة: صفّر العدّاد فوراً وثبّتها على الخادم
@@ -5941,6 +5993,11 @@ function markLocalMessagesRead(conversationId) {
 async function markConversationRead(conversationId, { force = false } = {}) {
   if (!conversationId || !state.me) return false;
 
+  // وضع المراقبة (v2.9): اطلاع المشرف العام على محادثة ليس طرفاً فيها لا
+  // يغيّر حالة قراءة أصحابها — وإلا كتم إشعاراتهم وشاراتهم بصمت.
+  // (نفس الحراسة مفروضة في الخادم داخل mark_conversation_read.)
+  if (isObserverOfConversation(conversationId)) return false;
+
   resetUnreadFor(conversationId);
   closeConversationNotifications(conversationId);
   queuePendingRead(conversationId);
@@ -6002,6 +6059,10 @@ const deliveredRequestsInFlight = new Map();
 
 async function markMessagesDelivered(conversationId, { force = false } = {}) {
   if (!conversationId || !state.me || !state.isOnline) return false;
+
+  // وضع المراقبة (v2.9): لا نثبّت ✓✓ لرسائل لا تخصّنا — العلامة تخص المستقبِل
+  if (isObserverOfConversation(conversationId)) return false;
+
   if (!force && deliveredRequestsInFlight.has(conversationId)) {
     return deliveredRequestsInFlight.get(conversationId);
   }
@@ -6403,10 +6464,19 @@ function subscribeGlobalMessageWatch() {
             return;
           }
 
-          // RLS تضمن أن الرسائل الواصلة هنا تخص محادثات المستخدم فقط
+          // RLS تسمح للمشرف العام بمراقبة كل الرسائل — لكن التنبيه يبقى مقصوراً
+          // على محادثاتنا المباشرة (الطرف الآخر) وإلا تحوّل الهاتف إلى جهاز
+          // تنبيهات لكل النظام: تحديث القائمة نعم، صوت/إشعار لا (الوضع الصامت).
           bumpUnreadBadge(msg.conversation_id, preview, lastAt);
 
-          if (msg.message_type !== "call") {
+          const scope = shouldAlertForMessage({
+            message: msg,
+            conversation: state.conversationParties[msg.conversation_id] || null,
+            meId: state.me.id,
+            isSuperAdmin: Boolean(state.me.is_super_admin),
+          });
+
+          if (scope.alert) {
             playNotificationSound();
             void showLocalMessageNotification(msg);
           }
@@ -6519,6 +6589,15 @@ async function showLocalMessageNotification(msg) {
     ) {
       return;
     }
+
+    // بوابة أخيرة: لا إشعار لرسالة لست طرفاً مباشراً في محادثتها (مراقبة صامتة)
+    const scope = shouldAlertForMessage({
+      message: msg,
+      conversation: state.conversationParties[msg.conversation_id] || null,
+      meId: state.me.id,
+      isSuperAdmin: Boolean(state.me.is_super_admin),
+    });
+    if (!scope.alert) return;
 
     const sender = state.contacts.find((c) => c.id === msg.sender_id);
     const title = sender?.display_name || "رسالة جديدة";

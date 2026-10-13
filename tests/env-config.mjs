@@ -53,6 +53,7 @@ const SOURCE_FILES = [
   "js/media.js",
   "js/notifications.js",
   "js/notification-router.js",
+  "js/notification-scope.js",
   "js/push-policy.js",
   "js/push.js",
   "js/realtime.js",
