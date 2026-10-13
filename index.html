@@ -16,8 +16,14 @@
   <link rel="manifest" href="./manifest.json" crossorigin="use-credentials">
   <link rel="icon" type="image/x-icon" href="./icons/icon.png">
   <meta name="theme-color" content="#111b21" />
-  <link rel="stylesheet" href="./css/style.css?v=25" />
+  <link rel="stylesheet" href="./css/style.css?v=28" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!--
+    متغيرات البيئة وقت التشغيل: ملف مُولَّد (غير مُتتبَّع في Git) يضبط self.__ENV__
+    بالأسماء VITE_* نفسها. على Vite تُقرأ القيم من import.meta.env مباشرة.
+    توليد الملف: npm run env:generate  (انظر .env.example)
+  -->
+  <script src="./env.js"></script>
 </head>
 
 <body data-theme="dark">
@@ -25,6 +31,25 @@
 <!-- شاشة تحميل أولية: تمنع ظهور شاشة الدخول للحظة قبل التحقق من الجلسة المخزنة -->
 <div id="boot-loading" class="boot-loading">
   <div class="boot-spinner"></div>
+</div>
+
+<!-- ================= شاشة إعداد البيئة (تظهر فقط عند غياب متغيرات البيئة) ================= -->
+<div id="config-error" class="config-error hidden" role="alert">
+  <div class="config-error-card">
+    <h1>⚙️ إعداد البيئة غير مكتمل</h1>
+    <p>
+      لم يجد التطبيق مفاتيح Supabase/Firebase. لا تُكتب هذه القيم داخل الكود —
+      بل تُضبط في متغيرات البيئة ثم تُولَّد إلى ملف <code>env.js</code>.
+    </p>
+    <p id="config-error-detail" class="config-error-detail"></p>
+    <ul id="config-error-list"></ul>
+    <ol class="config-error-steps">
+      <li>انسخ <code>.env.example</code> إلى <code>.env</code> ثم املأ القيم (مفاتيح عامة فقط).</li>
+      <li>شغّل <code>npm run env:generate</code> لتوليد <code>env.js</code> في جذر الموقع.</li>
+      <li>أو استخدم Vite (<code>npm run dev</code> / <code>npm run build</code>) لقراءة القيم من <code>.env</code> تلقائياً.</li>
+      <li>ثم أعد تحميل الصفحة (Ctrl+Shift+R).</li>
+    </ol>
+  </div>
 </div>
 
 <!-- ================= AUTH SCREEN ================= -->
@@ -111,6 +136,17 @@
     </div>
 
     <div id="contact-list-wrap">
+      <!-- دليل المستخدمين (للمشرف): كل المسجّلين + بحث حي + بدء محادثة فورية -->
+      <div id="directory-heading" class="section-heading directory-heading hidden">
+        <span id="directory-heading-text" data-i18n="directory">كل المستخدمين المسجّلين</span>
+        <span id="directory-count" class="directory-count hidden">0</span>
+        <button type="button" id="directory-close" class="directory-close" data-i18n-title="directory_close" title="إغلاق الدليل" aria-label="إغلاق الدليل">✕</button>
+      </div>
+      <div id="directory-section" class="hidden"></div>
+      <div id="directory-footer" class="directory-footer hidden">
+        <button type="button" id="directory-more" data-i18n="directory_show_more">عرض المزيد</button>
+      </div>
+
       <!-- المستخدم العادي: قائمة مسطحة -->
       <div id="contact-list"></div>
 
@@ -163,7 +199,7 @@
 <audio id="notification-sound" src="./icons/notify.mp3" preload="auto"></audio>
 <div id="global-toast" class="global-toast hidden"></div>
 
-<script type="module" src="./js/app.js?v=26"></script>
+<script type="module" src="./js/app.js?v=28"></script>
 
 </body>
 </html>

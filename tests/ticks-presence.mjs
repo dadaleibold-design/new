@@ -13,6 +13,7 @@
  * التشغيل:  node tests/ticks-presence.mjs
  */
 import { register } from "node:module";
+import { installTestEnv } from "./test-env.mjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -196,7 +197,10 @@ function createEnv({ online = true, messages = [] } = {}) {
   return { window, document: window.document, errors, realtimeHandlers, rpcCalls, profileUpdates };
 }
 
-const importApp = (tag) => import(`file://${path.join(ROOT, "js/app.js")}?scenario=${tag}`);
+const importApp = (tag) => {
+  installTestEnv(globalThis.window);
+  return import(`file://${path.join(ROOT, "js/app.js")}?scenario=${tag}`);
+};
 
 /* ------------------------------------------------------------------
  * 1) علامات حالة الرسالة

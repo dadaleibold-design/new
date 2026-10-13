@@ -1,5 +1,4 @@
 import { supabase } from "./supabaseClient.js";
-import { isAdminEmail } from "./config.js";
 
 /* ============================================================
  * منطق المصادقة
@@ -86,11 +85,9 @@ export async function signUp({ email, password, displayName, phone }) {
   if (!name) throw new Error("اسم المستخدم مطلوب.");
   if (!password || password.length < 6) throw new Error("كلمة المرور يجب ألا تقل عن 6 أحرف.");
 
+  // حساب بالبريد = مرشّح للوظيفة الإدارية، والقرار النهائي لقاعدة البيانات:
+  // الدالة is_admin_email() هي التي تمنح is_admin عند إنشاء الصف (لا قائمة في الواجهة).
   const adminSignup = Boolean(normalizedEmail);
-
-  if (adminSignup && !isAdminEmail(normalizedEmail)) {
-    throw new Error("البريد الإلكتروني مخصص للمشرفين المعتمدين فقط. سجّل برقم الهاتف كمستخدم.");
-  }
 
   if (!adminSignup) {
     if (!normalizedPhone) throw new Error("رقم الهاتف مطلوب لإنشاء حساب مستخدم.");
@@ -106,7 +103,7 @@ export async function signUp({ email, password, displayName, phone }) {
       data: {
         display_name: name,
         phone: normalizedPhone || null,
-        account_type: adminSignup ? "admin" : "user",
+        account_type: adminSignup ? "email" : "user",
       },
     },
   });
@@ -132,12 +129,13 @@ export async function signUp({ email, password, displayName, phone }) {
       );
   }
 
-  return { ...data, authEmail, accountType: adminSignup ? "admin" : "user" };
+  return { ...data, authEmail, accountType: adminSignup ? "email" : "user" };
 }
 
 /**
  * تسجيل الدخول.
- *  - identity يحوي "@"  ⇒ بريد مشرف ⇒ يجب أن يكون معتمداً وأن يكون الحساب is_admin.
+ *  - identity يحوي "@"  ⇒ بريد إلكتروني (مسار المشرفين): تُرفض المحاولة إن لم
+ *    يكن الحساب `is_admin`/`is_super_admin` في قاعدة البيانات (لا قائمة في الواجهة).
  *  - غير ذلك ⇒ رقم هاتف ⇒ مستخدم عادي.
  * يُرجع { session, user, role }.
  */
@@ -151,9 +149,6 @@ export async function signIn({ identity, password }) {
 
   if (emailLogin) {
     const email = value.toLowerCase();
-    if (!isAdminEmail(email)) {
-      throw new Error("تسجيل الدخول بالبريد متاح للمشرفين المعتمدين فقط — استخدم رقم الهاتف.");
-    }
     const res = await supabase.auth.signInWithPassword({ email, password });
     if (res.error) throw friendlyAuthError(res.error);
     data = res.data;
@@ -192,7 +187,7 @@ export async function signIn({ identity, password }) {
 
   if (emailLogin && profile && !profile.is_admin && !profile.is_super_admin) {
     await supabase.auth.signOut();
-    throw new Error("هذا الحساب ليس مشرفاً — لا يمكن الدخول بالبريد الإلكتروني.");
+    throw new Error("هذا الحساب ليس مشرفاً — الدخول بالبريد متاح للحسابات الممنوحة is_admin في قاعدة البيانات فقط. استخدم رقم الهاتف.");
   }
 
   try {

@@ -1,10 +1,24 @@
 // supabase/functions/send-push/index.ts
 // Sends Firebase Cloud Messaging notifications for newly inserted messages.
-// Required Edge Function secrets:
-//   FIREBASE_PROJECT_ID
-//   FIREBASE_CLIENT_EMAIL
-//   FIREBASE_PRIVATE_KEY  (the service-account PEM; escaped \n is supported)
-//   SEND_PUSH_SECRET      (shared secret used by the database trigger)
+//
+// أنواع الطلبات المدعومة:
+//   • (افتراضي) رسالة جديدة        — message_id / conversation_id / sender_id
+//   • test                          — إشعار تجريبي للمستخدم الحالي (JWT)
+//   • probe                         — مسبار مسار الخلفية من قاعدة البيانات
+//   • incoming_call / call_ended    — من trigger على call_rooms
+//   • new_user                      — من trigger على profiles: يُشعر **كل المشرفين**
+//                                     (is_admin أو is_super_admin غير محظورين) على
+//                                     كل أجهزتهم بأن مستخدماً جديداً سجّل في النظام.
+//
+// كل الأسرار تُقرأ حصرياً من Deno.env.get() — لا مفتاح واحد داخل الكود:
+//
+// Required (one of the two Firebase forms):
+//   • FIREBASE_SERVICE_ACCOUNT — كامل JSON لحساب الخدمة (يُفضّل: سرّ واحد)
+//   • أو الحقول منفصلة: FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL +
+//     FIREBASE_PRIVATE_KEY  (PEM؛ يدعم \n مُهرَّبة — يُعاد تحويلها لأسطر حقيقية)
+//   SEND_PUSH_SECRET      — السرّ المشترك الذي يستخدمه trigger قاعدة البيانات
+//                           (نفس قيمة Vault: SEND_PUSH_SECRET؛ والرابط المقابل
+//                           محفوظ في Vault باسم SEND_PUSH_URL)
 // Optional:
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
@@ -21,16 +35,71 @@ import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID");
-const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL");
-const FIREBASE_PRIVATE_KEY = Deno.env.get("FIREBASE_PRIVATE_KEY")?.replace(/\\n/g, "\n");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
+
+/** حقول حساب خدمة Firebase كما تظهر في ملف JSON الرسمي */
+interface ServiceAccount {
+  project_id?: string;
+  client_email?: string;
+  private_key?: string;
+}
+
+/**
+ * يعيد مفتاح PEM إلى صيغته الصحيحة: الأسرار تُخزَّن غالباً في سطر واحد
+ * مع `\n` مُهرَّبة، فيجب تحويلها إلى أسطر حقيقية قبل importPKCS8.
+ */
+function normalizePrivateKey(value?: string | null): string | undefined {
+  const key = typeof value === "string" ? value.trim() : "";
+  if (!key) return undefined;
+  return key.replace(/\\n/g, "\n");
+}
+
+/**
+ * يقرأ FIREBASE_SERVICE_ACCOUNT (JSON كامل) — ويدعم أيضاً تمريره Base64.
+ * لا يُسجَّل أي جزء من قيمته في السجلات.
+ */
+function loadServiceAccount(): ServiceAccount {
+  const raw = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
+  if (!raw) return {};
+
+  const attempts: string[] = [raw];
+  if (!raw.trim().startsWith("{")) {
+    try {
+      attempts.push(atob(raw.trim()));
+    } catch {
+      /* ليست Base64 — نكتفي بالمحاولة الأولى */
+    }
+  }
+
+  for (const candidate of attempts) {
+    try {
+      const parsed = JSON.parse(candidate) as ServiceAccount;
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      /* جرّب الصيغة التالية */
+    }
+  }
+
+  console.error("[send-push] FIREBASE_SERVICE_ACCOUNT is not valid JSON — ignoring it");
+  return {};
+}
+
+const SERVICE_ACCOUNT = loadServiceAccount();
+
+const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") || SERVICE_ACCOUNT.project_id;
+const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") || SERVICE_ACCOUNT.client_email;
+const FIREBASE_PRIVATE_KEY = normalizePrivateKey(
+  Deno.env.get("FIREBASE_PRIVATE_KEY") || SERVICE_ACCOUNT.private_key
+);
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
 }
 if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-  throw new Error("Firebase service-account secrets are not configured");
+  throw new Error(
+    "Firebase secrets are not configured: provide FIREBASE_SERVICE_ACCOUNT " +
+      "(full service-account JSON) or FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY"
+  );
 }
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
@@ -163,6 +232,7 @@ async function sendToFcm(
 type DeviceRow = {
   id: string;
   token: string;
+  user_id?: string | null;
   platform?: string | null;
   device_id?: string | null;
   device_info?: Record<string, unknown> | null;
@@ -201,6 +271,53 @@ async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
     `[send-push] recipient=${userId.slice(0, 8)}… devices=${rows.length} [${devices.join(", ")}]`,
   );
   return rows;
+}
+
+/**
+ * كل توكنات مجموعة مستخدمين في طلب واحد.
+ * يُستخدم للإشعار الجماعي (مستخدم جديد → كل المشرفين) بدل طلب لكل مشرف.
+ */
+async function loadDeviceTokensForUsers(userIds: string[]): Promise<DeviceRow[]> {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  if (!ids.length) return [];
+
+  const { data, error } = await supabase
+    .from("fcm_tokens")
+    .select("id, token, user_id, platform, device_id, device_info")
+    .in("user_id", ids);
+  if (error) throw error;
+
+  const seen = new Set<string>();
+  const rows: DeviceRow[] = [];
+  for (const row of (data || []) as DeviceRow[]) {
+    if (!row.token || seen.has(row.token)) continue;
+    seen.add(row.token);
+    rows.push(row);
+  }
+
+  const devicesByUser = new Map<string, number>();
+  rows.forEach((r) => {
+    const key = String(r.user_id || "?");
+    devicesByUser.set(key, (devicesByUser.get(key) || 0) + 1);
+  });
+  console.log(
+    `[send-push] bulk recipients=${ids.length} devices=${rows.length} ` +
+      `[${[...devicesByUser.entries()].map(([u, n]) => `${u.slice(0, 8)}:${n}`).join(", ")}]`,
+  );
+  return rows;
+}
+
+/** كل المشرفين النشطين (غير المحظورين) — مستلمو إشعار "مستخدم جديد" */
+async function loadAdminIds(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, is_admin, is_super_admin, is_blocked")
+    .or("is_admin.eq.true,is_super_admin.eq.true");
+  if (error) throw error;
+
+  return (data || [])
+    .filter((row: any) => row?.id && row.is_blocked !== true)
+    .map((row: any) => String(row.id));
 }
 
 /**
@@ -379,6 +496,57 @@ Deno.serve(async (req) => {
 
       const results = await sendToAllDevices(tokens, data, { highPriority: true });
       return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
+    }
+
+    // --- إشعار المشرفين: مستخدم جديد سجّل في النظام (trigger على public.profiles) ---
+    // طلب واحد من القاعدة → إشعار لكل المشرفين على كل أجهزتهم.
+    if (input.type === "new_user") {
+      const userId = String(input.user_id || "");
+      if (!userId) return json({ error: "user_id required" }, 400);
+
+      const adminIds = (await loadAdminIds()).filter((id) => id !== userId);
+      if (!adminIds.length) {
+        console.log("[send-push] new_user: لا يوجد مشرف نشط — تم تخطّي الإشعار");
+        return json({ sent: 0, total: 0, admins: 0, skipped: "no admins" });
+      }
+
+      const name = String(input.display_name || "").trim() || "مستخدم جديد";
+      const email = String(input.email || "").trim();
+      const phone = String(input.phone || "").trim();
+      const contact = email || phone;
+      const isStaff = input.is_admin === true;
+
+      const data: Record<string, string> = {
+        type: "new_user",
+        // مفتاح التوجيه: نقرة الإشعار تفتح (أو تُنشئ) محادثة مباشرة مع المستخدم الجديد
+        userId,
+        title: isStaff ? `🛡️ مشرف جديد: ${name}` : `👤 مستخدم جديد: ${name}`,
+        body: contact
+          ? `انضم إلى التطبيق — ${contact} — اضغط لبدء محادثة`
+          : "انضم إلى التطبيق الآن — اضغط لبدء محادثة",
+        createdAt: String(input.created_at || ""),
+      };
+
+      const tokens = await loadDeviceTokensForUsers(adminIds);
+      if (!tokens.length) {
+        console.log(
+          `[send-push] new_user: admins=${adminIds.length} devices=0 (لم يُفعّل أي مشرف الإشعارات)`,
+        );
+        return json({ sent: 0, total: 0, admins: adminIds.length, skipped: "no fcm token" });
+      }
+
+      console.log(
+        `[send-push] new_user user=${userId.slice(0, 8)}… admins=${adminIds.length} devices=${tokens.length}`,
+      );
+      // أولوية عالية: الإشعار يخص حدثاً لحظياً (مستخدم جديد الآن)
+      const results = await sendToAllDevices(tokens, data, { highPriority: true });
+      return json({
+        admins: adminIds.length,
+        sent: results.filter((r) => r.ok).length,
+        total: results.length,
+        removed: results.filter((r) => r.removed).length,
+        results,
+      });
     }
 
     const messageId = String(input.message_id || "");

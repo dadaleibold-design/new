@@ -2,6 +2,7 @@
 import { register } from "node:module";
 register("./hooks.mjs", import.meta.url);
 import { JSDOM } from "jsdom";
+import { installTestEnv } from "./test-env.mjs";
 import fs from "fs";
 import path from "path";
 const ROOT = path.resolve(new URL(".", import.meta.url).pathname, "..");
@@ -34,6 +35,8 @@ const mkq = (table) => {
   ["select","eq","neq","in","or","gt","gte","lt","order","limit","insert","update","upsert","delete"].forEach(m => q[m] = (...a)=>{ calls.push(table+"."+m); st.filters.push([m,...a]); return q; });
   const resolve = () => {
     if (table==="profiles") {
+      // قائمة المشرفين تأتي من قاعدة البيانات (is_admin/is_super_admin) لا من قائمة بُرد ثابتة
+      if (st.filters.some(f=>f[0]==="or" && String(f[1]).includes("is_admin.eq.true"))) return ADMINS;
       if (st.filters.some(f=>f[0]==="in")) return ADMINS;
       if (st.filters.some(f=>f[0]==="eq" && f[1]==="is_admin")) return ADMINS;
       return [];
@@ -73,6 +76,7 @@ const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
 let fails = 0;
 const check = (name, cond, extra="") => { console.log((cond?"✅":"❌"), name, extra); if(!cond) fails++; };
 
+installTestEnv(window);
 await import(path.join(ROOT,"js/app.js"));
 await wait(1500);
 check("app shell visible", !document.getElementById("app-shell").classList.contains("hidden"));
