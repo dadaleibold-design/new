@@ -2,25 +2,52 @@
  * firebase-messaging-sw.js
  * Service Worker لإشعارات Firebase Cloud Messaging (Web Push).
  *
- * قواعد الموثوقية المطبَّقة:
- *  1) نقرة الإشعار: معالجنا مُسجَّل بمرحلة الالتقاط (capture) فيعمل قبل
- *     معالج Firebase SDK. الـ SDK يستدعي stopImmediatePropagation() عند
- *     عدم وجود رابط (fcm_options.link) فيبتلع النقرة — وهذا كان يمنع فتح
- *     المحادثة نهائياً. الآن نوقف الانتشار بأنفسنا ونعالج النقرة دائماً.
- *  2) الحمولة تأتي بأشكال متعددة: FCM_MSG (تغلّفها Firebase داخل
- *     notification.data)، أو data مباشرة. normalizePayload يوحّدها كلها —
- *     بما فيها بيانات النقرة (event.notification.data = { FCM_MSG: … }).
- *  3) منع التكرار بمفتاح الرسالة (messageId / roomId)، لا بالـ tag وحده.
- *     الـ tag وحده كان يُسقط رسالة جديدة إذا بقي إشعار سابق بنفس
- *     المحادثة في الصينية (الإشعار القديم يحمل نفس الـ tag).
- *  4) كل تسليم push يُنتج إشعاراً مرئياً عندما يكون التطبيق في الخلفية
- *     (شرط userVisibleOnly في Chrome/Android)، بما فيها إنهاء المكالمة.
- *  5) مكالمة فائتة لها tag خاص (missed-<room>) لا يستبدل إشعار المحادثة.
- *  6) pushsubscriptionchange → إعادة اشتراك + تنبيه التطبيق لتحديث التوكن.
+ * المبدأ الحاكم (SW_BUILD 2026-10-13.2):
+ *   «مصدر واحد يعرض الإشعار، والبقية تسجّل فقط».
+ *
+ *  1) الخادم (send-push) يرسل دفعة data-only للويب (بلا webpush.notification).
+ *     بذلك لا يعرض Firebase SDK إشعاراً تلقائياً بشكل لا نتحكم فيه (كان الإشعار
+ *     التلقائي يُبنى من حقل notification الخام، فيختلف عن حمولتنا، ثم كان منع
+ *     التكرار يُسقط نسختنا الصحيحة لصالح نسخة SDK الناقصة).
+ *  2) معالج `push` الخام في هذا الملف هو المسؤول الوحيد عن العرض. يعمل مع كل
+ *     دفعة (حتى لو فشل تحميل SDK)، ويعرض دائماً عندما لا توجد نافذة ظاهرة —
+ *     وهذا ما يستوفي شرط userVisibleOnly في Chrome/Android وSafari.
+ *  3) SDK.onBackgroundMessage يسجّل الاستلام فقط (تشخيص).
+ *  4) منع التكرار بهوية الحدث (messageId / roomId) لا بالـ tag وحده، مع قفل
+ *     تسلسلي ومهلة لكل عملية عرض كي لا يتجمّد الطابور فيُفقد كل ما يليه.
+ *  5) إن ظهرت نسخة ناقصة من SDK لنفس الحدث (بلا عنوان) تُستبدل بنسختنا الكاملة.
+ *  6) pushsubscriptionchange: SDK هو المسؤول عن التوكن؛ نكتفي بإبلاغ الصفحات.
+ *  7) سجلات تتبع واضحة بالبادئة [push-sw] لمعرفة هل تصل الدفعة من Google
+ *     أصلاً إلى الجهاز، ومن قرّر العرض أو التخطّي ولماذا.
  * ============================================================ */
 
-const SW_BUILD = "2026-10-12.1";
+const SW_BUILD = "2026-10-13.2";
+const LOG = "[push-sw]";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
+
+function swLog(step, info) {
+  try {
+    console.log(LOG, step, info === undefined ? "" : info);
+  } catch {
+    /* تجاهل */
+  }
+}
+function swWarn(step, info) {
+  try {
+    console.warn(LOG, step, info === undefined ? "" : info);
+  } catch {
+    /* تجاهل */
+  }
+}
+function swError(step, info) {
+  try {
+    console.error(LOG, step, info === undefined ? "" : info);
+  } catch {
+    /* تجاهل */
+  }
+}
+
+swLog("evaluating service worker", { build: SW_BUILD });
 
 let firebaseReady = false;
 
@@ -30,16 +57,19 @@ try {
     "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging-compat.js"
   );
   firebaseReady = true;
+  swLog("firebase sdk loaded");
 } catch (error) {
-  // شبكة مقطوعة / حجب / CSP: نُكمل بالمسار الاحتياطي المستقل بدل سقوط الـ SW
-  console.error("[messaging-sw] تعذّر تحميل Firebase SDK — سيُستخدم المسار الاحتياطي:", error);
+  // شبكة مقطوعة / حجب / CSP: المعالج الخام يكمل العرض وحده
+  swError("firebase sdk failed to load — raw push handler will render", String(error));
 }
 
 self.addEventListener("install", () => {
+  swLog("install → skipWaiting");
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
+  swLog("activate → clients.claim");
   event.waitUntil(self.clients.claim());
 });
 
@@ -48,8 +78,22 @@ self.addEventListener("message", (event) => {
 });
 
 /* ------------------------------------------------------------
- * أدوات مشتركة
+ * أدوات مساعدة
  * ---------------------------------------------------------- */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** يحوّل قيم الحمولة إلى نصوص (شرط FCM: data قيمها نصوص فقط) */
+function stringMap(source) {
+  const out = {};
+  if (!isObject(source)) return out;
+  for (const [key, value] of Object.entries(source)) {
+    if (value === null || value === undefined || typeof value === "object") continue;
+    out[key] = String(value);
+  }
+  return out;
+}
 
 /** يبني رابط التطبيق بالنسبة الصحيحة حتى لو كان مستضافاً على مسار فرعي */
 function appBaseUrl() {
@@ -81,64 +125,84 @@ function iconUrl(hint) {
   }
 }
 
+/* ------------------------------------------------------------
+ * توحيد الحمولة: مصدر واحد لكل أشكال الدفعة
+ * ---------------------------------------------------------- */
+
 /**
- * يوحّد شكل الحمولة من أي مصدر:
- *   • push خام من FCM:            { data:{…}, notification:{…} }
- *   • كائن إشعار معروض (SDK):     { data:{ FCM_MSG:{ data:{…}, notification:{…} } } }
- *   • حمولة onBackgroundMessage:  { data:{…}, notification:{…} }
+ * يبني الحمولة الموحّدة من أي شكل:
+ *   • دفعة push خام من FCM:        { data:{…}, notification?:{…}, fcmMessageId }
+ *   • كائن SDK المُغلّف:           { FCM_MSG:{ data:{…}, notification?:{…} } }
+ *   • حمولة onBackgroundMessage:   { data:{…}, messageId, notification? }
+ * الأولوية دائماً لـ data (عقدنا مع الخادم)، ثم لحقل notification (توافق رجعي).
  */
-function normalizePayload(raw = {}) {
-  const wrapped = raw?.FCM_MSG || raw?.data?.FCM_MSG || raw?.notification?.data?.FCM_MSG || null;
-  const source = wrapped ? { ...raw, ...wrapped } : raw;
+function fromPushPayload(raw) {
+  const src = isObject(raw) ? raw : {};
+  let inner = src;
+  if (isObject(src.FCM_MSG)) inner = src.FCM_MSG;
+  else if (isObject(src.data) && isObject(src.data.FCM_MSG)) inner = src.data.FCM_MSG;
 
-  const data = source?.data || source?.notification?.data || {};
-  const notification = source?.notification || {};
+  const data = stringMap(inner.data);
+  const note = isObject(inner.notification) ? inner.notification : {};
+  return buildPayload({
+    data,
+    title: data.title || note.title,
+    body: data.body || note.body,
+    icon: data.icon || note.icon,
+  });
+}
 
-  const conversationId = String(
-    data.conversationId || data.conversation_id || raw?.conversationId || raw?.conversation_id || ""
-  );
-  const messageId = String(data.messageId || data.message_id || raw?.messageId || raw?.message_id || "");
-  const type = String(data.type || raw?.type || "message");
-  const roomId = String(data.roomId || data.room_id || raw?.roomId || raw?.room_id || "");
+/** بيانات إشعار معروض (نقرة، أو notification.data): مسطّحة أو مُغلّفة بـ FCM_MSG */
+function fromNotificationData(notificationData) {
+  if (isObject(notificationData?.FCM_MSG)) {
+    return fromPushPayload({ FCM_MSG: notificationData.FCM_MSG });
+  }
+  const data = stringMap(notificationData);
+  return buildPayload({ data, title: data.title, body: data.body, icon: data.icon });
+}
 
+function buildPayload({ data, title, body, icon }) {
+  const type = data.type || "message";
+  const conversationId = data.conversationId || data.conversation_id || "";
+  const messageId = data.messageId || data.message_id || "";
+  const roomId = data.roomId || data.room_id || "";
   return {
-    data: { ...data, conversationId, messageId, type, roomId },
-    title: notification.title || data.title || raw?.title || "رسالة جديدة",
-    body: notification.body || data.body || raw?.body || "لديك رسالة جديدة",
-    icon: notification.icon || data.icon || raw?.icon || "",
+    data: { ...data, type, conversationId, messageId, roomId },
+    title: title || "رسالة جديدة",
+    body: body || "لديك رسالة جديدة",
+    icon: icon || "",
     conversationId,
     messageId,
     type,
     roomId,
     isCall: type === "incoming_call",
     isCallEnded: type === "call_ended",
-    isMessage: type === "new_message" || type === "message" || !type,
   };
 }
 
+/** بيانات إشعار موجود (من getNotifications) — تدعم النسخة المُغلّفة من SDK */
+function extractData(notificationData) {
+  if (isObject(notificationData?.FCM_MSG)) return stringMap(notificationData.FCM_MSG.data);
+  return stringMap(notificationData);
+}
+
 /**
- * tag الإشعار: يحدد أيّ إشعارات تستبدل بعضها على الجهاز.
- *   • رسائل المحادثة: tag لكل محادثة (تتجمّع كما في واتساب).
- *   • المكالمة الواردة: tag لكل غرفة (تُغلق عند انتهائها).
- *   • المكالمة الفائتة: tag منفصل — لا تستبدل إشعار الرسائل.
+ * مفتاح الهوية: كل إشعار يمثّل حدثاً واحداً (رسالة أو غرفة مكالمة).
+ * يُقارَن بالإشعارات المعروضة فعلاً وبالذاكرة القصيرة، لا بالـ tag وحده.
  */
+function identityKey(data = {}) {
+  if (data.messageId) return `msg:${data.messageId}`;
+  if (data.roomId) return `room:${data.roomId}`;
+  return "";
+}
+
+/** tag الإشعار: يحدد أيّ إشعارات تستبدل بعضها على الجهاز */
 function notificationTag(payload) {
   if (payload.isCall) return `call-${payload.roomId || payload.conversationId || "incoming"}`;
   if (payload.isCallEnded) return `missed-${payload.roomId || Date.now()}`;
   if (payload.conversationId) return `conversation-${payload.conversationId}`;
   if (payload.messageId) return `message-${payload.messageId}`;
   return `whatsapp-message-${Date.now()}`;
-}
-
-/**
- * مفتاح الهوية للمنع من التكرار: كل إشعار يُمثّل حدثاً واحداً (رسالة أو
- * غرفة مكالمة). يُقارَن بالإشعارات المعروضة فعلاً وليس بالـ tag.
- */
-function identityKey(data = {}) {
-  const d = data?.FCM_MSG?.data || data || {};
-  if (d.messageId || d.message_id) return `msg:${d.messageId || d.message_id}`;
-  if (d.roomId || d.room_id) return `room:${d.type || "call"}:${d.roomId || d.room_id}`;
-  return "";
 }
 
 function buildNotificationOptions(payload) {
@@ -174,77 +238,169 @@ function buildNotificationOptions(payload) {
 }
 
 /* ------------------------------------------------------------
- * العرض: تسلسل داخلي + منع تكرار بالهوية
+ * العرض: طابور تسلسلي + مهلة لكل عملية + ذاكرة قصيرة لمنع التكرار
  * ---------------------------------------------------------- */
 
-// المستمعان (Firebase SDK + المسار الاحتياطي) يعملان في نفس الـ SW؛ نُسلسل
-// فحص "هل عُرض؟" + "اعرض" كي لا يفحص كلاهما قبل أن يعرض أيّ منهما.
+const DISPLAY_TIMEOUT_MS = 8000;
+const RECENT_TTL_MS = 60_000;
+const recentKeys = new Map(); // identityKey -> وقت العرض
 let displayChain = Promise.resolve();
 
-function enqueueDisplay(task) {
-  const run = displayChain.then(task, task);
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * عملية عرض واحدة في كل مرة. المهلة تمنع تجمّد الطابور: إن علقت عملية
+ * (getNotifications لا يعود مثلاً) تُكمل العمليات التالية بدلاً من أن يصبح
+ * كل push لاحق بلا إشعار (وهو ما يُطلق إشعار Chrome العام «تم تحديث الموقع»).
+ */
+function enqueueDisplay(label, task) {
+  const run = displayChain.then(() =>
+    withTimeout(Promise.resolve().then(task), DISPLAY_TIMEOUT_MS, label)
+  );
   displayChain = run.catch(() => {});
   return run;
 }
 
-/** يعرض الإشعار إن لم يكن هذا الحدث معروضاً بالفعل. يعيد true إن عرض. */
-function showNotificationOnce(payload) {
-  return enqueueDisplay(async () => {
-    const { tag, options } = buildNotificationOptions(payload);
-    const key = identityKey(payload.data);
+function rememberKey(key) {
+  const now = Date.now();
+  for (const [stored, at] of recentKeys) {
+    if (now - at > RECENT_TTL_MS) recentKeys.delete(stored);
+  }
+  recentKeys.set(key, now);
+}
+
+/**
+ * يعرض الإشعار إن لم يكن هذا الحدث معروضاً. يعيد true إن عرض.
+ * إن وُجدت نسخة ناقصة لنفس الحدث (بلا عنوان) تُغلق وتُستبدل بنسختنا.
+ */
+function showPayloadOnce(payload) {
+  const key = identityKey(payload.data);
+  const { tag, options } = buildNotificationOptions(payload);
+
+  return enqueueDisplay("show-payload", async () => {
     if (key) {
+      const seenAt = recentKeys.get(key);
+      if (seenAt && Date.now() - seenAt < RECENT_TTL_MS) {
+        swLog("duplicate skipped (recent)", { key });
+        return false;
+      }
+      rememberKey(key);
+
+      let same = [];
       try {
         const existing = await self.registration.getNotifications({ tag });
-        if (existing.some((n) => identityKey(n.data) === key)) return false;
-      } catch {
-        /* getNotifications غير مدعومة — أكمل */
+        same = existing.filter((n) => identityKey(extractData(n.data)) === key);
+      } catch (error) {
+        swWarn("getNotifications failed — continuing", String(error));
       }
+
+      if (same.some((n) => String(n.title || "").trim())) {
+        swLog("duplicate skipped (already displayed)", { key, tag });
+        return false;
+      }
+      same.forEach((n) => n.close()); // نسخة ناقصة لنفس الحدث
     }
-    await self.registration.showNotification(payload.title, options);
+
+    try {
+      await self.registration.showNotification(payload.title, options);
+    } catch (error) {
+      if (key) recentKeys.delete(key);
+      throw error;
+    }
+    swLog("notification shown", { tag, title: payload.title, key });
     return true;
   });
 }
 
 /**
- * إنهاء مكالمة: يُغلق رنين المكالمة الواردة. ولأن قواعد Push تُلزم بإظهار
- * إشعار لكل دفعة في الخلفية، فإن لم تكن فائتة نعرض إشعاراً صامتاً يستبدل
- * الرنين ثم يُغلق بعد لحظة قصيرة.
+ * بعد العرض: إن ظهرت متأخرة نسخة ناقصة من SDK لنفس الحدث (ومن غير نسختنا
+ * الكاملة) فإنها تستبدل نسختنا بالـ tag نفسه. نغلقها ونعيد عرض نسختنا.
+ */
+async function reconcileLateCopies(payload, tag) {
+  const key = identityKey(payload.data);
+  if (!key) return;
+  await sleep(800);
+  try {
+    await enqueueDisplay("reconcile", async () => {
+      const existing = await self.registration.getNotifications({ tag });
+      const same = existing.filter((n) => identityKey(extractData(n.data)) === key);
+      const incomplete = same.filter((n) => !String(n.title || "").trim());
+      if (!incomplete.length) return;
+      const complete = same.some((n) => String(n.title || "").trim());
+      incomplete.forEach((n) => n.close());
+      swWarn("incomplete late copy replaced", { key, complete });
+      if (!complete) {
+        const { options } = buildNotificationOptions(payload);
+        await self.registration.showNotification(payload.title, options);
+      }
+    });
+  } catch (error) {
+    swWarn("reconcile failed", String(error));
+  }
+}
+
+/** إشعار عام عند فشل كل المسارات — يحافظ على شرط userVisibleOnly */
+async function showGenericFallback(reason) {
+  try {
+    await enqueueDisplay("fallback", () =>
+      self.registration.showNotification("رسالة جديدة", {
+        body: "افتح التطبيق لعرض التفاصيل",
+        icon: iconUrl(),
+        badge: iconUrl(),
+        tag: "push-fallback",
+        renotify: true,
+        silent: false,
+        data: { type: "fallback", url: appUrl() },
+      })
+    );
+    swLog("fallback notification shown", { reason });
+  } catch (error) {
+    swError("fallback notification failed", String(error));
+  }
+}
+
+/**
+ * إنهاء مكالمة: فائتة ⇒ إشعار مستقل ويُغلق الرنين. غير فائتة ⇒ يستبدل
+ * الرنين بإشعار صامت قصير ثم يُغلق (ويستوفي userVisibleOnly أيضاً).
  */
 async function handleCallEnded(payload) {
   const roomId = payload.roomId || "";
   const missed = String(payload.data.missed) === "true";
 
   if (missed) {
-    await showNotificationOnce({
+    await showPayloadOnce({
       ...payload,
       title: payload.title || "مكالمة فائتة",
       body: payload.body || "لديك مكالمة فائتة",
     });
-    // أغلق رنين المكالمة الواردة
-    try {
+    await enqueueDisplay("close-ringing", async () => {
       const ringing = await self.registration.getNotifications({ tag: `call-${roomId}` });
       ringing.forEach((n) => n.close());
-    } catch {
-      /* تجاهل */
-    }
+    });
     return;
   }
 
-  // غير فائتة: استبدل الرنين بإشعار صامت قصير ثم أغلقه
-  await enqueueDisplay(async () => {
-    await self.registration.showNotification(payload.title || "انتهت المكالمة", {
+  const endTag = `call-${roomId || "ended"}`;
+  await enqueueDisplay("call-ended-silent", () =>
+    self.registration.showNotification(payload.title || "انتهت المكالمة", {
       body: payload.body || "انتهت المكالمة",
       icon: iconUrl(payload.icon),
       badge: iconUrl(),
-      tag: `call-${roomId || "ended"}`,
+      tag: endTag,
       renotify: false,
       silent: true,
       data: { ...payload.data, type: "call_ended", roomId },
-    });
-  });
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+    })
+  );
+  await sleep(1500);
   try {
-    const shown = await self.registration.getNotifications({ tag: `call-${roomId || "ended"}` });
+    const shown = await self.registration.getNotifications({ tag: endTag });
     shown.forEach((n) => n.close());
   } catch {
     /* تجاهل */
@@ -261,7 +417,7 @@ async function hasVisibleClient() {
 }
 
 /* ------------------------------------------------------------
- * الاستقبال: Firebase SDK إن توفّر + مسار احتياطي مستقل
+ * تهيئة Firebase SDK (للـ onMessage في الواجهة + تسجيل الاستلام)
  * ---------------------------------------------------------- */
 
 const firebaseConfig = {
@@ -280,58 +436,110 @@ if (firebaseReady) {
   try {
     firebase.initializeApp(firebaseConfig);
     messaging = firebase.messaging();
+    swLog("firebase messaging initialized");
   } catch (error) {
-    console.error("[messaging-sw] فشل تهيئة Firebase Messaging:", error);
+    swError("firebase messaging init failed — raw push handler only", String(error));
     messaging = null;
   }
 }
 
 if (messaging) {
-  // يُستدعى من الـ SDK فقط عندما لا توجد نافذة ظاهرة (وإلا تُرسَل الرسالة للصفحة)
-  messaging.onBackgroundMessage(async (payload) => {
-    const normalized = normalizePayload(payload);
-
-    if (normalized.isCallEnded) {
-      await handleCallEnded(normalized);
-      return;
-    }
-
-    await showNotificationOnce(normalized);
+  // يُستدعى من SDK لكل دفعة في الخلفية. لا نعرض هنا (المصدر الوحيد للعرض
+  // هو معالج push الخام)، بل نسجّل الاستلام للتشخيص فقط.
+  messaging.onBackgroundMessage((payload) => {
+    swLog("sdk onBackgroundMessage (log only)", {
+      type: payload?.data?.type || "",
+      messageId: payload?.data?.messageId || "",
+      fcmMessageId: payload?.messageId || "",
+      sdkNotification: Boolean(payload?.notification),
+    });
   });
 }
 
-// المسار الاحتياطي المستقل: يعمل إن لم يعرض الـ SDK شيئاً (SDK غير متاح،
-// أو نسخة قديمة، أو دفعة data-only). الفحص بالهوية يمنع الازدواج.
-self.addEventListener("push", (event) => {
-  if (!event.data) return;
+/* ------------------------------------------------------------
+ * الاستقبال: معالج push الخام (المصدر الوحيد للعرض)
+ * ---------------------------------------------------------- */
 
-  let raw = null;
+function parsePushEvent(event) {
+  if (!event?.data) return null;
   try {
-    raw = event.data.json();
+    const value = event.data.json();
+    return isObject(value) ? value : null;
   } catch {
     try {
-      raw = { data: { body: event.data.text() } };
+      const text = event.data.text();
+      return text ? { data: { body: text } } : null;
     } catch {
-      raw = null;
+      return null;
     }
   }
-  if (!raw) return;
+}
 
-  const payload = normalizePayload(raw);
+function describePush(raw, received) {
+  const inner = isObject(raw?.FCM_MSG) ? raw.FCM_MSG : raw || {};
+  const data = isObject(inner.data) ? inner.data : {};
+  return {
+    build: SW_BUILD,
+    receivedAt: new Date(received).toISOString(),
+    hasPayload: Boolean(raw),
+    fcmMessageId: raw?.fcmMessageId || inner.fcmMessageId || "",
+    type: data.type || "",
+    messageId: data.messageId || "",
+    roomId: data.roomId || "",
+    // true ⇒ الدفعة تحمل notification (نسخة قديمة من الخادم): قد يعرض SDK نسخته
+    sdkAutoDisplayCandidate: Boolean(inner.notification),
+    dataKeys: Object.keys(data),
+  };
+}
 
-  event.waitUntil((async () => {
-    // نافذة ظاهرة: الصفحة تتولّى العرض (onMessage) ولا نُزعج المستخدم مرتين
-    if (await hasVisibleClient()) return;
+async function handlePush(raw, received) {
+  let payload = null;
+  try {
+    payload = raw ? fromPushPayload(raw) : null;
+  } catch (error) {
+    swError("payload normalization failed", String(error));
+  }
 
-    // امنح الـ SDK فرصة أولاً ثم تحقق من الهوية قبل العرض
-    await new Promise((resolve) => setTimeout(resolve, 600));
+  // نافذة ظاهرة: الصفحة تتولّى العرض عبر onMessage (لا إشعار مزدوج)
+  if (await hasVisibleClient()) {
+    swLog("decision: app window visible → page renders via onMessage", {
+      type: payload?.type || "",
+      messageId: payload?.messageId || "",
+    });
+    return;
+  }
 
+  try {
+    if (!payload) {
+      swWarn("decision: unparseable push → generic notification");
+      await showGenericFallback("unparseable");
+      return;
+    }
     if (payload.isCallEnded) {
+      swLog("decision: call_ended", { roomId: payload.roomId, missed: payload.data.missed });
       await handleCallEnded(payload);
       return;
     }
-    await showNotificationOnce(payload);
-  })());
+    swLog("decision: background → render notification", {
+      type: payload.type,
+      messageId: payload.messageId,
+      roomId: payload.roomId,
+      elapsedMs: Date.now() - received,
+    });
+    const shown = await showPayloadOnce(payload);
+    if (shown) await reconcileLateCopies(payload, notificationTag(payload));
+  } catch (error) {
+    swError("display failed → generic fallback", String(error));
+    await showGenericFallback("display-failed");
+  }
+}
+
+self.addEventListener("push", (event) => {
+  const received = Date.now();
+  const raw = parsePushEvent(event);
+  // أول سطر: يثبت وصول الدفعة من FCM إلى الجهاز حتى لو فشل ما بعده
+  swLog("push received", describePush(raw, received));
+  event.waitUntil(handlePush(raw, received));
 });
 
 /* ------------------------------------------------------------
@@ -384,7 +592,7 @@ async function focusOrOpenClient(payload, event) {
     try {
       if (conversationId || payload.roomId) target.postMessage(message);
     } catch (error) {
-      console.warn("[messaging-sw] postMessage failed:", error);
+      swWarn("postMessage to client failed", String(error));
     }
     try {
       if (typeof target.focus === "function") await target.focus();
@@ -415,7 +623,7 @@ async function focusOrOpenClient(payload, event) {
         return navigated;
       }
     } catch (error) {
-      console.warn("[messaging-sw] navigate failed:", error);
+      swWarn("navigate failed", String(error));
     }
   }
 
@@ -432,7 +640,13 @@ self.addEventListener(
   (event) => {
     event.stopImmediatePropagation();
     event.notification.close();
-    const payload = normalizePayload(event.notification?.data || {});
+    const payload = fromNotificationData(event.notification?.data || {});
+    swLog("notification clicked", {
+      action: event.action || "open",
+      type: payload.type,
+      conversationId: payload.conversationId,
+      messageId: payload.messageId,
+    });
     event.waitUntil(focusOrOpenClient(payload, event));
   },
   { capture: true }
@@ -442,12 +656,23 @@ self.addEventListener("notificationclose", () => {
   // no-op: الإشعارات تُدار بالـ tag من التطبيق نفسه
 });
 
-// تدوير اشتراك Push: نُعيد الاشتراك ونُبلّغ التطبيق ليحدّث توكن FCM في قاعدة البيانات
+/* ------------------------------------------------------------
+ * تدوير الاشتراك: SDK يعيد التوكن بنفسه (onSubChange). نكتفي بإبلاغ الصفحات
+ * لتعيد المزامنة مع قاعدة البيانات. (لا نستدعي pushManager.subscribe هنا:
+ * كان ذلك يُنشئ اشتراكاً خارج FCM ويتعارض مع منطق SDK.)
+ * ---------------------------------------------------------- */
 self.addEventListener("pushsubscriptionchange", (event) => {
-  event.waitUntil((async () => {
-    console.warn("[messaging-sw] تغيّر اشتراك Push — يجب تحديث التوكن.");
-    try {
-      const clientList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  swWarn("pushsubscriptionchange — notifying pages to re-sync FCM token", {
+    hasNewSubscription: Boolean(event.newSubscription),
+  });
+  event.waitUntil(
+    (async () => {
+      let clientList = [];
+      try {
+        clientList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      } catch {
+        clientList = [];
+      }
       clientList.forEach((client) => {
         try {
           client.postMessage({ type: "PUSH_RESUBSCRIBE" });
@@ -455,19 +680,6 @@ self.addEventListener("pushsubscriptionchange", (event) => {
           /* تجاهل */
         }
       });
-    } catch {
-      /* تجاهل */
-    }
-    try {
-      if (event.newSubscription) return;
-      const applicationServerKey = event.oldSubscription?.options?.applicationServerKey;
-      if (!applicationServerKey) return;
-      await self.registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey,
-      });
-    } catch (error) {
-      console.warn("[messaging-sw] تعذّر إعادة الاشتراك:", error);
-    }
-  })());
+    })()
+  );
 });

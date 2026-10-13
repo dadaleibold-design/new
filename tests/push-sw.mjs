@@ -55,16 +55,25 @@ class FakeEventTarget {
 }
 
 /** بيئة SW وهمية كاملة */
-function createSwEnv({ visibleClient = false } = {}) {
+function createSwEnv({ visibleClient = false, sdkDelayMs = 0 } = {}) {
   const self = new FakeEventTarget();
   const notifications = [];
   const openedWindows = [];
   const posted = [];
   const waitPromises = [];
+  const logs = []; // كل استدعاءات console.* داخل الـ SW (للتحقق من السجلات)
+  const subscribeCalls = []; // يجب أن يبقى فارغاً: لا يُنشئ الـ SW اشتراكاً خارج FCM
+  self.registration_pushManager = {
+    subscribe: (opts) => {
+      subscribeCalls.push(opts);
+      return Promise.resolve(null);
+    },
+  };
 
   self.location = { origin: "https://app.test", href: "https://app.test/firebase-messaging-sw.js" };
   self.registration = {
     scope: "https://app.test/firebase-cloud-messaging-push-scope",
+    pushManager: self.registration_pushManager,
     showNotification(title, options) {
       const record = {
         title,
@@ -121,7 +130,11 @@ function createSwEnv({ visibleClient = false } = {}) {
 
   const context = {
     self,
-    console: { log() {}, warn() {}, error() {} },
+    console: {
+      log: (...args) => logs.push(["log", ...args]),
+      warn: (...args) => logs.push(["warn", ...args]),
+      error: (...args) => logs.push(["error", ...args]),
+    },
     URL,
     Date,
     Promise,
@@ -165,6 +178,7 @@ function createSwEnv({ visibleClient = false } = {}) {
     }
     if (internal.notification) {
       // الـ SDK يعرض notification بنفسه ويلفّ الحمولة في FCM_MSG
+      if (sdkDelayMs) await new Promise((r) => setTimeout(r, sdkDelayMs));
       const { title, body, icon, tag, actions, renotify, requireInteraction, vibrate, silent } =
         internal.notification;
       await self.registration.showNotification(title, {
@@ -192,6 +206,34 @@ function createSwEnv({ visibleClient = false } = {}) {
     notifications,
     openedWindows,
     posted,
+    logs,
+    subscribeCalls,
+    /** دفعة لا يمكن تحليلها (json يرمي خطأ) */
+    async pushUnparseable() {
+      const pending = [];
+      const event = {
+        data: {
+          json: () => {
+            throw new SyntaxError("bad json");
+          },
+          text: () => "",
+        },
+        waitUntil: (p) => pending.push(p),
+      };
+      self.dispatch("push", event);
+      await Promise.all(pending);
+    },
+    /** تغيّر الاشتراك دون اشتراك جديد (الإلغاء) */
+    async subscriptionChange() {
+      const pending = [];
+      const event = {
+        oldSubscription: { options: { applicationServerKey: new Uint8Array([4, 1]) } },
+        newSubscription: null,
+        waitUntil: (p) => pending.push(p),
+      };
+      self.dispatch("pushsubscriptionchange", event);
+      await Promise.all(pending);
+    },
     /** يرسل push ثم ينتظر كل ما أُعطي لـ waitUntil */
     async push(payload) {
       const pending = [];
@@ -387,6 +429,71 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   await wait(700);
   const call = env.notifications.find((n) => n.tag === "call-r-7");
   check("المكالمة الواردة تُعرض بـ tag الغرفة وتبقى مرئية", Boolean(call && call.options.requireInteraction));
+}
+
+/* 9) [السبب الجذري] نسخة SDK ناقصة (بلا عنوان) لا تُسقط نسختنا الكاملة ----- */
+{
+  const env = createSwEnv();
+  await env.push({
+    notification: { body: "مرحبا", tag: "conversation-c-30" }, // بلا title ⇒ نسخة SDK ناقصة
+    data: { type: "new_message", messageId: "m-30", conversationId: "c-30", title: "أحمد", body: "مرحبا", senderId: "u-2" },
+  });
+  await wait(900);
+  const titles = env.notifications.map((n) => n.title);
+  check(
+    "نسخة SDK ناقصة لا تُسقط نسختنا: يبقى إشعار واحد مكتمل",
+    env.notifications.length === 1 && titles[0] === "أحمد",
+    `titles=${JSON.stringify(titles)}`
+  );
+}
+
+/* 10) نسخة SDK متأخرة وناقصة (تُعرض بعد نسختنا بالـ tag نفسه) ⇒ مصالحة ---- */
+{
+  const env = createSwEnv({ sdkDelayMs: 300 });
+  await env.push({
+    notification: { body: "مرحبا", tag: "conversation-c-31" },
+    data: { type: "new_message", messageId: "m-31", conversationId: "c-31", title: "سارة", body: "مرحبا", senderId: "u-3" },
+  });
+  await wait(150);
+  const titles = env.notifications.map((n) => n.title);
+  check(
+    "نسخة SDK متأخرة وناقصة تُستبدل بنسختنا الكاملة بعد المصالحة",
+    env.notifications.length === 1 && titles[0] === "سارة",
+    `titles=${JSON.stringify(titles)}`
+  );
+}
+
+/* 11) دفعة غير قابلة للتحليل ⇒ إشعار عام (يحفظ شرط userVisibleOnly) ----------- */
+{
+  const env = createSwEnv();
+  await env.pushUnparseable();
+  const fallback = env.notifications.find((n) => n.tag === "push-fallback");
+  check("دفعة غير قابلة للتحليل ⇒ إشعار عام بدل تجاهلها", Boolean(fallback) && fallback.title === "رسالة جديدة");
+}
+
+/* 12) تغيّر الاشتراك: لا اشتراك خارج FCM (كان يتعارض مع منطق SDK) ----------- */
+{
+  const env = createSwEnv();
+  await env.subscriptionChange();
+  check("pushsubscriptionchange لا يستدعي pushManager.subscribe", env.subscribeCalls.length === 0);
+  check(
+    "pushsubscriptionchange يُبلغ الصفحات لإعادة مزامنة التوكن",
+    env.posted.some((m) => m?.type === "PUSH_RESUBSCRIBE")
+  );
+}
+
+/* 13) السجلات: وصول الدفعة من FCM يُسجَّل بمعرّفها، وقرار العرض يُسجَّل ------- */
+{
+  const env = createSwEnv();
+  await env.push({ ...pushPayload({ messageId: "m-40", conversationId: "c-40" }), fcmMessageId: "fcm-123" });
+  await wait(100);
+  const received = env.logs.find((a) => a[1] === "[push-sw]" && a[2] === "push received");
+  const decision = env.logs.find((a) => a[1] === "[push-sw]" && String(a[2]).startsWith("decision:"));
+  check(
+    "سجل [push-sw] يثبت وصول الدفعة مع معرّف FCM ومن ثم قرار العرض",
+    Boolean(received) && received[3]?.fcmMessageId === "fcm-123" && Boolean(decision),
+    `received=${JSON.stringify(received?.[3] || null)}`
+  );
 }
 
 console.log(fails ? `\n❌ PUSH SW TESTS FAILED: ${fails}` : "\nPUSH SW TESTS PASSED");
