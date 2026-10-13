@@ -8,8 +8,13 @@
 // Optional:
 //   SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
-//   APP_PUBLIC_URL        (e.g. https://app.example.com — يُضاف كرابط احتياطي للنقرة)
 //   PUSH_NORMAL_URGENCY   ("1" لإعادة الأولوية العادية)
+//
+// عقد الويب (v2026-10-13.2): كل دفعة ويب data-only — بلا webpush.notification.
+// الإشعار المرئي يُبنى حصرياً في firebase-messaging-sw.js من حقول data، فيتطابق
+// الشكل الذي يرسله الخادم مع الشكل الذي تقرؤه الـ SW تماماً، ولا يعرض Firebase
+// SDK إشعاراً تلقائياً بحمولة مختلفة. نقرة الإشعار تُوجَّه من الـ SW (scope).
+// APP_PUBLIC_URL لم يعد مطلوباً للويب (إن ضُبط فهو غير مستخدم).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
@@ -20,7 +25,6 @@ const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID");
 const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL");
 const FIREBASE_PRIVATE_KEY = Deno.env.get("FIREBASE_PRIVATE_KEY")?.replace(/\\n/g, "\n");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
-const APP_PUBLIC_URL = (Deno.env.get("APP_PUBLIC_URL") || "").replace(/\/+$/, "");
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
@@ -86,78 +90,27 @@ async function getFirebaseAccessToken() {
 }
 
 /**
- * tag الإشعار يحدد أي إشعارات تستبدل بعضها على الجهاز:
- *   • رسالة: tag لكل محادثة (تتجمّع).
- *   • مكالمة واردة: tag لكل غرفة (يُغلق عند انتهائها في الـ Service Worker).
- *   • مكالمة فائتة: tag منفصل (لا تستبدل إشعار الرسائل — كان هذا تداخلاً).
- *   • اختبار/مسبار: tag فريد (لا يستبدل رسالة حقيقية ولا يُكتم بها).
+ * عقد الإرسال للويب (data-only):
+ *   • الحمولة كلها في `data` (قيمها نصوص). الإشعار المرئي يبنيه الـ Service Worker
+ *     في firebase-messaging-sw.js من هذه الحقول: title / body / icon / type / ...
+ *   • لا `webpush.notification` ولا `notification` على المستوى الأعلى:
+ *     - لا يعرض Firebase SDK إشعاراً تلقائياً بحمولة مختلفة عن حمولتنا.
+ *     - الـ SW هو المصدر الوحيد للعرض، فيستوفي userVisibleOnly دائماً.
+ *   • webpush.headers: Urgency/TTL فقط (تحكّم في التسليم، لا في العرض).
+ *   • tag/renotify/requireInteraction/actions تُحدَّد في الـ SW (مصدر واحد).
  */
-function buildTag(data: Record<string, string>): string {
-  if (data.type === "incoming_call") return `call-${data.roomId || data.conversationId || "incoming"}`;
-  if (data.type === "call_ended") return `missed-${data.roomId || crypto.randomUUID()}`;
-  if (data.type === "test" || data.type === "probe") return `test-${crypto.randomUUID()}`;
-  if (data.conversationId) return `conversation-${data.conversationId}`;
-  if (data.messageId) return `message-${data.messageId}`;
-  return `whatsapp-message-${crypto.randomUUID()}`;
-}
-
-/** رابط النقرة الاحتياطي (يُستخدم فقط إن ضُبط APP_PUBLIC_URL) */
-function buildAppLink(data: Record<string, string>): string | undefined {
-  if (!APP_PUBLIC_URL) return undefined;
-  const url = new URL(`${APP_PUBLIC_URL}/index.html`);
-  if (data.conversationId) url.searchParams.set("conversation", data.conversationId);
-  if (data.messageId) url.searchParams.set("message", data.messageId);
-  if (data.type === "incoming_call" && data.roomId) url.searchParams.set("answer_call", data.roomId);
-  return url.href;
-}
-
-/**
- * يبني إعدادات الإشعار لـ Web Push.
- *
- * لماذا نُرسل `webpush.notification` (وليس data-only)؟
- *   1) iOS/iPadOS (Safari 16.4+) لا يدعم الدفع الصامت بموثوقية — يجب أن تحمل
- *      الدفعة حمولة عرض، وإلا لا يرى المستخدم شيئاً.
- *   2) Chrome/Android: الدفعة التي لا تُظهر إشعاراً في الخلفية تُعامَل كانتهاك
- *      لـ userVisibleOnly فيُستبدل الإشعار بنص عام، لذا الإشعار هنا ضروري.
- *   3) منع الازدواج: الـ SDK يعرض هذا الإشعار تلقائياً، وmessaging.onBackgroundMessage
- *      والمسار الاحتياطي في firebase-messaging-sw.js يتحققان بالهوية
- *      (messageId/roomId) قبل أي عرض إضافي.
- *
- * الحقول المكرّرة في `data` تقرأها نقرة الإشعار في الـ Service Worker، لأن
- * الـ SDK يلفّ الحمولة داخل notification.data.FCM_MSG.
- */
-function buildWebPushNotification(data: Record<string, string>) {
-  const isCall = data.type === "incoming_call";
-
+function buildWebPushHeaders(opts: { highPriority?: boolean }, urgent: boolean) {
   return {
-    title: data.title || "رسالة جديدة",
-    body: data.body || "لديك رسالة جديدة",
-    icon: data.icon || undefined,
-    tag: buildTag(data),
-    renotify: true,
-    requireInteraction: isCall,
-    silent: false,
-    vibrate: isCall ? [500, 250, 500, 250, 500] : [100, 50, 100],
-    actions: isCall
-      ? [
-          { action: "answer", title: "📞 رد" },
-          { action: "decline", title: "رفض" },
-        ]
-      : [],
-    data: {
-      type: data.type || "message",
-      conversationId: data.conversationId || "",
-      messageId: data.messageId || "",
-      roomId: data.roomId || "",
-      senderId: data.senderId || data.callerId || "",
-    },
+    Urgency: urgent ? "high" : "normal",
+    // رسائل المكالمات/الاختبار تنتهي بسرعة (لا فائدة من إيصالها متأخرة)
+    TTL: opts.highPriority ? "60" : "86400",
   };
 }
 
 async function sendToFcm(
   token: string,
   data: Record<string, string>,
-  opts: { highPriority?: boolean; withNotification?: boolean } = {},
+  opts: { highPriority?: boolean } = {},
 ) {
   const accessToken = await getFirebaseAccessToken();
 
@@ -175,10 +128,7 @@ async function sendToFcm(
       ttl: opts.highPriority ? "60s" : "86400s",
     },
     webpush: {
-      headers: {
-        Urgency: urgent ? "high" : "normal",
-        TTL: opts.highPriority ? "60" : "86400",
-      },
+      headers: buildWebPushHeaders(opts, urgent),
     },
     apns: {
       headers: {
@@ -187,12 +137,6 @@ async function sendToFcm(
       },
     },
   };
-
-  if (opts.withNotification !== false) {
-    (body.webpush as Record<string, unknown>).notification = buildWebPushNotification(data);
-    const link = buildAppLink(data);
-    if (link) (body.webpush as Record<string, unknown>).fcm_options = { link };
-  }
 
   const response = await fetch(
     `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_PROJECT_ID!)}/messages:send`,
@@ -298,7 +242,29 @@ async function sendToAllDevices(rows: DeviceRow[], data: Record<string, string>,
     results.push(...settled);
   }
 
+  logDelivery(data.type || "unknown", results);
   return results;
+}
+
+/**
+ * سجلات التشخيص في Supabase Logs (Edge Function logs):
+ *   • ملخّص لكل دفعة: النوع + عدد النجاح/الفشل + عدد التوكنات المحذوفة.
+ *   • سبب كل فشل (HTTP status + رسالة FCM) — لتعرف هل رفض FCM الدفعة أصلاً.
+ * لا نطبع التوكنات نفسها (بيانات حسّاسة)، فقط معرّف الصف.
+ */
+function logDelivery(
+  type: string,
+  results: Array<{ tokenId: string; ok: boolean; status: number; removed: boolean; error?: string }>,
+) {
+  const sent = results.filter((r) => r.ok).length;
+  const removed = results.filter((r) => r.removed).length;
+  console.log(`[send-push] type=${type} sent=${sent}/${results.length} removed=${removed}`);
+  for (const r of results) {
+    if (r.ok) continue;
+    console.warn(
+      `[send-push] FCM rejected row=${r.tokenId} status=${r.status}${r.removed ? " (token pruned)" : ""} reason=${r.error || "unknown"}`,
+    );
+  }
 }
 
 async function getUserFromRequest(req: Request) {
@@ -323,6 +289,7 @@ Deno.serve(async (req) => {
 
   try {
     const input = await req.json();
+    console.log(`[send-push] request type=${String(input?.type || "message")}`);
 
     // --- إشعار تجريبي للمستخدم نفسه (يتطلب JWT المستخدم) ---
     if (input.type === "test") {
@@ -392,11 +359,7 @@ Deno.serve(async (req) => {
             icon: caller?.avatar_url || "",
           };
 
-      const results = await sendToAllDevices(tokens, data, {
-        highPriority: true,
-        // مكالمة منتهية/فائتة: لا حاجة لإشعار تفاعلي يبقى على الشاشة
-        withNotification: input.type === "incoming_call",
-      });
+      const results = await sendToAllDevices(tokens, data, { highPriority: true });
       return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
     }
 

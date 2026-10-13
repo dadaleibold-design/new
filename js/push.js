@@ -67,6 +67,10 @@ async function registerFirebaseServiceWorker() {
   // عامل Firebase — لذا ننتظر تفعيل تسجيل Firebase نفسه صراحةً، وإلا قد يفشل
   // getToken بـ "no active Service Worker" على أول تفعيل.
   await waitForActiveWorker(firebaseServiceWorkerRegistration);
+  console.info("[FCM] firebase-messaging-sw active", {
+    scope: firebaseServiceWorkerRegistration.scope,
+    state: firebaseServiceWorkerRegistration.active?.state || "unknown",
+  });
 
   // حدّث ملف الـ SW عند كل تفعيل حتى لا يعلق المستخدم على نسخة قديمة
   firebaseServiceWorkerRegistration.update().catch(() => {});
@@ -424,6 +428,7 @@ export async function syncPushToken({ userId = null, force = false, minIntervalM
       }
 
       localStorage.setItem(TOKEN_SYNC_KEY, String(Date.now()));
+      console.info("[FCM] token registered for user (…" + token.slice(-8) + ")");
       return true;
     } catch (error) {
       console.error("[FCM] syncPushToken:", error);
