@@ -100,20 +100,37 @@ function buildSource(values) {
     " * المصدر: متغيرات البيئة (VITE_*) عبر scripts/generate-env.mjs",
     ` * وقت التوليد: ${new Date().toISOString()}`,
     " * يُستخدَم في المتصفح وفي Service Worker معاً (self === window في الصفحة).",
+    " * كل المفاتيح المعروفة مكتوبة صراحة (فارغة إن غابت) حتى لا يكون",
+    " * الملف فارغاً أبداً وحتى تسمّي شاشة الإعداد في التطبيق النواقص بدقة.",
     " */",
     "self.__ENV__ = Object.freeze({",
   ];
 
   for (const key of FRONTEND_KEYS) {
-    const value = values[key];
-    if (!value) continue;
-    lines.push(`  ${JSON.stringify(key)}: ${JSON.stringify(value)},`);
+    lines.push(`  ${JSON.stringify(key)}: ${JSON.stringify(values[key] || "")},`);
   }
 
   lines.push("});");
   lines.push("if (typeof window !== \"undefined\") window.__ENV__ = self.__ENV__;");
   lines.push("");
   return lines.join("\n");
+}
+
+/** قيمة تبدو كرابط Supabase صالح؟ (تُستبعد القيم التالفة حتى تظهر كناقصة لا كعميل مكسور) */
+function isPlausibleSupabaseUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/** كتابة ذرّية: ملف مؤقت ثم إعادة تسمية، حتى لا يُقرأ ملف نصف مكتوب أبداً */
+function writeOutput(source) {
+  const tmpFile = `${OUT_FILE}.tmp-${process.pid}`;
+  fs.writeFileSync(tmpFile, source, "utf8");
+  fs.renameSync(tmpFile, OUT_FILE);
 }
 
 function main() {
@@ -131,18 +148,27 @@ function main() {
   }
 
   assertNoServerSecrets(fileValues);
+  // أسرار السيرفر في بيئة العملية لا تُكتب أبداً (نقتصر على FRONTEND_KEYS)،
+  // لكن وجود قيمتها في ملف .env مرفوض أعلاه لأنه مصدر التسريب المحتمل.
+
+  // قيمة Supabase تالفة الصياغة تُستبعد وتُحسب ناقصة: عميل يُبنى على رابط
+  // مكسور يعلّق الإقلاع، أما غيابه فيُظهر شاشة إعداد صريحة فوراً.
+  if (values.VITE_SUPABASE_URL && !isPlausibleSupabaseUrl(values.VITE_SUPABASE_URL)) {
+    console.warn(
+      `⚠️  VITE_SUPABASE_URL ليست رابطاً صالحاً (${values.VITE_SUPABASE_URL}) — ستُعامل كناقصة.`
+    );
+    delete values.VITE_SUPABASE_URL;
+  }
 
   const missing = FRONTEND_KEYS.filter((key) => key !== "VITE_AGORA_APP_ID" && !values[key]);
 
-  if (!exists && !Object.keys(values).length) {
-    console.error(
-      "❌ لا يوجد ملف .env ولا متغيرات بيئة.\n" +
-        "   انسخ .env.example إلى .env ثم املأ القيم، أو صدّرها في بيئة النشر."
-    );
-    process.exit(1);
-  }
-
   if (checkOnly) {
+    if (!exists && !Object.keys(values).length) {
+      console.error(
+        "❌ لا يوجد ملف .env ولا متغيرات بيئة.\n" +
+          "   انسخ .env.example إلى .env ثم املأ القيم، أو صدّرها في بيئة النشر."
+      );
+    }
     console.log(
       missing.length
         ? `⚠️  متغيرات ناقصة: ${missing.join(", ")}`
@@ -151,11 +177,26 @@ function main() {
     process.exit(missing.length ? 1 : 0);
   }
 
-  fs.writeFileSync(OUT_FILE, buildSource(values), "utf8");
-  console.log(`✅ تم توليد ${path.relative(ROOT, OUT_FILE)} (${Object.keys(values).length} متغيراً)`);
+  // ⚠️ لا نفشل البناء عند غياب المتغيرات: فشل buildCommand على Vercel كان
+  // يمنع النشر أو يترك الموقع بلا env.js أصلاً. بدلاً من ذلك نكتب دائماً
+  // ملفاً صالحاً نحوياً (بقيم فارغة صريحة عند الغياب) فيُقلع التطبيق
+  // ويعرض شاشة «إعداد البيئة غير مكتمل» تسمّي النواقص — بدل تجمّد صامت.
+  // البوّابة الصارمة عند الحاجة هي: npm run env:check
+  if (!exists && !Object.keys(values).length) {
+    console.warn(
+      "⚠️  لا يوجد ملف .env ولا متغيرات بيئة — سيُولَّد env.js فارغ القيم.\n" +
+        "   انسخ .env.example إلى .env ثم املأ القيم، أو اضبط VITE_* في بيئة النشر\n" +
+        "   (على Vercel: Project Settings → Environment Variables)، ثم أعد النشر."
+    );
+  }
+
+  writeOutput(buildSource(values));
+  console.log(
+    `✅ تم توليد ${path.relative(ROOT, OUT_FILE)} (${FRONTEND_KEYS.filter((k) => values[k]).length} متغيراً مضبوطاً)`
+  );
 
   if (missing.length) {
-    console.warn(`⚠️  متغيرات ناقصة: ${missing.join(", ")}`);
+    console.warn(`⚠️  متغيرات ناقصة (سيعرض التطبيق شاشة إعداد تسمّيها): ${missing.join(", ")}`);
   }
 }
 
