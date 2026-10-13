@@ -7,20 +7,23 @@
 -- ============================================================
 -- إسقاط الدوال القديمة لتجنب أخطاء تضارب أنواع الإرجاع (42P13)
 -- ============================================================
-DROP FUNCTION IF EXISTS public.admin_delete_user(uuid);
-DROP FUNCTION IF EXISTS public.mark_messages_delivered(uuid);
-DROP FUNCTION IF EXISTS public.mark_all_messages_delivered();
-DROP FUNCTION IF EXISTS public.push_diagnostics();
-DROP FUNCTION IF EXISTS public.push_probe();
-DROP FUNCTION IF EXISTS public.push_probe_result(bigint);
-DROP FUNCTION IF EXISTS public.push_call_edge(text, uuid, uuid, jsonb);
-DROP FUNCTION IF EXISTS public.notify_new_message();
-DROP FUNCTION IF EXISTS public.notify_call_room();
-DROP FUNCTION IF EXISTS public.admin_directory_search(text, integer, integer);
-DROP FUNCTION IF EXISTS public.registered_users_count();
-DROP FUNCTION IF EXISTS public.is_admin_user(uuid);
-DROP FUNCTION IF EXISTS public.is_not_blocked(uuid);
-DROP FUNCTION IF EXISTS public.handle_new_user();
+-- ============================================================
+-- إسقاط الدوال القديمة مع تبعاتها (CASCADE) لتجنب أخطاء الارتباط
+-- ============================================================
+DROP FUNCTION IF EXISTS public.admin_delete_user(uuid) CASCADE;
+DROP FUNCTION IF EXISTS public.mark_messages_delivered(uuid) CASCADE;
+DROP FUNCTION IF EXISTS public.mark_all_messages_delivered() CASCADE;
+DROP FUNCTION IF EXISTS public.push_diagnostics() CASCADE;
+DROP FUNCTION IF EXISTS public.push_probe() CASCADE;
+DROP FUNCTION IF EXISTS public.push_probe_result(bigint) CASCADE;
+DROP FUNCTION IF EXISTS public.push_call_edge(text, uuid, uuid, jsonb) CASCADE;
+DROP FUNCTION IF EXISTS public.notify_new_message() CASCADE;
+DROP FUNCTION IF EXISTS public.notify_call_room() CASCADE;
+DROP FUNCTION IF EXISTS public.admin_directory_search(text, integer, integer) CASCADE;
+DROP FUNCTION IF EXISTS public.registered_users_count() CASCADE;
+DROP FUNCTION IF EXISTS public.is_admin_user(uuid) CASCADE;
+DROP FUNCTION IF EXISTS public.is_not_blocked(uuid) CASCADE;
+DROP FUNCTION IF EXISTS public.handle_new_user() CASCADE;
 
 -- ------------------------------------------------------------
 -- 1. PROFILES  (one row per auth.users row)
