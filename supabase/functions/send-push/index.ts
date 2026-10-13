@@ -160,18 +160,28 @@ async function sendToFcm(
  * أي إشعار لمستخدم يُرسَل إلى كل توكنات حسابه — لا إلى أول توكن فقط.
  * ------------------------------------------------------------------ */
 
-type DeviceRow = { id: string; token: string; platform?: string | null };
+type DeviceRow = {
+  id: string;
+  token: string;
+  platform?: string | null;
+  device_id?: string | null;
+  device_info?: Record<string, unknown> | null;
+};
 type SendResult = { ok: boolean; status: number; details: any };
 
 const FCM_CONCURRENCY = 10;
 const FCM_MAX_ATTEMPTS = 3;
 const FCM_RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
 
-/** كل توكنات الحساب (صف لكل جهاز) بلا تكرار */
+/**
+ * كل توكنات الحساب النشطة (صف لكل جهاز/متصفح) بلا تكرار.
+ * "نشط" = موجود في الجدول؛ التوكنات التي يرفضها FCM (UNREGISTERED…) تُحذف
+ * تلقائياً عند الإرسال (sendToAllDevices → isDeadToken).
+ */
 async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
   const { data, error } = await supabase
     .from("fcm_tokens")
-    .select("id, token, platform")
+    .select("id, token, platform, device_id, device_info")
     .eq("user_id", userId);
   if (error) throw error;
 
@@ -182,6 +192,14 @@ async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
     seen.add(row.token);
     rows.push(row);
   }
+
+  // سجل تشخيصي: كم جهازاً سيستقبل الإشعار (بدون التوكنات نفسها)
+  const devices = rows.map((r) =>
+    `${r.platform || "?"}/${(r.device_id || r.id).slice(0, 8)}`
+  );
+  console.log(
+    `[send-push] recipient=${userId.slice(0, 8)}… devices=${rows.length} [${devices.join(", ")}]`,
+  );
   return rows;
 }
 

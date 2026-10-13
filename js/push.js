@@ -4,6 +4,7 @@ import {
   getToken,
   onMessage,
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
+import { buildDeviceInfo, decideServerWrite, getOrCreateDeviceId } from "./push-policy.js";
 
 // ⚠️ لا يوجد onTokenRefresh في Firebase Web SDK v9+ (modular). استيراده يُسقط
 // الوحدة كلها بـ SyntaxError فيتجمّد التطبيق. تدوير التوكن يُعالَج بإعادة
@@ -352,9 +353,10 @@ export async function syncPushToken({ userId = null, force = false, minIntervalM
       if (!("Notification" in window) || Notification.permission !== "granted") return false;
       if (!("serviceWorker" in navigator) || !window.isSecureContext) return false;
 
+      // المستخدم المسجَّل سابقاً على هذا المتصفح (قبل هذه المزامنة)
+      const previousUser = localStorage.getItem("fcm_user_id");
       const lastSync = Number(localStorage.getItem(TOKEN_SYNC_KEY) || 0);
       const cached = localStorage.getItem(TOKEN_KEY);
-      const needsServerWrite = force || !cached || !lastSync || Date.now() - lastSync > minIntervalMs;
 
       let registration = null;
       try {
@@ -380,8 +382,10 @@ export async function syncPushToken({ userId = null, force = false, minIntervalM
         }
       }
 
-      if (obtained && obtained !== cached) {
-        console.log("[FCM] توكن جديد — جارٍ تحديث قاعدة البيانات.");
+      // التدوير يُكتشف هنا — قبل قرار الكتابة (كان القرار سابقاً يُحسب قبله فيتأخر الحفظ)
+      const tokenChanged = Boolean(obtained && obtained !== cached);
+      if (tokenChanged) {
+        console.log("[FCM] توكن جديد لهذا المتصفح (تدوير) — سيُحفظ في الخادم فوراً.");
         token = obtained;
         localStorage.setItem(TOKEN_KEY, obtained);
         localStorage.removeItem(TOKEN_SYNC_KEY);
@@ -389,28 +393,56 @@ export async function syncPushToken({ userId = null, force = false, minIntervalM
 
       if (!token) return false;
 
-      if (userId) {
-        localStorage.setItem("fcm_user_id", String(userId));
+      // تغيّر المستخدم على نفس المتصفح (تسجيل دخول بحساب آخر) → نقل التوكن للحساب الجديد
+      const userChanged = Boolean(userId) && String(userId) !== previousUser;
+      const decision = decideServerWrite({
+        force,
+        tokenChanged,
+        userChanged,
+        hasCachedToken: Boolean(cached),
+        lastSyncAt: lastSync,
+        now: Date.now(),
+        minIntervalMs,
+      });
+
+      const targetUser = userId ? String(userId) : previousUser;
+      if (!decision.write) {
+        console.info(`[FCM] التوكن مُسجَّل مسبقاً — لا حاجة للكتابة (${decision.reason}).`);
+        return true;
       }
-
-      if (!needsServerWrite) return true;
-
-      const targetUser = userId || localStorage.getItem("fcm_user_id");
       if (!targetUser) return Boolean(token);
 
       const { supabase } = await import("./supabaseClient.js");
 
-      // تسجيل التوكن عبر RPC آمنة (SECURITY DEFINER) تنقل التوكن إلى المستخدم الحالي
-      // مباشرة — هذا يضمن تسجيل كل جهاز لحسابه حتى لو كان التوكن مسجلاً سابقاً
-      // لحساب آخر على الجهاز نفسه (upsert عادي كانت ستحجبه سياسة RLS بصمت).
+      // هوية الجهاز الثابتة (لكل متصفح) + معلومات وصفية — تسمح بتمييز أجهزة المستخدم الواحد
       const platform = detectPlatformLabel();
-      let { error } = await supabase.rpc("register_fcm_token", {
-        p_token: token,
-        p_platform: platform,
+      const deviceId = getOrCreateDeviceId(localStorage, () => crypto.randomUUID());
+      const deviceInfo = buildDeviceInfo({
+        platform,
+        userAgent: navigator.userAgent || "",
+        standalone: Boolean(window.matchMedia?.("(display-mode: standalone)")?.matches),
+        language: navigator.language || "",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
       });
 
-      // توافق رجعي: قبل تطبيق الهجرة v2.6 تكون الدالة غير موجودة → upsert عادي
+      console.log(
+        `[FCM] تسجيل جهاز للمستخدم ${String(targetUser).slice(0, 8)}… ` +
+          `device=${deviceId ? deviceId.slice(0, 8) : "none"} platform=${platform} سبب=${decision.reason}`
+      );
+
+      // تسجيل التوكن عبر RPC آمنة (SECURITY DEFINER) تنقل التوكن إلى المستخدم الحالي
+      // مباشرة وتُرجع الإجراء (inserted | refreshed | moved) — upsert عادي كانت ستحجبه RLS بصمت.
+      let { data: rpcResult, error } = await supabase.rpc("register_fcm_token", {
+        p_token: token,
+        p_platform: platform,
+        p_device_id: deviceId,
+        p_device_info: deviceInfo,
+      });
+
+      // توافق رجعي: قبل تطبيق الهجرة v2.6/v2.7 تكون الدالة غير موجودة → upsert عادي
       if (error && /PGRST202|42883|schema cache|does not exist/i.test(`${error.code || ""} ${error.message || ""}`)) {
+        console.warn("[FCM] دالة register_fcm_token غير متاحة — رجوع إلى upsert مباشر.");
+        rpcResult = null;
         ({ error } = await supabase.from("fcm_tokens").upsert(
           {
             user_id: targetUser,
@@ -427,8 +459,16 @@ export async function syncPushToken({ userId = null, force = false, minIntervalM
         return false;
       }
 
+      // لا نحدّث fcm_user_id إلا بعد نجاح الكتابة: فشل الشبكة يجعل المحاولة التالية تعيد الكتابة
+      localStorage.setItem("fcm_user_id", String(targetUser));
       localStorage.setItem(TOKEN_SYNC_KEY, String(Date.now()));
-      console.info("[FCM] token registered for user (…" + token.slice(-8) + ")");
+
+      const action = rpcResult?.action || "upserted";
+      console.info(
+        `[FCM] token ${action} — user=${String(targetUser).slice(0, 8)}… ` +
+          `device=${deviceId ? deviceId.slice(0, 8) : "none"} ` +
+          `removedRotated=${rpcResult?.rotated_removed ?? 0} (…${token.slice(-8)})`
+      );
       return true;
     } catch (error) {
       console.error("[FCM] syncPushToken:", error);

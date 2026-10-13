@@ -395,10 +395,14 @@ create table if not exists public.fcm_tokens (
   user_id uuid not null references public.profiles(id) on delete cascade,
   token text not null,
   platform text default 'web',
+  device_id text,
+  device_info jsonb not null default '{}'::jsonb,
   created_at timestamptz default now(),
   updated_at timestamptz default now(),
   unique (token)
 );
+
+create index if not exists idx_fcm_tokens_user_device on public.fcm_tokens (user_id, device_id);
 
 alter table public.fcm_tokens enable row level security;
 
@@ -423,6 +427,80 @@ begin
   end;
 end
 $$;
+
+-- RPC تسجيل توكن الجهاز (v2.7): تنقل التوكن للمستخدم الحالي، وتحذف صف الجهاز القديم عند التدوير
+drop function if exists public.register_fcm_token(text, text);
+create or replace function public.register_fcm_token(
+  p_token text,
+  p_platform text default 'web',
+  p_device_id text default null,
+  p_device_info jsonb default '{}'::jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_owner uuid;
+  v_action text;
+  v_id uuid;
+  v_device text := nullif(btrim(coalesce(p_device_id, '')), '');
+  v_removed int := 0;
+begin
+  if v_uid is null then
+    raise exception 'not authenticated' using errcode = '42501';
+  end if;
+  if coalesce(btrim(p_token), '') = '' then
+    raise exception 'token required' using errcode = '22023';
+  end if;
+
+  -- تحديد الإجراء قبل الكتابة: جديد / تحديث لنفس الحساب / نقل من حساب آخر على الجهاز نفسه
+  select user_id into v_owner from public.fcm_tokens where token = p_token;
+  v_action := case
+    when not found then 'inserted'
+    when v_owner = v_uid then 'refreshed'
+    else 'moved'
+  end;
+
+  -- تدوير التوكن على نفس الجهاز: احذف الصفوف القديمة لهذا الجهاز (لنفس المستخدم فقط)
+  if v_device is not null then
+    delete from public.fcm_tokens
+    where user_id = v_uid
+      and device_id = v_device
+      and token <> p_token;
+    get diagnostics v_removed = row_count;
+  end if;
+
+  insert into public.fcm_tokens (user_id, token, platform, device_id, device_info, created_at, updated_at)
+  values (
+    v_uid,
+    p_token,
+    coalesce(nullif(p_platform, ''), 'web'),
+    v_device,
+    coalesce(p_device_info, '{}'::jsonb),
+    now(),
+    now()
+  )
+  on conflict (token) do update
+    set user_id = excluded.user_id,
+        platform = excluded.platform,
+        device_id = excluded.device_id,
+        device_info = excluded.device_info,
+        updated_at = now()
+  returning id into v_id;
+
+  return jsonb_build_object(
+    'id', v_id,
+    'action', v_action,
+    'rotated_removed', v_removed
+  );
+end;
+$$;
+
+revoke all on function public.register_fcm_token(text, text, text, jsonb) from public;
+grant execute on function public.register_fcm_token(text, text, text, jsonb) to authenticated;
 
 -- ------------------------------------------------------------
 -- 9. صلاحيات المشرف العام (Super Admin) — تحكم كامل بلا قيود
