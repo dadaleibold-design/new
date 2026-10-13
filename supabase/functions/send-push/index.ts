@@ -10,6 +10,13 @@
 //                                     (is_admin أو is_super_admin غير محظورين) على
 //                                     كل أجهزتهم بأن مستخدماً جديداً سجّل في النظام.
 //
+// 🔒 عزل المستلمين (v2.9) — نفس قواعد قاعدة البيانات، مُعاد التحقق منها هنا:
+//   • الرسالة: المستلم = الطرف الآخر في **نفس صف المحادثة** (user_id ⇄ admin_id).
+//     المرسل ليس طرفاً (مراقبة/مشاهدة) ⇒ يُرفض الطلب بلا أي إرسال.
+//   • المكالمة: المستلم = **callee_id في غرفة المكالمة** المكتوبة في قاعدة
+//     البيانات (لا من الحمولة وحدها). لا رنين لأي حساب آخر — ومنهم المشرف العام.
+//   • new_user: هو الإشعار الجماعي الوحيد (كل المشرفين النشطين) ولا يقبل مستلماً واحداً.
+//
 // كل الأسرار تُقرأ حصرياً من Deno.env.get() — لا مفتاح واحد داخل الكود:
 //
 // Required (one of the two Firebase forms):
@@ -321,6 +328,31 @@ async function loadAdminIds(): Promise<string[]> {
 }
 
 /**
+ * 🔒 المستلم المباشر لرسالة داخل محادثة — من نفس صف المحادثة وحده:
+ *   المرسل user_id ⇒ المستلم admin_id، والعكس صحيح.
+ * المرسل ليس طرفاً في المحادثة (مشاهدة/مراقبة المشرف العام) ⇒ null
+ * (لا إشعار لأي جهة — حتى لا يتحوّل جهاز المراقب إلى جهاز تنبيهات).
+ */
+function conversationCounterpart(
+  conversation: { user_id?: string | null; admin_id?: string | null } | null | undefined,
+  senderId: string,
+): string | null {
+  if (!conversation || !senderId) return null;
+  if (conversation.user_id === senderId) return conversation.admin_id || null;
+  if (conversation.admin_id === senderId) return conversation.user_id || null;
+  return null;
+}
+
+/**
+ * 🔒 رفض مكتوم: لا إشعار ولا طلب FCM — يُعاد السبب للـ Trigger (يُسجَّل في
+ * push_delivery_log من جهة قاعدة البيانات إن مرّ بها الطلب).
+ */
+function refuse(reason: string, status = 200) {
+  console.warn(`[send-push] notification refused: ${reason}`);
+  return json({ sent: 0, total: 0, skipped: reason }, status);
+}
+
+/**
  * هل التوكن ميّت فعلاً (ألغى الجهاز التسجيل أو التوكن غير صالح بنيوياً)؟
  * لا نحذف عند INVALID_ARGUMENT عام: خطأ في الحمولة يُسقط توكنات الأجهزة كلها بالخطأ.
  */
@@ -466,9 +498,28 @@ Deno.serve(async (req) => {
       const callerId = String(input.caller_id || "");
       if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id are required" }, 400);
 
+      // 🔒 مصدر الحقيقة هو غرفة المكالمة في قاعدة البيانات — لا الحمولة وحدها.
+      // الرنين يذهب إلى callee_id المسجَّل في الغرفة، ولا شيء غيره إطلاقاً
+      // (لا سوبر أدمن ولا مشرفين آخرين ولا أي حساب غير المعني بالمكالمة).
+      const { data: room, error: roomError } = await supabase
+        .from("call_rooms")
+        .select("id, caller_id, callee_id, status")
+        .eq("id", roomId)
+        .maybeSingle();
+      if (roomError) return json({ error: "Call room lookup failed" }, 500);
+      if (!room) return refuse("call room not found", 404);
+      if (String(room.callee_id || "") !== calleeId) return refuse("callee mismatch", 409);
+
+      const recipientId = String(room.callee_id || "");
+      const resolvedCallerId = String(room.caller_id || callerId);
+      if (!recipientId || recipientId === resolvedCallerId) return refuse("invalid call parties", 400);
+      // تصريح قاعدة البيانات بالمستلم (v2.9) — أي تباين يعني طلباً مُلفَّقاً ⇒ رفض
+      const declaredRecipient = String(input.recipient_id || "");
+      if (declaredRecipient && declaredRecipient !== recipientId) return refuse("recipient mismatch", 409);
+
       const [{ data: caller }, tokens] = await Promise.all([
-        supabase.from("profiles").select("display_name, avatar_url").eq("id", callerId).maybeSingle(),
-        loadDeviceTokens(calleeId),
+        supabase.from("profiles").select("display_name, avatar_url").eq("id", resolvedCallerId).maybeSingle(),
+        loadDeviceTokens(recipientId),
       ]);
       if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
@@ -478,7 +529,8 @@ Deno.serve(async (req) => {
             type: "incoming_call",
             roomId,
             conversationId: String(input.conversation_id || ""),
-            callerId,
+            callerId: resolvedCallerId,
+            calleeId: recipientId,
             callType: isVideo ? "video" : "audio",
             title: caller?.display_name || "مكالمة واردة",
             body: isVideo ? "📹 مكالمة فيديو واردة — اضغط للرد" : "📞 مكالمة صوتية واردة — اضغط للرد",
@@ -488,6 +540,7 @@ Deno.serve(async (req) => {
             type: "call_ended",
             roomId,
             conversationId: String(input.conversation_id || ""),
+            calleeId: recipientId,
             missed: String(input.status === "missed"),
             title: input.status === "missed" ? `مكالمة فائتة من ${caller?.display_name || "مستخدم"}` : "انتهت المكالمة",
             body: isVideo ? "مكالمة فيديو فائتة" : "مكالمة صوتية فائتة",
@@ -560,10 +613,18 @@ Deno.serve(async (req) => {
       .from("conversations")
       .select("user_id, admin_id")
       .eq("id", conversationId)
-      .single();
-    if (conversationError || !conversation) return json({ error: "Conversation not found" }, 404);
+      .maybeSingle();
+    if (conversationError) return json({ error: "Conversation lookup failed" }, 500);
+    if (!conversation) return json({ error: "Conversation not found" }, 404);
 
-    const recipientId = conversation.user_id === senderId ? conversation.admin_id : conversation.user_id;
+    // 🔒 عزل المستلم: الطرف الآخر في نفس المحادثة حصراً (user_id ⇄ admin_id).
+    // المرسل ليس طرفاً في المحادثة ⇒ لا إشعار لأي جهة (وضع المراقبة/المشاهدة).
+    const recipientId = conversationCounterpart(conversation, senderId);
+    if (!recipientId || recipientId === senderId) return refuse("sender is not a conversation party");
+    // تصريح قاعدة البيانات بالمستلم (v2.9) — أي تباين يعني طلباً مُلفَّقاً ⇒ رفض
+    const declaredRecipient = String(input.recipient_id || "");
+    if (declaredRecipient && declaredRecipient !== recipientId) return refuse("recipient mismatch", 409);
+
     const [{ data: sender }, tokens] = await Promise.all([
       supabase.from("profiles").select("display_name").eq("id", senderId).maybeSingle(),
       loadDeviceTokens(recipientId),

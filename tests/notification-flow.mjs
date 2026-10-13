@@ -9,6 +9,9 @@
  *   3) رسالة Service Worker … {type:"OPEN_CONVERSATION"} → فتح + تمرير للرسالة
  *   4) العدّاد … رسالة لحظية في محادثة غير مفتوحة تزيد الشارة، والنقر عليها
  *      يصفّرها *فوراً* (قبل أي طلب شبكة)
+ *   5) الوضع الصامت … المشرف العام في وضع المراقبة: رسالة في محادثة ليس طرفاً
+ *      فيها تُحدِّث القائمة بلا صوت وبلا إشعار نظام (v2.9)، ورسالة في محادثته
+ *      المباشرة تُنبّه عادياً
  *
  * كل حالة تعمل في عملية Node مستقلة لأن وحدات المشروع تُقيَّم مرة واحدة لكل
  * عملية (حالة modules مشتركة) — والعزل يمنع تسرّب الحالة بين السيناريوهات.
@@ -20,7 +23,7 @@ import { installTestEnv } from "./test-env.mjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const SCENARIOS = ["url", "pending-route", "sw-message", "unread"];
+const SCENARIOS = ["url", "pending-route", "sw-message", "unread", "monitor"];
 const requested = process.argv[2] || "all";
 
 /* ------------------------------------------------------------------
@@ -57,7 +60,7 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /* ------------------------------------------------------------------
  * بيئة jsdom + Supabase وهمي (شبيه بـ tests/smoke.mjs مع مهلة SW)
  * ---------------------------------------------------------------- */
-function createEnv({ url = "http://localhost/index.html", storage = {} } = {}) {
+function createEnv({ url = "http://localhost/index.html", storage = {}, superAdmin = false } = {}) {
   const dom = new JSDOM(HTML, { url, pretendToBeVisual: true });
   const { window } = dom;
 
@@ -72,9 +75,21 @@ function createEnv({ url = "http://localhost/index.html", storage = {} } = {}) {
   Object.entries(storage).forEach(([k, v]) => window.localStorage.setItem(k, v));
 
   /* --- بيانات وهمية --- */
-  const ME = { id: "me", display_name: "أنا", is_admin: false, is_super_admin: false, email: null };
+  const ME = superAdmin
+    ? { id: "me", display_name: "المشرف العام", is_admin: true, is_super_admin: true, email: "almgawell17@gmail.com" }
+    : { id: "me", display_name: "أنا", is_admin: false, is_super_admin: false, email: null };
   const ADMIN = { id: "a1", display_name: "المشرف الأول", is_admin: true, email: "almgawell1@gmail.com" };
   const CONVERSATION = { id: "c1", user_id: "me", admin_id: "a1", last_message: "قديم", last_message_at: "2026-09-21T09:00:00Z" };
+  // محادثة مراقبة: المستخدم العادي "u9" مع مشرف آخر — المشرف العام ليس طرفاً فيها
+  const MONITORED = {
+    id: "c2",
+    user_id: "u9",
+    admin_id: "a2",
+    last_message: "مراقبة",
+    last_message_at: "2026-09-21T08:00:00Z",
+    user: { id: "u9", display_name: "مستخدم مراقب" },
+  };
+  const CONVERSATIONS = superAdmin ? [CONVERSATION, MONITORED] : [CONVERSATION];
   const MESSAGES = [
     { id: "m1", conversation_id: "c1", sender_id: "a1", content: "رسالة قديمة", message_type: "text", status: "read", created_at: "2026-09-21T09:00:00Z" },
     { id: "m2", conversation_id: "c1", sender_id: "a1", content: "الرسالة التي جاء منها الإشعار", message_type: "text", status: "sent", created_at: "2026-09-21T09:05:00Z" },
@@ -107,8 +122,9 @@ function createEnv({ url = "http://localhost/index.html", storage = {} } = {}) {
         return [ADMIN];
       }
       if (table === "conversations") {
-        if (st.filters.some((f) => f[0] === "eq" && f[1] === "id" && f[2] !== "c1")) return null;
-        return st.filters.some((f) => f[0] === "eq" && f[1] === "id") ? CONVERSATION : [CONVERSATION];
+        const byId = st.filters.find((f) => f[0] === "eq" && f[1] === "id");
+        if (byId) return CONVERSATIONS.find((c) => c.id === byId[2]) || null;
+        return CONVERSATIONS;
       }
       if (table === "messages") {
         if (st.filters.some((f) => f[0] === "neq" && f[1] === "status")) return unreadRows;
@@ -123,10 +139,16 @@ function createEnv({ url = "http://localhost/index.html", storage = {} } = {}) {
     return q;
   };
 
+  // تسجيل كل إشعار نظام فعلي وكل تشغيل صوت — للتحقق من الوضع الصامت (v2.9)
+  const shownNotifications = [];
+  const plays = [];
+
   const registration = {
     active: true,
     scope: "http://localhost/firebase-cloud-messaging-push-scope/",
-    showNotification: async () => {},
+    showNotification: async (title, options = {}) => {
+      shownNotifications.push({ title: String(title || ""), tag: String(options?.tag || "") });
+    },
     getNotifications: async () => [],
     update: async () => {},
     addEventListener() {},
@@ -184,7 +206,9 @@ function createEnv({ url = "http://localhost/index.html", storage = {} } = {}) {
     json: async () => ({ token: "t" }),
   });
 
-  window.HTMLMediaElement.prototype.play = async () => {};
+  window.HTMLMediaElement.prototype.play = async function () {
+    plays.push(String(this?.id || this?.src || this?.tagName || "?"));
+  };
   window.HTMLMediaElement.prototype.pause = () => {};
   globalThis.Notification = { permission: "granted", requestPermission: async () => "granted" };
   window.Notification = globalThis.Notification;
@@ -196,7 +220,16 @@ function createEnv({ url = "http://localhost/index.html", storage = {} } = {}) {
   window.addEventListener("error", (e) => errors.push(e.message));
   process.on("unhandledRejection", (e) => errors.push("unhandled: " + (e?.message || e)));
 
-  return { window, document: window.document, errors, realtimeHandlers, swMessageListeners, rpcCalls };
+  return {
+    window,
+    document: window.document,
+    errors,
+    realtimeHandlers,
+    swMessageListeners,
+    rpcCalls,
+    shownNotifications,
+    plays,
+  };
 }
 
 const importApp = (tag) => {
@@ -298,6 +331,104 @@ if (requested === "unread") {
 
   await wait(900);
   check("العدّاد ما زال صفراً بعد المزامنة", badgeText() === "0", badgeText());
+  check("لا أخطاء تشغيل", env.errors.length === 0, env.errors.join(" | "));
+}
+
+/* ------------------------------------------------------------------
+ * 5) الوضع الصامت: المشرف العام في وضع المراقبة (v2.9)
+ * ---------------------------------------------------------------- */
+if (requested === "monitor") {
+  const env = createEnv({ superAdmin: true });
+  await importApp("monitor");
+  await wait(1800);
+
+  const doc = env.document;
+  const insertHandler = env.realtimeHandlers.find(
+    (h) => h.opts?.table === "messages" && h.opts?.event === "INSERT" && !h.opts.filter
+  );
+
+  check("قناة مراقبة الرسائل مشتركة", Boolean(insertHandler));
+  check("قائمة المراقبة تعرض محادثة ليست له", Boolean(doc.querySelector('[data-conversation-id="c2"]')));
+
+  // (أ) رسالة في محادثة مراقبة (ليس طرفاً فيها) ⇒ تحديث القائمة بلا أي تنبيه
+  env.plays.length = 0;
+  env.shownNotifications.length = 0;
+  insertHandler.cb({
+    new: {
+      id: "mM1",
+      conversation_id: "c2",
+      sender_id: "u9",
+      content: "رسالة في محادثة مراقَبة",
+      message_type: "text",
+      created_at: new Date().toISOString(),
+    },
+  });
+  await wait(250);
+
+  check("لا صوت إشعار لرسالة في محادثة مراقَبة", !env.plays.includes("notification-sound"), JSON.stringify(env.plays));
+  check("لا إشعار نظام لرسالة في محادثة مراقَبة", env.shownNotifications.length === 0, JSON.stringify(env.shownNotifications));
+  check(
+    "لكن القائمة تحدّثت (مراقبة صامتة لا تعطيل)",
+    doc.querySelector('[data-conversation-id="c2"] .contact-sub')?.textContent?.includes("مراقَبة")
+  );
+
+  // (ب) رسالة في محادثة هو طرف مباشر فيها ⇒ تنبيه طبيعي
+  env.plays.length = 0;
+  env.shownNotifications.length = 0;
+  insertHandler.cb({
+    new: {
+      id: "mM2",
+      conversation_id: "c1",
+      sender_id: "a1",
+      content: "رسالة في محادثتي",
+      message_type: "text",
+      created_at: new Date().toISOString(),
+    },
+  });
+  await wait(250);
+
+  check("صوت الإشعار يعمل في محادثة هو طرف فيها", env.plays.includes("notification-sound"), JSON.stringify(env.plays));
+  check(
+    "إشعار النظام يظهر في محادثة هو طرف فيها",
+    env.shownNotifications.some((n) => n.tag === "conversation-c1"),
+    JSON.stringify(env.shownNotifications)
+  );
+
+  // (ج) بطاقة مكالمة لا تُنتج إشعار رسالة (لمسار المكالمات إشعاره الخاص)
+  env.plays.length = 0;
+  env.shownNotifications.length = 0;
+  insertHandler.cb({
+    new: {
+      id: "mM3",
+      conversation_id: "c1",
+      sender_id: "a1",
+      content: "📞 مكالمة",
+      message_type: "call",
+      created_at: new Date().toISOString(),
+    },
+  });
+  await wait(250);
+  check("بطاقة مكالمة لا تُشغّل صوت إشعار رسالة", !env.plays.includes("notification-sound"));
+
+  // (د) فتح محادثة مراقَبة: اطلاع فقط — لا نغيّر حالة أصحابها ولا نُصدر صوتاً
+  env.plays.length = 0;
+  env.shownNotifications.length = 0;
+  env.rpcCalls.length = 0;
+  doc.querySelector('[data-conversation-id="c2"]').click();
+  await wait(1200);
+
+  check("محادثة المراقبة تُفتح للاطلاع", doc.body.classList.contains("viewing-chat"));
+  check(
+    "لا طلب قراءة لمحادثة نراقبها (لا تتغيّر حالة أصحابها)",
+    !env.rpcCalls.some((c) => c.name === "mark_conversation_read" && c.args?.p_conversation_id === "c2"),
+    JSON.stringify(env.rpcCalls.map((c) => c.name))
+  );
+  check(
+    "فتح محادثة المراقبة لا يُصدر صوتاً ولا إشعاراً",
+    !env.plays.includes("notification-sound") && env.shownNotifications.length === 0,
+    JSON.stringify({ plays: env.plays, shown: env.shownNotifications })
+  );
+
   check("لا أخطاء تشغيل", env.errors.length === 0, env.errors.join(" | "));
 }
 

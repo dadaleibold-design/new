@@ -13,6 +13,8 @@
 
 import { AGORA, isAgoraConfigured, buildAgoraChannelName } from "./config.js";
 import { safeAsync, safeQuery, safeDom, guard } from "./safety.js";
+// عزل الرنين (v2.9): لا يرن إلا الجهاز الذي هو callee_id في غرفة المكالمة
+import { shouldRingForInvite } from "./notification-scope.js";
 import {
   startRingtone,
   stopRingtone as stopRingtoneEngine,
@@ -1099,6 +1101,8 @@ export async function startCall(callType = "audio") {
     channel,
     callType,
     conversationId: conv.id,
+    // تصريح صريح بالمستهدف: المستقبل يرفض أي دعوة لا تحمل معرّفه (v2.9)
+    calleeId: peer.id,
     caller: {
       id: me.id,
       display_name: me.display_name,
@@ -1140,6 +1144,27 @@ export async function startCall(callType = "audio") {
  * ---------------------------------------------------------- */
 async function handleIncomingInvite(payload) {
   if (!payload?.roomId || !payload?.channel) return;
+
+  const me = callState.ctx?.getMe?.();
+  if (!me?.id) return;
+
+  // ⛔ عزل الرنين: لا يرن هذا الجهاز إلا إذا كان هو callee_id الفعلي في غرفة
+  //    المكالمة المسجَّلة في قاعدة البيانات. أي دعوة أخرى (بث خاطئ، مراقبة
+  //    المشرف العام، دعوة أُلغيت) تُتجاهل تماماً بلا رنين ولا إشعار.
+  const supabase = callState.ctx?.supabase;
+  const { ok, data: room } = await safeQuery("calls:verify-invite", () =>
+    supabase
+      .from("call_rooms")
+      .select("id, caller_id, callee_id, status")
+      .eq("id", payload.roomId)
+      .maybeSingle()
+  );
+
+  const verdict = shouldRingForInvite({ payload, room, roomChecked: ok, meId: me.id });
+  if (!verdict.ring) {
+    console.warn("[calls] تجاهل دعوة مكالمة ليست موجّهة لهذا الجهاز:", verdict.reason);
+    return;
+  }
 
   // مشغول بمكالمة أخرى → ارفض تلقائياً
   if (callState.current || callState.incoming) {
