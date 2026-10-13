@@ -302,3 +302,46 @@ body[data-theme="light"] .day-separator span{background:#fff;color:#54656f}
 .bubble-row.mine:not(.own) .bubble{background:color-mix(in srgb,var(--wa-bubble-mine-dark) 80%,#2a3942)}
 body[data-theme="light"] .bubble-row.mine:not(.own) .bubble{background:color-mix(in srgb,var(--wa-bubble-mine-light) 85%,#fff)}
 #chat-header-name .owner-admin-badge{vertical-align:middle}
+
+/* =========================================================
+   Image Lightbox — عارض صور المحادثة بملء الشاشة
+   ========================================================= */
+.msg-attachment{cursor:zoom-in;-webkit-user-drag:none;user-select:none;-webkit-touch-callout:none}
+.msg-attachment:focus-visible{outline:2px solid var(--wa-green);outline-offset:2px}
+
+.lightbox{position:fixed;inset:0;z-index:9500;display:flex;flex-direction:column;overflow:hidden;overscroll-behavior:contain;background:rgba(0,0,0,.88);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);color:#fff;animation:lightbox-in .18s ease;touch-action:none;user-select:none;-webkit-user-select:none}
+@keyframes lightbox-in{from{opacity:0}to{opacity:1}}
+body.lightbox-open{overflow:hidden}
+
+.lightbox-toolbar{position:absolute;top:0;inset-inline:0;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:calc(env(safe-area-inset-top,0px) + 10px) 12px 10px;background:linear-gradient(to bottom,rgba(0,0,0,.6),rgba(0,0,0,0));pointer-events:none}
+.lightbox-group{display:flex;align-items:center;gap:8px;pointer-events:auto}
+.lightbox-btn{width:42px;height:42px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:50%;background:rgba(17,27,33,.6);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px);color:#fff;font-size:18px;line-height:1;transition:background .15s ease,transform .15s ease;-webkit-tap-highlight-color:transparent}
+.lightbox-btn:hover{background:rgba(17,27,33,.85)}
+.lightbox-btn:active{transform:scale(.92)}
+.lightbox-btn:disabled{opacity:.35;cursor:default}
+.lightbox-btn.lightbox-close{background:rgba(17,27,33,.75);font-size:20px}
+.lightbox-btn.lightbox-download.is-busy{animation:lightbox-pulse 1s ease-in-out infinite}
+@keyframes lightbox-pulse{50%{opacity:.4}}
+.lightbox-btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
+
+.lightbox-stage{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;touch-action:none;cursor:default}
+.lightbox-img{flex:none;display:block;max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;transform-origin:center center;will-change:transform;user-select:none;-webkit-user-select:none;-webkit-user-drag:none;-webkit-touch-callout:none;pointer-events:auto;cursor:grab;transition:transform .12s ease-out;touch-action:none}
+.lightbox-img.is-zoomed{cursor:grab;transition:none}
+.lightbox-img:active{cursor:grabbing}
+
+.lightbox-spinner{position:absolute;top:50%;left:50%;width:42px;height:42px;margin:-21px 0 0 -21px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:boot-spin .8s linear infinite;pointer-events:none}
+.lightbox-status{position:absolute;inset-inline:0;bottom:calc(env(safe-area-inset-bottom,0px) + 20px);padding:0 16px;text-align:center;font-size:13.5px;color:#e9edef;pointer-events:none}
+.lightbox-status:empty{display:none}
+.lightbox-status{text-shadow:0 1px 4px rgba(0,0,0,.8)}
+
+@media (max-width:380px){
+  .lightbox-btn{width:38px;height:38px;font-size:16px}
+  .lightbox-group{gap:4px}
+  .lightbox-toolbar{padding-inline:8px}
+}
+@media (hover:none) and (pointer:coarse){
+  .lightbox-group .lightbox-btn:not(.lightbox-close):not(.lightbox-download){display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  .lightbox,.lightbox-img{animation:none;transition:none}
+}

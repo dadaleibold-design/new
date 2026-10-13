@@ -50,6 +50,7 @@ import {
   guard,
 } from "./safety.js";
 import { prepareFileForUpload, MEDIA_PRESETS, formatBytes } from "./media.js";
+import { initImageLightbox } from "./lightbox.js";
 import {
   createResilientChannel,
   ensureRealtimeConnected,
@@ -68,6 +69,9 @@ import {
 
 // يُشغَّل عند استيراد الوحدة (قبل boot) حتى لا يضيع نقر إشعار وقع أثناء الإقلاع
 initNotificationRouter();
+
+// عارض الصور بملء الشاشة: تفويض أحداث على الوثيقة (يعمل مع الصور الجديدة والقديمة)
+initImageLightbox();
 
 const state = {
   me: null,
@@ -3337,7 +3341,10 @@ function buildMessageBubble(m) {
           src="${escapeHtml(
             m.attachment_url
           )}"
-          alt=""
+          alt="${state.lang === "en" ? "Image" : "صورة"}"
+          role="button"
+          tabindex="0"
+          aria-haspopup="dialog"
           loading="lazy"
           decoding="async"
         >
