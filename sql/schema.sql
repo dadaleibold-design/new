@@ -4,7 +4,7 @@
 -- ============================================================
 
 -- Extensions
-create extension if not exists "uuid-ossp";
+DROP FUNCTION IF EXISTS;
 
 -- ------------------------------------------------------------
 -- 1. PROFILES  (one row per auth.users row)
