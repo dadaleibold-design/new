@@ -1,6 +1,6 @@
-import { supabase } from "./supabaseClient.js";
+import { supabase, supabaseInitError, isSupabaseReady } from "./supabaseClient.js";
 import { signUp, signIn, signOut, getCurrentProfile, looksLikeEmail } from "./auth.js";
-import { ADMINS, SUPABASE_URL, SUPABASE_ANON_KEY } from "./config.js";
+import { SUPABASE_URL, SUPABASE_ANON_KEY, missingEnvKeys } from "./config.js";
 import { applyLanguage } from "./i18n.js";
 import {
   cacheMessages,
@@ -130,7 +130,29 @@ const state = {
   lastRenderedSignature: "",
   messagesHasMore: false,
   loadingOlder: false,
+
+  // دليل المستخدمين (المشرف): بحث حي في كل المسجّلين في جدول profiles
+  directoryChannel: null,
+  directoryOpen: false,
+  directoryQuery: "",
+  directoryUsers: [],
+  directoryTotal: 0,
+  directoryLoading: false,
+  directoryTimer: null,
+  directoryRequestId: 0,
+  directoryHiddenBefore: null,
+  // تنبيه داخلي لمستخدم جديد (من Realtime) — يستخدمه النقر على التنبيه
+  pendingUserAlert: null,
 };
+
+const DIRECTORY_PAGE_SIZE = 60;
+const DIRECTORY_SECTION_SELECTORS = [
+  "#contact-list",
+  "#admins-heading",
+  "#admins-section",
+  "#users-heading",
+  "#users-section",
+];
 
 const MESSAGES_PAGE_SIZE = 80;
 const MESSAGE_COLUMNS =
@@ -138,7 +160,49 @@ const MESSAGE_COLUMNS =
 
 const $ = (sel) => document.querySelector(sel);
 
+/**
+ * شاشة «إعداد البيئة ناقص»: تظهر فقط عندما يتعذّر إنشاء عميل Supabase
+ * (أي أن المفاتيح لم تُضبط في متغيرات البيئة). لا مفاتيح ثابتة في الكود،
+ * لذا نُخبر المسؤول بالخطوات الدقيقة بدل شاشة بيضاء أو خطأ غامض.
+ */
+function showConfigErrorScreen() {
+  safeDom("boot:config-error", () => {
+    document.querySelector("#boot-loading")?.classList.add("hidden");
+    document.querySelector("#auth-screen")?.classList.add("hidden");
+    document.querySelector("#app-shell")?.classList.add("hidden");
+
+    const box = document.querySelector("#config-error");
+    if (!box) return;
+
+    const missing = missingEnvKeys();
+    const list = document.querySelector("#config-error-list");
+    const detail = document.querySelector("#config-error-detail");
+
+    if (list) {
+      list.innerHTML = "";
+      const keys = missing.length ? missing : missing.filter(() => false);
+      (keys.length ? keys : ["VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY"]).forEach((key) => {
+        const li = document.createElement("li");
+        li.textContent = key;
+        list.appendChild(li);
+      });
+    }
+
+    if (detail) {
+      detail.textContent = supabaseInitError || "إعدادات Supabase غير متوفرة.";
+    }
+
+    box.classList.remove("hidden");
+  });
+}
+
 async function boot() {
+  // لا نُقلع بلا عميل Supabase: نعرض شاشة الإعداد بدل الانهيار الصامت
+  if (!isSupabaseReady()) {
+    showConfigErrorScreen();
+    return;
+  }
+
   // حاجز الأخطاء العام: يمنع أي استثناء غير معالج من تجميد/إسقاط الواجهة
   installGlobalErrorBoundary({ notify: (msg) => showAuthError(msg) });
 
@@ -422,8 +486,10 @@ async function enterApp() {
   });
 
   state.me = profileResult.data;
-  if (state.me?.email && ADMINS.some((admin) => admin.email.toLowerCase() === state.me.email.toLowerCase())) {
-    state.me.is_admin = true;
+  // صلاحية المشرف تُقرأ من قاعدة البيانات فقط (profiles.is_admin/is_super_admin)
+  // ولا تُشتق من أي قائمة بُرد ثابتة في الواجهة.
+  if (state.me) {
+    state.me.is_admin = Boolean(state.me.is_admin || state.me.is_super_admin);
   }
 
   if (!state.me) {
@@ -464,6 +530,8 @@ async function enterApp() {
     subscribeGlobalMessageWatch();
     subscribeToIncomingCalls();
     subscribeCallRoomsWatch();
+    // دليل المستخدمين: تحديث لحظي عند تسجيل مستخدم جديد (بجانب إشعار FCM)
+    subscribeAdminDirectory();
   });
 
   // نبضة اليقظة: تكتشف موت اتصال Realtime (تجميد التبويب/Doze) وتُحييه
@@ -910,11 +978,19 @@ function switchAuthTab(which) {
   $("#signup-form")?.classList.toggle("hidden", which !== "signup");
 }
 
-function showAuthError(msg) {
+/**
+ * يعرض التنبيه (في شاشة الدخول أو كتنبيه عائم بعد الدخول).
+ * @param {string} msg النص
+ * @param {{id:string, label?:string}|null} [action] إجراء اختياري: نقر التنبيه ينفّذه
+ */
+function showAuthError(msg, action = null) {
   const text =
     msg ||
     state.t?.error_generic ||
     "حدث خطأ ما";
+
+  // التنبيه العائم قابل للنقر — نربط الإجراء الحالي فقط
+  state.pendingUserAlert = action?.id ? action : null;
 
   const authScreenVisible =
     !$("#auth-screen")?.classList.contains("hidden");
@@ -937,6 +1013,8 @@ function showAuthError(msg) {
 
     toast.textContent = text;
     toast.classList.remove("hidden");
+    // تنبيه قابل للنقر (مستخدم جديد) — يُبرز للمستخدم أنه إجراء لا مجرد رسالة
+    toast.classList.toggle("toast-action", Boolean(state.pendingUserAlert));
 
     clearTimeout(toast._hideTimeout);
 
@@ -1172,10 +1250,62 @@ function wireChrome() {
     guard("settings:remove-wallpaper", () => removeProfileMedia("wallpaper_url"))
   );
 
-  // بحث فوري في قائمة جهات الاتصال (كان الحقل بلا ربط)
-  $(".search-box input")?.addEventListener(
+  // بحث فوري في قائمة جهات الاتصال. للمشرف: بحث حي في **كل** المسجّلين
+  // (جدول profiles) مع إمكانية بدء محادثة فورية مع أي مستخدم.
+  const searchInput = $(".search-box input");
+
+  searchInput?.addEventListener(
     "input",
-    guard("sidebar:search", (e) => filterContactList(e.target.value))
+    guard("sidebar:search", (e) => handleSidebarSearchInput(e.target.value))
+  );
+
+  searchInput?.addEventListener(
+    "focus",
+    guard("sidebar:search-focus", (e) => {
+      if (!state.me?.is_admin) return;
+      if (state.directoryOpen) return;
+      state.directoryQuery = String(e.target.value || "").trim();
+      setDirectoryVisible(true);
+      safeAsync("directory:focus", () => refreshDirectory(state.directoryQuery));
+    })
+  );
+
+  searchInput?.addEventListener(
+    "keydown",
+    guard("sidebar:search-key", (e) => {
+      if (e.key !== "Escape") return;
+      closeDirectory();
+      e.target.blur?.();
+    })
+  );
+
+  // زر إغلاق الدليل (يعمل باللمس على الجوال بلا حاجة لمفتاح Escape)
+  $("#directory-close")?.addEventListener(
+    "click",
+    guard("directory:close", () => closeDirectory())
+  );
+
+  // «عرض المزيد»: الصفحة التالية من قائمة المسجّلين
+  $("#directory-more")?.addEventListener(
+    "click",
+    guard("directory:more", () =>
+      safeAsync("directory:more", () => refreshDirectory(state.directoryQuery, { append: true }))
+    )
+  );
+
+  // التنبيه العائم قابل للنقر: إن كان عن مستخدم جديد يفتح محادثة معه فوراً
+  $("#global-toast")?.addEventListener(
+    "click",
+    guard("toast:action", () => {
+      const alert = state.pendingUserAlert;
+      if (!alert?.id) return;
+      state.pendingUserAlert = null;
+      $(".search-box input")?.blur?.();
+      safeAsync("toast:open-user", async () => {
+        const opened = await openConversationWithUser(alert.id);
+        if (!opened) showAuthError("تعذّر فتح محادثة مع المستخدم الجديد.");
+      });
+    })
   );
 
   // أغلق لوحة الإعدادات عند النقر خارجها
@@ -1517,7 +1647,18 @@ async function openRouteFromNotification(route) {
     if (handled.data) return;
   }
 
-  if (!route.conversationId) return;
+  if (!route.conversationId) {
+    // إشعار «مستخدم جديد» للمشرف: الهدف مستخدم وليس محادثة قائمة → نُنشئها فوراً
+    if (route.userId) {
+      const opened = await safeAsync("route:new-user", () =>
+        openConversationWithUser(route.userId, { messageId: route.messageId })
+      );
+      if (!opened.ok || !opened.data) {
+        showAuthError("تعذّر فتح محادثة مع المستخدم الجديد — تحقق من الاتصال.");
+      }
+    }
+    return;
+  }
 
   closeConversationNotifications(route.conversationId);
   resetUnreadFor(route.conversationId);
@@ -1555,16 +1696,12 @@ function handleDeepLinks() {
 /**
  * هل هذا الطرف مشرف؟ يُستخدم لتثبيت حالة "متصل الآن" وإظهارها دائماً.
  *
- * الشرط يشمل أكثر من مسار حتى لا تعتمد النتيجة على اكتمال حقل واحد:
- *   • البريد مطابق لقائمة المشرفين الثابتة في js/config.js (ADMINS)
- *   • أو حقل is_admin / is_super_admin في الملف الشخصي
- *   • أو بيانات المحادثة القائمة (نفس الحقول)
+ * المصدر الوحيد: علامات قاعدة البيانات (is_admin / is_super_admin) في الملف
+ * الشخصي أو في بيانات المحادثة القائمة — لا قائمة بُرد ثابتة في الواجهة.
  */
 function isAdminContact(id, profile = null) {
   const candidate = profile || state.contacts?.find((c) => c.id === id) || null;
-  const email = String(candidate?.email || "").toLowerCase().trim();
 
-  if (email && ADMINS.some((a) => String(a.email).toLowerCase() === email)) return true;
   if (candidate?.is_admin || candidate?.is_super_admin) return true;
 
   const known = state.contacts?.find((c) => c.id === id);
@@ -1667,6 +1804,351 @@ function filterContactList(rawQuery) {
       emptyEl.classList.add("hidden");
     }
   });
+}
+
+/* ============================================================
+ * دليل المستخدمين الشامل (للمشرف)
+ * ------------------------------------------------------------
+ * المشكلة القديمة: مربع البحث كان يُخفي/يُظهر صفوف المحادثات المعروضة فقط،
+ * فالمستخدم الذي ليس له محادثة سابقة لا يظهر أبداً ولا يمكن بدء محادثة معه.
+ *
+ * الحل: عند تفعيل المشرف للبحث نفتح «الدليل» ونجلب من جدول profiles مباشرة:
+ *   • بحث فارغ  ⇒ كل المسجّلين (الأحدث تسجيلاً أولاً) مع العدّاد الكلي.
+ *   • كتابة     ⇒ بحث حي (debounce) في الاسم/البريد/الهاتف عبر الدالة
+ *                 admin_directory_search (مع مسار احتياطي بالاستعلام المباشر).
+ *   • النقر على أي نتيجة ⇒ فتح/إنشاء محادثة فورية مع ذلك المستخدم.
+ * ============================================================ */
+
+/** يفتح الدليل ويخفي أقسام القائمة مؤقتاً (مع حفظ حالتها لإرجاعها عند الإغلاق) */
+function setDirectoryVisible(visible) {
+  state.directoryOpen = Boolean(visible);
+
+  safeDom("directory:visibility", () => {
+    if (state.directoryOpen) {
+      if (!state.directoryHiddenBefore) {
+        state.directoryHiddenBefore = DIRECTORY_SECTION_SELECTORS.map((sel) => [
+          sel,
+          Boolean($(sel)?.classList.contains("hidden")),
+        ]);
+      }
+      DIRECTORY_SECTION_SELECTORS.forEach((sel) => $(sel)?.classList.add("hidden"));
+      $("#directory-heading")?.classList.remove("hidden");
+      $("#directory-section")?.classList.remove("hidden");
+      return;
+    }
+
+    DIRECTORY_SECTION_SELECTORS.forEach((sel) => {
+      const wasHidden = state.directoryHiddenBefore?.find(([s]) => s === sel)?.[1];
+      // لا نُظهر ما كان مخفياً قبل فتح الدليل (مثل قسم المشرفين لغير المشرف)
+      if (!wasHidden) $(sel)?.classList.remove("hidden");
+    });
+    state.directoryHiddenBefore = null;
+
+    ["#directory-heading", "#directory-section", "#directory-footer"].forEach((sel) =>
+      $(sel)?.classList.add("hidden")
+    );
+  });
+}
+
+/** يُعيد تطبيق حالة الدليل بعد أي إعادة رسم لقوائم المحادثات */
+function reapplyDirectoryVisibility() {
+  if (!state.directoryOpen) return;
+  safeDom("directory:reapply", () => {
+    DIRECTORY_SECTION_SELECTORS.forEach((sel) => $(sel)?.classList.add("hidden"));
+  });
+}
+
+function isDirectoryOpen() {
+  return Boolean(state.directoryOpen && state.me?.is_admin);
+}
+
+/** يُغلق الدليل ويفرّغ مربع البحث ويُرجع قوائم المحادثات كما كانت */
+function closeDirectory({ clearInput = true } = {}) {
+  if (clearInput) {
+    const input = document.querySelector(".search-box input");
+    if (input) input.value = "";
+    filterContactList("");
+  }
+  if (!state.directoryOpen) return;
+  setDirectoryVisible(false);
+}
+
+/** مدخل أي كتابة في مربع البحث: تصفية محلية + بحث حي في كل المسجّلين للمشرف */
+function handleSidebarSearchInput(value) {
+  filterContactList(value);
+
+  if (!state.me?.is_admin) return;
+
+  const query = String(value || "").trim();
+  state.directoryQuery = query;
+
+  if (!state.directoryOpen) {
+    setDirectoryVisible(true);
+    // فتح أول مرة: امسح النتائج القديمة واعرض قائمة كاملة فوراً
+    state.directoryUsers = [];
+    state.directoryTotal = 0;
+  }
+
+  scheduleDirectorySearch(query, { immediate: !query });
+}
+
+/** بحث حي مؤجَّل (debounce) حتى لا نُغرق الخادم مع كل حرف */
+function scheduleDirectorySearch(query, { immediate = false } = {}) {
+  clearTimeout(state.directoryTimer);
+  state.directoryTimer = setTimeout(() => {
+    state.directoryTimer = null;
+    safeAsync("directory:search", () => refreshDirectory(query));
+  }, immediate ? 0 : 220);
+}
+
+/**
+ * جلب صفحة من الدليل.
+ * المسار المفضّل: دالة admin_directory_search (تطابق الهاتف بأي صيغة + conversation_id).
+ * المسار الاحتياطي: استعلام مباشر على profiles (يعمل قبل تنفيذ هجرة v2.8).
+ */
+async function fetchDirectoryUsers(query, { offset = 0, limit = DIRECTORY_PAGE_SIZE } = {}) {
+  const rpc = await safeQuery("directory:rpc", () =>
+    supabase.rpc("admin_directory_search", {
+      p_query: query || "",
+      p_limit: limit,
+      p_offset: offset,
+    })
+  );
+
+  if (rpc.ok && rpc.data && Array.isArray(rpc.data.users)) {
+    return { ok: true, users: rpc.data.users, total: Number(rpc.data.total) || 0 };
+  }
+
+  if (rpc.error) {
+    console.warn("[directory] تعذّر استخدام admin_directory_search — مسار احتياطي:", rpc.error?.message || rpc.error);
+  }
+
+  const safeQueryText = String(query || "")
+    .replace(/[,()%_\\]/g, " ")
+    .trim();
+
+  let request = supabase
+    .from("profiles")
+    .select("*", { count: "exact" })
+    .neq("id", state.me.id)
+    .order("created_at", { ascending: false, nullsFirst: false })
+    .range(offset, offset + Math.max(limit - 1, 0));
+
+  if (safeQueryText) {
+    const pattern = `%${safeQueryText}%`;
+    request = request.or(
+      `display_name.ilike.${pattern},email.ilike.${pattern},phone.ilike.${pattern}`
+    );
+  }
+
+  const res = await safeQuery("directory:table", () => request);
+  if (!res.ok) return { ok: false, users: [], total: 0, error: res.error };
+
+  const users = (res.data || []).map((u) => ({
+    ...u,
+    email: /^phone\.\d+@users\.local$/i.test(String(u.email || "")) ? null : u.email,
+  }));
+
+  return { ok: true, users, total: Number(res.count) || users.length };
+}
+
+/** يجلب (أو يجدد) نتائج الدليل ويرسمها — مع تجاهل النتائج القديمة المتأخرة */
+async function refreshDirectory(query, { append = false } = {}) {
+  if (!state.me?.is_admin) return;
+
+  const requestId = ++state.directoryRequestId;
+  const offset = append ? state.directoryUsers.length : 0;
+  state.directoryLoading = true;
+  renderDirectoryStatus("loading");
+
+  const result = await fetchDirectoryUsers(query, { offset });
+  if (requestId !== state.directoryRequestId) return; // نتيجة قديمة — تجاهل
+
+  state.directoryLoading = false;
+
+  if (!result.ok) {
+    renderDirectoryStatus("error");
+    return;
+  }
+
+  state.directoryQuery = query;
+  state.directoryTotal = result.total || 0;
+  state.directoryUsers = append
+    ? [...state.directoryUsers, ...result.users]
+    : result.users;
+
+  renderDirectory();
+}
+
+function renderDirectoryStatus(kind) {
+  safeDom("directory:status", () => {
+    const section = $("#directory-section");
+    const t = state.t || {};
+    if (!section) return;
+
+    setDirectoryVisible(true);
+    $("#directory-footer")?.classList.add("hidden");
+
+    if (kind === "loading") {
+      section.innerHTML = `<div class="directory-status">${escapeHtml(
+        t.directory_loading || "جاري البحث…"
+      )}</div>`;
+      return;
+    }
+
+    section.innerHTML = `<div class="directory-status error">${escapeHtml(
+      t.directory_error || "تعذّر تحميل دليل المستخدمين — تحقق من الاتصال ثم أعد المحاولة."
+    )}</div>`;
+  });
+}
+
+/** يرسم نتائج الدليل: صف لكل مستخدم مع بيانات التواصل وزر بدء المحادثة */
+function renderDirectory() {
+  safeDom("directory:render", () => {
+    const section = $("#directory-section");
+    if (!section) return;
+
+    const t = state.t || {};
+    const users = state.directoryUsers || [];
+
+    section.innerHTML = "";
+
+    if (!users.length) {
+      const empty = document.createElement("div");
+      empty.className = "directory-status";
+      empty.id = "directory-empty";
+      empty.textContent = state.directoryQuery
+        ? t.directory_empty || "لا يوجد مستخدمون مطابقون"
+        : t.directory_none || "لا يوجد مستخدمون مسجّلون بعد";
+      section.appendChild(empty);
+    } else {
+      const frag = document.createDocumentFragment();
+      users.forEach((user) => {
+        try {
+          frag.appendChild(buildDirectoryRow(user));
+        } catch (err) {
+          console.error("buildDirectoryRow failed:", user?.id, err);
+        }
+      });
+      section.appendChild(frag);
+    }
+
+    const headingText = $("#directory-heading-text");
+    if (headingText) {
+      headingText.textContent = state.directoryQuery
+        ? t.directory_results || "نتائج البحث في كل المستخدمين"
+        : t.directory || "كل المستخدمين المسجّلين";
+    }
+
+    const count = $("#directory-count");
+    if (count) {
+      count.textContent = String(state.directoryTotal || users.length);
+      count.classList.remove("hidden");
+      count.title = t.directory_total || "إجمالي المسجّلين";
+    }
+
+    const footer = $("#directory-footer");
+    if (footer) {
+      const hasMore = users.length < (state.directoryTotal || 0);
+      footer.classList.toggle("hidden", !hasMore);
+      const more = $("#directory-more");
+      if (more) {
+        more.textContent = `${t.directory_show_more || "عرض المزيد"} (${users.length}/${
+          state.directoryTotal
+        })`;
+      }
+    }
+  });
+}
+
+/** يحوّل بيانات المستخدم المخزّنة إلى صف جاهز في الدليل */
+function buildDirectoryRow(user) {
+  const known = state.contacts?.find((c) => c.id === user.id) || null;
+  const conversationId = user.conversation_id || known?._conversationId || null;
+  const t = state.t || {};
+
+  const entry = {
+    ...user,
+    _conversationId: conversationId,
+    _unread: known?._unread || 0,
+    _lastAt: known?._lastAt || user.last_message_at || null,
+    _subtitle: directorySubtitle(user),
+    _directoryTag: conversationId ? t.directory_has_chat || "محادثة قائمة" : "",
+  };
+
+  const row = buildContactRow(entry, {
+    withUnread: true,
+    directory: true,
+    onOpen: () => openDirectoryEntry(entry),
+  });
+
+  row.dataset.directoryUser = String(user.id || "");
+  row.title = t.directory_open || "اضغط لبدء محادثة فورية";
+  return row;
+}
+
+/** سطر توضيحي للصف: بيانات التواصل + تاريخ التسجيل */
+function directorySubtitle(user) {
+  const t = state.t || {};
+  const contact = [user.phone, user.email].filter(Boolean).join(" · ");
+  const joined = formatJoinedLabel(user.created_at);
+  if (contact && joined) return `${contact} · ${joined}`;
+  if (contact) return contact;
+  return joined || t.directory_no_contact || "لا توجد بيانات تواصل";
+}
+
+/** تاريخ الانضمام بصيغة مختصرة (اليوم/أمس/تاريخ) */
+function formatJoinedLabel(iso) {
+  const t = state.t || {};
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+
+  const label = t.directory_joined || "انضم";
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return `${label} ${t.today || "اليوم"}`;
+  }
+  const yesterday = new Date();
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) {
+    return `${label} ${t.yesterday || "أمس"}`;
+  }
+  const locale = state.lang === "ar" ? "ar-SA" : "en-US";
+  return `${label} ${date.toLocaleDateString(locale, { day: "2-digit", month: "2-digit", year: "2-digit" })}`;
+}
+
+/** فتح محادثة من الدليل: تُنشأ المحادثة فوراً إن لم تكن موجودة */
+async function openDirectoryEntry(entry) {
+  const profile = { ...entry };
+  closeDirectory();
+
+  await openConversation(profile);
+
+  // أضف المحادثة الجديدة إلى قائمة المحادثات (تظهر تحت قسم المحادثات)
+  await safeAsync("directory:reload-contacts", () => loadContacts());
+}
+
+/** يفتح محادثة (أو يُنشئها) مع مستخدم بالمعرّف — يُستخدم أيضاً عند نقر إشعار «مستخدم جديد» */
+async function openConversationWithUser(userId, { messageId = null } = {}) {
+  if (!userId || !state.me) return false;
+  if (String(userId) === String(state.me.id)) return false;
+
+  let profile =
+    state.contacts?.find((c) => c.id === userId) ||
+    state.directoryUsers?.find((u) => u.id === userId) ||
+    null;
+
+  if (!profile) {
+    const { ok, data } = await safeQuery("route:user-profile", () =>
+      supabase.from("profiles").select("*").eq("id", userId).maybeSingle()
+    );
+    if (!ok || !data) return false;
+    profile = data;
+  }
+
+  await openConversation({ ...profile }, { messageId });
+  return true;
 }
 
 function toggleLanguage() {
@@ -1979,6 +2461,9 @@ function renderContactsFromCache(cached) {
 
   list.appendChild(fragment);
 
+  // إن كان دليل المستخدمين مفتوحاً: أبقِ قوائم المحادثات مخفية
+  reapplyDirectoryVisibility();
+
   updateUnreadTotals();
 }
 
@@ -1988,7 +2473,8 @@ async function loadContactsFromNetwork() {
   if (!state.me.is_admin) {
     // المستخدم العادي: قائمة المشرفين + عدّاد غير المقروء + ترتيب حسب آخر تفاعل
     const [{ data: adminProfiles }, { data: myConvs }] = await Promise.all([
-      supabase.from("profiles").select("*").in("email", ADMINS.map((a) => a.email)),
+      // المشرفون = من يمنحه السيرفر is_admin/is_super_admin (لا قائمة بُرد في الكود)
+      supabase.from("profiles").select("*").or("is_admin.eq.true,is_super_admin.eq.true"),
       supabase
         .from("conversations")
         .select("id, admin_id, last_message, last_message_at")
@@ -2166,6 +2652,9 @@ async function loadContactsFromNetwork() {
       ])
     );
   }
+
+  // إن كان دليل المستخدمين مفتوحاً: أبقِ قوائم المحادثات مخفية
+  reapplyDirectoryVisibility();
 
   // إجماليات الأقسام + شارة أيقونة التطبيق بعد كل تحديث للقائمة
   updateUnreadTotals();
@@ -2417,10 +2906,15 @@ function buildContactRow(c, opts) {
             ? `<span class="owner-admin-badge">${escapeHtml(c._ownerAdminName)}</span>`
             : ""
         }
+        ${
+          c._directoryTag
+            ? `<span class="directory-tag">${escapeHtml(c._directoryTag)}</span>`
+            : ""
+        }
       </div>
 
       <div class="contact-sub">
-        ${escapeHtml(c._lastMessage || "")}
+        ${escapeHtml(c._subtitle || c._lastMessage || "")}
       </div>
     </div>
 
@@ -2479,12 +2973,21 @@ function buildContactRow(c, opts) {
     // تصفير العدّاد لحظة النقر — قبل أي عمل غير متزامن داخل openConversation.
     // (المطلوب: يزول العدّاد بمجرد فتح المحادثة لا بعد جهوزية الشبكة).
     if (c._conversationId) resetUnreadFor(c._conversationId);
+
+    // صفوف الدليل لها سلوك فتح خاص (إنشاء المحادثة + تحديث القائمة)
+    if (typeof opts.onOpen === "function") {
+      opts.onOpen(c);
+      return;
+    }
+
     openConversation(c);
   });
 
   if (
     opts.withUnread &&
-    c._conversationId
+    c._conversationId &&
+    // صفوف الدليل لا تُسجَّل في خريطة صفوف المحادثات (قد تتكرّر مع صف القائمة)
+    !opts.directory
   ) {
     row.dataset.conversationId =
       c._conversationId;
@@ -2793,7 +3296,7 @@ async function openConversation(otherProfile, { messageId = null } = {}) {
       "تعذّر فتح المحادثة: " +
         (err?.message ||
           "خطأ غير معروف") +
-        " — تأكد من تشغيل sql/schema.sql بالكامل ومن صحة SUPABASE_URL/ANON_KEY في js/config.js"
+        " — تأكد من تشغيل sql/schema.sql بالكامل ومن ضبط VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY في متغيرات البيئة (انظر .env.example)"
     );
 
     closeChatView();
@@ -5942,6 +6445,48 @@ function subscribeGlobalMessageWatch() {
 }
 
 /**
+ * قناة المشرفين: تسجيل مستخدم جديد.
+ * تعمل كطبقة ثانية بجانب إشعار FCM (تظهر حتى لو كان الإشعار مغلقاً أو الجهاز
+ * لا يدعم Push)، وتُحدّث الدليل لحظياً إن كان مفتوحاً.
+ */
+function subscribeAdminDirectory() {
+  if (!state.me?.is_admin) return;
+  if (channelAlive(state.directoryChannel)) return;
+  teardownChannel("directoryChannel");
+
+  state.directoryChannel = createResilientChannel(supabase, {
+    topic: "admin-directory",
+    label: "directory",
+    handlers: [
+      {
+        type: "postgres_changes",
+        filter: { event: "INSERT", schema: "public", table: "profiles" },
+        callback: (payload) => {
+          const row = payload.new;
+          if (!row?.id) return;
+          // حسابات المشرفين نفسها: لا تنبيه إداري عنها
+          if (isAdminContact(row.id, row)) return;
+          if (row.id === state.me?.id) return;
+
+          if (isDirectoryOpen()) {
+            scheduleDirectorySearch(state.directoryQuery, { immediate: true });
+          }
+
+          const name = String(row.display_name || "").trim() || "مستخدم";
+          showAuthError(`👤 مستخدم جديد: ${name} — اضغط لبدء محادثة`, { id: row.id });
+          playNotificationSound();
+        },
+      },
+    ],
+    onStatus: (status, error) => {
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("[realtime] قناة دليل المستخدمين:", status, error || "");
+      }
+    },
+  });
+}
+
+/**
  * تصحيح مؤجَّل للعدّادات — يجمع الأحداث المتلاحقة (كثرة تحديثات الحالة)
  * في طلب واحد بعد 500 مللي ثانية بدل إغراق الشبكة.
  */
@@ -6645,6 +7190,11 @@ function startApp() {
 
   boot().catch((err) => {
     console.error("Fatal boot error:", err);
+
+    if (!isSupabaseReady()) {
+      showConfigErrorScreen();
+      return;
+    }
 
     // آخر خط دفاع: لا تترك المستخدم أمام شاشة تحميل لا تنتهي
     document.querySelector("#boot-loading")?.classList.add("hidden");

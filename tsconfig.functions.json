@@ -1,0 +1,16 @@
+{
+  "//": "فحص أنواع دوال Supabase Edge Functions (Deno) محلياً عبر tsc — بلا Deno مثبَّت",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": []
+  },
+  "include": ["supabase/functions/**/*.ts"]
+}

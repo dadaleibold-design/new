@@ -34,6 +34,26 @@ export const getToken = (...a) => globalThis.__getToken(...a);
 export const onMessage = () => () => {};
 `,
 );
+// push.js يقرأ إعدادات Firebase من متغيرات البيئة عبر ./config.js —
+// نضع نسخة اختبارية بنفس الواجهة (القيم الحقيقية لا تُوضع في الكود إطلاقاً).
+fs.writeFileSync(
+  path.join(TMP, "js/config.js"),
+  `export const FIREBASE_CONFIG = {
+  apiKey: "test-firebase-api-key",
+  projectId: "test-firebase-project",
+  messagingSenderId: "1234567890",
+  appId: "1:1234567890:web:test-app",
+  authDomain: "test-firebase-project.firebaseapp.com",
+  storageBucket: "test-firebase-project.firebasestorage.app",
+};
+export const VAPID_PUBLIC_KEY = "test-vapid-public-key";
+export const isFirebaseConfigured = () => true;
+export const missingEnvKeys = () => [];
+export const SUPABASE_URL = "https://test.supabase.co";
+export const SUPABASE_ANON_KEY = "test-anon-key";
+`,
+);
+
 fs.writeFileSync(
   path.join(TMP, "js/supabaseClient.js"),
   `export const supabase = {

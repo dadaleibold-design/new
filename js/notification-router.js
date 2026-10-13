@@ -19,7 +19,7 @@
 const PENDING_KEY = "wa_pending_route";
 const PENDING_TS_KEY = "wa_pending_route_at";
 const ROUTE_TTL_MS = 30 * 60 * 1000;
-const URL_KEYS = ["conversation", "message", "answer_call", "decline_call"];
+const URL_KEYS = ["conversation", "message", "answer_call", "decline_call", "user"];
 
 let handler = null;
 let initialized = false;
@@ -46,14 +46,17 @@ export function routeFromNotificationData(data = {}) {
   const type = String(data.type || "").trim();
   const roomId = String(data.roomId || data.room_id || "").trim();
   const action = String(data.action || "").trim();
+  // إشعار "مستخدم جديد" للمشرفين: الهدف هو المستخدم نفسه (تُفتح/تُنشأ محادثة معه)
+  const userId = String(data.userId || data.user_id || "").trim();
 
-  if (!conversationId && !roomId) return null;
+  if (!conversationId && !roomId && !userId) return null;
 
   return {
     conversationId: conversationId || null,
     messageId: messageId || null,
     roomId: roomId || null,
-    type: type || "message",
+    userId: userId || null,
+    type: type || (userId ? "new_user" : "message"),
     action: action || null,
     at: Date.now(),
     source: "sw-message",
@@ -68,14 +71,16 @@ export function routeFromUrl(href = (typeof location !== "undefined" ? location.
     const messageId = url.searchParams.get("message");
     const answerCall = url.searchParams.get("answer_call");
     const declineCall = url.searchParams.get("decline_call");
+    const userId = url.searchParams.get("user");
 
-    if (!conversationId && !answerCall && !declineCall) return null;
+    if (!conversationId && !answerCall && !declineCall && !userId) return null;
 
     return {
       conversationId: conversationId || null,
       messageId: messageId || null,
       roomId: answerCall || declineCall || null,
-      type: answerCall ? "incoming_call" : declineCall ? "call_decline" : "message",
+      userId: userId || null,
+      type: answerCall ? "incoming_call" : declineCall ? "call_decline" : userId ? "new_user" : "message",
       action: answerCall ? "answer" : declineCall ? "decline" : "open",
       at: Date.now(),
       source: "url",
@@ -107,13 +112,14 @@ export function clearRouteFromUrl() {
 
 /** يخزّن الهدف في الذاكرة + localStorage ليبقى حتى بعد إعادة تحميل الصفحة */
 export function queuePendingRoute(route) {
-  if (!route || (!route.conversationId && !route.roomId)) return false;
+  if (!route || (!route.conversationId && !route.roomId && !route.userId)) return false;
 
   // تجاهل التكرار لنفس الهدف خلال 5 ثوانٍ (رسالة SW + رابط في نفس النقرة)
   const duplicate = pendingRoutes.find(
     (item) =>
       item.conversationId === route.conversationId &&
       item.messageId === route.messageId &&
+      item.userId === route.userId &&
       Math.abs((item.at || 0) - (route.at || 0)) < 5000
   );
   if (duplicate) return false;

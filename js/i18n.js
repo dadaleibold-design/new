@@ -37,6 +37,22 @@ export const STR = {
     sent: "أُرسلت",
     attach: "إرفاق",
     admins: "المشرفون",
+    directory: "كل المستخدمين المسجّلين",
+    directory_results: "نتائج البحث في كل المستخدمين",
+    directory_loading: "جاري البحث…",
+    directory_empty: "لا يوجد مستخدمون مطابقون",
+    directory_none: "لا يوجد مستخدمون مسجّلون بعد",
+    directory_error: "تعذّر تحميل دليل المستخدمين — تحقق من الاتصال ثم أعد المحاولة.",
+    directory_show_more: "عرض المزيد",
+    directory_has_chat: "محادثة قائمة",
+    directory_open: "اضغط لبدء محادثة فورية",
+    directory_total: "إجمالي المسجّلين",
+    directory_no_contact: "لا توجد بيانات تواصل",
+    directory_close: "إغلاق الدليل",
+    directory_joined: "انضم",
+    new_user_alert: "مستخدم جديد",
+    today: "اليوم",
+    yesterday: "أمس",
     pick_a_chat: "اختر محادثة لبدء المراسلة",
     recording_hint: "جاري التسجيل...",
     offline_notice: "لا يوجد اتصال بالإنترنت — سيتم إرسال رسائلك عند عودة الاتصال",
@@ -106,6 +122,22 @@ export const STR = {
     sent: "Sent",
     attach: "Attach",
     admins: "Supervisors",
+    directory: "All registered users",
+    directory_results: "Search results across all users",
+    directory_loading: "Searching…",
+    directory_empty: "No matching users",
+    directory_none: "No registered users yet",
+    directory_error: "Could not load the user directory — check your connection and retry.",
+    directory_show_more: "Show more",
+    directory_has_chat: "Existing chat",
+    directory_open: "Tap to start chatting now",
+    directory_total: "Registered users",
+    directory_no_contact: "No contact info",
+    directory_close: "Close directory",
+    directory_joined: "Joined",
+    new_user_alert: "New user",
+    today: "Today",
+    yesterday: "Yesterday",
     pick_a_chat: "Pick a chat to start messaging",
     recording_hint: "Recording...",
     offline_notice: "No internet connection — your messages will send once you're back online",
@@ -150,6 +182,11 @@ export function applyLanguage(lang) {
   document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
     const key = el.getAttribute("data-i18n-placeholder");
     if (t[key]) el.placeholder = t[key];
+  });
+  // عناوين الأدوات (title) القابلة للترجمة — مثل زر إغلاق دليل المستخدمين
+  document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    const key = el.getAttribute("data-i18n-title");
+    if (t[key]) el.title = t[key];
   });
   return t;
 }

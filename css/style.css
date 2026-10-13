@@ -345,3 +345,93 @@ body.lightbox-open{overflow:hidden}
 @media (prefers-reduced-motion:reduce){
   .lightbox,.lightbox-img{animation:none;transition:none}
 }
+
+/* ============ دليل المستخدمين (للمشرف): كل المسجّلين + بحث حي ============ */
+.directory-heading{display:flex;align-items:center;gap:8px;padding:10px 16px 4px}
+.directory-heading #directory-heading-text{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-transform:none}
+.directory-count{flex:0 0 auto;min-width:22px;padding:1px 8px;border-radius:10px;background:rgba(0,168,132,.16);color:var(--wa-green);font-size:11.5px;font-weight:700;text-align:center}
+.directory-close{flex:0 0 auto;width:26px;height:26px;padding:0;border:0;border-radius:50%;background:rgba(134,150,160,.16);color:var(--wa-text-secondary);font-size:13px;line-height:1;touch-action:manipulation}
+.directory-close:hover{background:rgba(134,150,160,.3);color:inherit}
+#directory-section{overflow:visible}
+.directory-status{padding:24px 16px;color:var(--wa-text-secondary);text-align:center;font-size:13.5px}
+.directory-status.error{color:#ff9b9b}
+.directory-tag{display:inline-block;margin-inline-start:6px;padding:1px 7px;border-radius:8px;background:rgba(0,168,132,.15);color:var(--wa-green);font-size:10.5px;font-weight:600;vertical-align:middle}
+.directory-footer{display:flex;justify-content:center;padding:10px 16px 18px}
+.directory-footer button{width:100%;max-width:280px;padding:10px 14px;border:1px dashed rgba(134,150,160,.35);border-radius:12px;background:rgba(134,150,160,.08);color:var(--wa-text-secondary);font-size:13px;font-weight:600;touch-action:manipulation}
+.directory-footer button:hover{background:rgba(134,150,160,.16);color:inherit}
+/* تنبيه عائم قابل للنقر (مستخدم جديد) */
+.global-toast.toast-action{cursor:pointer;border-inline-start-color:var(--wa-green);font-weight:600}
+.global-toast.toast-action:hover{filter:brightness(1.08)}
+
+/* ============================================================
+ * شاشة إعداد البيئة (تظهر فقط عند غياب متغيرات البيئة)
+ * لا مفاتيح ثابتة في الكود — نُرشد المسؤول للخطوات بدل خطأ غامض
+ * ============================================================ */
+.config-error {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: var(--bg, #0b141a);
+  overflow-y: auto;
+}
+
+.config-error.hidden {
+  display: none;
+}
+
+.config-error-card {
+  width: 100%;
+  max-width: 560px;
+  background: var(--panel, #111b21);
+  border: 1px solid var(--border, #22303a);
+  border-radius: 14px;
+  padding: 22px;
+  color: var(--text, #e9edef);
+  line-height: 1.9;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+
+.config-error-card h1 {
+  font-size: 1.15rem;
+  margin: 0 0 10px;
+}
+
+.config-error-card p {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+}
+
+.config-error-card code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  direction: ltr;
+  display: inline-block;
+}
+
+.config-error-detail {
+  color: #ffb4a2;
+  font-size: 0.85rem !important;
+  direction: ltr;
+  text-align: left;
+}
+
+#config-error-list {
+  margin: 8px 0 14px;
+  padding-inline-start: 20px;
+  direction: ltr;
+  text-align: left;
+  font-size: 0.85rem;
+  color: #ffd166;
+}
+
+.config-error-steps {
+  margin: 0;
+  padding-inline-start: 20px;
+  font-size: 0.9rem;
+}

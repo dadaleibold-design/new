@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v17";
+const CACHE_NAME = "wa-clone-shell-v18";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -7,6 +7,7 @@ const APP_SHELL = [
   "./js/app.js",
   "./js/auth.js",
   "./js/config.js",
+  "./js/env.js",
   "./js/i18n.js",
   "./js/supabaseClient.js",
   "./js/db.js",

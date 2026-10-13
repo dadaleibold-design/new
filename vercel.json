@@ -1,4 +1,6 @@
 {
+  "buildCommand": "node scripts/generate-env.mjs",
+  "outputDirectory": ".",
   "headers": [
     {
       "source": "/manifest.json",
@@ -13,6 +15,10 @@
         { "key": "Service-Worker-Allowed", "value": "/" },
         { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
       ]
+    },
+    {
+      "source": "/env.js",
+      "headers": [{ "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }]
     }
   ]
 }

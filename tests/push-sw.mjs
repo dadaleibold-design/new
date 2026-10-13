@@ -496,5 +496,39 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   );
 }
 
+/* 14) إشعار «مستخدم جديد» (للمشرفين): tag مستقل + نقرة تفتح محادثة معه ----- */
+{
+  const env = createSwEnv();
+  await env.push({
+    data: {
+      type: "new_user",
+      userId: "u-77",
+      title: "👤 مستخدم جديد: سارة",
+      body: "انضم إلى التطبيق — +966500000000 — اضغط لبدء محادثة",
+    },
+  });
+  await wait(700);
+
+  const notice = env.notifications.find((n) => n.tag === "new-user-u-77");
+  check("إشعار المستخدم الجديد يُعرض بـ tag خاص بالمستخدم", Boolean(notice), env.notifications.map((n) => n.tag).join(","));
+  check("عنوان إشعار المستخدم الجديد يحمل الاسم", /سارة/.test(notice?.title || ""), notice?.title || "");
+
+  // مع نافذة مفتوحة ⇒ رسالة OPEN_CONVERSATION تحمل userId
+  const warm = createSwEnv();
+  await warm.click(notice?.data || { type: "new_user", userId: "u-77" });
+  const msg = warm.posted.find((m) => m?.type === "OPEN_CONVERSATION");
+  check("نقرة الإشعار ترسل userId للنافذة المفتوحة", msg?.userId === "u-77", JSON.stringify(msg || null));
+
+  // بلا نافذة مفتوحة ⇒ رابط يحمل ?user=<id>
+  const cold = createSwEnv();
+  cold.self.clients.matchAll = () => Promise.resolve([]);
+  await cold.click(notice?.data || { type: "new_user", userId: "u-77" });
+  check(
+    "نقرة بلا نافذة تفتح ؟user=<id> لبدء محادثة فورية",
+    cold.openedWindows[0]?.includes("user=u-77"),
+    cold.openedWindows[0] || "(لا نافذة)"
+  );
+}
+
 console.log(fails ? `\n❌ PUSH SW TESTS FAILED: ${fails}` : "\nPUSH SW TESTS PASSED");
 process.exit(fails ? 1 : 0);

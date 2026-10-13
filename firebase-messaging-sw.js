@@ -2,7 +2,7 @@
  * firebase-messaging-sw.js
  * Service Worker لإشعارات Firebase Cloud Messaging (Web Push).
  *
- * المبدأ الحاكم (SW_BUILD 2026-10-13.2):
+ * المبدأ الحاكم (SW_BUILD 2026-10-13.4):
  *   «مصدر واحد يعرض الإشعار، والبقية تسجّل فقط».
  *
  *  1) الخادم (send-push) يرسل دفعة data-only للويب (بلا webpush.notification).
@@ -21,7 +21,7 @@
  *     أصلاً إلى الجهاز، ومن قرّر العرض أو التخطّي ولماذا.
  * ============================================================ */
 
-const SW_BUILD = "2026-10-13.2";
+const SW_BUILD = "2026-10-13.4";
 const LOG = "[push-sw]";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
 
@@ -50,6 +50,22 @@ function swError(step, info) {
 swLog("evaluating service worker", { build: SW_BUILD });
 
 let firebaseReady = false;
+
+/* ------------------------------------------------------------
+ * متغيرات البيئة: Service Worker لا يملك `import.meta.env` (لا يعمل إلا
+ * داخل حزمة Vite)، لذا نقرأ الملف المولَّد `./env.js` الذي يضبط
+ * `self.__ENV__` بنفس الأسماء (VITE_FIREBASE_*). الملف يُنشأ عند النشر
+ * بالأمر `npm run env:generate` — ولا يحتوي أي سرّ سيرفري.
+ * غياب الملف لا يُسقط الـ SW: معالج الدفعات الخام يكمل العرض وحده.
+ * ---------------------------------------------------------- */
+let ENV = {};
+try {
+  importScripts("./env.js");
+  ENV = (self.__ENV__ && typeof self.__ENV__ === "object") ? self.__ENV__ : {};
+  swLog("env loaded", { keys: Object.keys(ENV).length });
+} catch (error) {
+  swError("env.js غير موجود أو تعذّر تحميله — الإشعارات تعمل بمعالج الدفعات الخام", String(error));
+}
 
 try {
   importScripts(
@@ -193,6 +209,8 @@ function extractData(notificationData) {
 function identityKey(data = {}) {
   if (data.messageId) return `msg:${data.messageId}`;
   if (data.roomId) return `room:${data.roomId}`;
+  // إشعار "مستخدم جديد" (كل مستخدم = حدث واحد)
+  if (data.userId || data.user_id) return `user:${data.userId || data.user_id}`;
   return "";
 }
 
@@ -200,6 +218,8 @@ function identityKey(data = {}) {
 function notificationTag(payload) {
   if (payload.isCall) return `call-${payload.roomId || payload.conversationId || "incoming"}`;
   if (payload.isCallEnded) return `missed-${payload.roomId || Date.now()}`;
+  // مستخدم جديد: إشعار مستقل لكل مستخدم (لا يستبدل إشعاراً آخر)
+  if (payload.data?.userId || payload.data?.user_id) return `new-user-${payload.data.userId || payload.data.user_id}`;
   if (payload.conversationId) return `conversation-${payload.conversationId}`;
   if (payload.messageId) return `message-${payload.messageId}`;
   return `whatsapp-message-${Date.now()}`;
@@ -224,7 +244,14 @@ function buildNotificationOptions(payload) {
       messageId: payload.messageId,
       type: payload.type,
       roomId: payload.roomId,
-      url: appUrl(payload.conversationId, payload.messageId),
+      // ?user=<id> ⇒ التطبيق يفتح (أو يُنشئ) محادثة مباشرة مع صاحب الإشعار
+      url: appUrl(
+        payload.conversationId,
+        payload.messageId,
+        payload.data?.userId || payload.data?.user_id
+          ? { user: payload.data.userId || payload.data.user_id }
+          : {}
+      ),
     },
     vibrate: isCall ? [500, 250, 500, 250, 500, 250, 500] : [100, 50, 100],
     actions: isCall
@@ -420,19 +447,33 @@ async function hasVisibleClient() {
  * تهيئة Firebase SDK (للـ onMessage في الواجهة + تسجيل الاستلام)
  * ---------------------------------------------------------- */
 
+/**
+ * تهيئة Firebase من متغيرات البيئة فقط — لا مفاتيح ثابتة في هذا الملف.
+ * الأسماء: VITE_FIREBASE_API_KEY / VITE_FIREBASE_PROJECT_ID /
+ *          VITE_FIREBASE_MESSAGING_SENDER_ID / VITE_FIREBASE_APP_ID
+ */
+const FIREBASE_PROJECT_ID = String(ENV.VITE_FIREBASE_PROJECT_ID || "").trim();
+
 const firebaseConfig = {
-  apiKey: "AIzaSyDeg6RBNC9bWw1QYxBkYtCuMMFPBzxpw4o",
-  authDomain: "studio-6422025604-b97aa.firebaseapp.com",
-  projectId: "studio-6422025604-b97aa",
-  storageBucket: "studio-6422025604-b97aa.firebasestorage.app",
-  messagingSenderId: "599267399266",
-  appId: "1:599267399266:web:4cd19dbf69068019f5e33b",
-  measurementId: "G-FFX14GZB51",
+  apiKey: String(ENV.VITE_FIREBASE_API_KEY || "").trim(),
+  authDomain: FIREBASE_PROJECT_ID ? `${FIREBASE_PROJECT_ID}.firebaseapp.com` : "",
+  projectId: FIREBASE_PROJECT_ID,
+  storageBucket: FIREBASE_PROJECT_ID ? `${FIREBASE_PROJECT_ID}.firebasestorage.app` : "",
+  messagingSenderId: String(ENV.VITE_FIREBASE_MESSAGING_SENDER_ID || "").trim(),
+  appId: String(ENV.VITE_FIREBASE_APP_ID || "").trim(),
 };
+
+/** هل إعدادات Firebase مكتملة داخل الـ SW؟ */
+const isFirebaseConfigured = Boolean(
+  firebaseConfig.apiKey &&
+    firebaseConfig.projectId &&
+    firebaseConfig.messagingSenderId &&
+    firebaseConfig.appId
+);
 
 let messaging = null;
 
-if (firebaseReady) {
+if (firebaseReady && isFirebaseConfigured) {
   try {
     firebase.initializeApp(firebaseConfig);
     messaging = firebase.messaging();
@@ -441,6 +482,8 @@ if (firebaseReady) {
     swError("firebase messaging init failed — raw push handler only", String(error));
     messaging = null;
   }
+} else if (firebaseReady) {
+  swLog("firebase config missing in env.js — raw push handler only (display path unaffected)");
 }
 
 if (messaging) {
@@ -549,6 +592,7 @@ self.addEventListener("push", (event) => {
 async function focusOrOpenClient(payload, event) {
   const conversationId = payload.conversationId;
   const messageId = payload.messageId;
+  const userId = payload.data?.userId || payload.data?.user_id || "";
   const targetUrl = appUrl(
     conversationId,
     messageId,
@@ -556,7 +600,9 @@ async function focusOrOpenClient(payload, event) {
       ? { decline_call: payload.roomId || "1" }
       : payload.isCall
         ? { answer_call: payload.roomId || "1" }
-        : {}
+        : userId
+          ? { user: userId }
+          : {}
   );
 
   const base = appBaseUrl();
@@ -565,6 +611,7 @@ async function focusOrOpenClient(payload, event) {
     conversationId,
     messageId,
     roomId: payload.roomId,
+    userId,
     notificationType: payload.type,
     action: event?.action || "open",
     url: targetUrl,
@@ -590,7 +637,7 @@ async function focusOrOpenClient(payload, event) {
 
   if (target) {
     try {
-      if (conversationId || payload.roomId) target.postMessage(message);
+      if (conversationId || payload.roomId || userId) target.postMessage(message);
     } catch (error) {
       swWarn("postMessage to client failed", String(error));
     }

@@ -1,27 +1,58 @@
-export const SUPABASE_URL = "https://gqocavvhhfwgkzscrjms.supabase.co";
-export const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdxb2NhdnZoaGZ3Z2t6c2Nyam1zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2MzE2MDMsImV4cCI6MjEwNDIwNzYwM30.x4HxOcAiusptsdflVje61wY8t9IfMOAGsCdUg3pIGaQ";
+/* ============================================================
+ * js/config.js — إعدادات التطبيق العامة (بدون أي أسرار ثابتة)
+ * ------------------------------------------------------------
+ * 🔐 كل المفاتيح والروابط تأتي من متغيرات البيئة عبر js/env.js:
+ *      import.meta.env.VITE_* (Vite)  أو  self.__ENV__ (وقت التشغيل)
+ *    لا تُكتب أي قيمة سرّية أو مفتاح مباشرة في هذا الملف.
+ *
+ *    المفاتيح السرّية للسيرفر (service role / private key / Agora certificate)
+ *    ممنوعة هنا تماماً — مكانها أسرار Supabase Edge Functions فقط.
+ * ============================================================ */
 
-export const VAPID_PUBLIC_KEY = "BGKcsJH4YH7vV384UCmx_FKD0xGiWTNuMA7skLLUWzIodKXTSFLRleq1K0ttPMnXZfzQO42bQig8nSKTSIw1jts";
+import {
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  VAPID_PUBLIC_KEY,
+  FIREBASE_CONFIG,
+  AGORA_APP_ID,
+  AGORA_TOKEN_ENDPOINT,
+  missingEnvKeys,
+  isSupabaseConfigured,
+  isFirebaseConfigured,
+  readEnvSnapshot,
+} from "./env.js";
+
+// إعادة تصدير قيم البيئة حتى تعتمد بقية الوحدات على مسار واحد
+export {
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  VAPID_PUBLIC_KEY,
+  FIREBASE_CONFIG,
+  missingEnvKeys,
+  isSupabaseConfigured,
+  isFirebaseConfigured,
+  readEnvSnapshot,
+};
 
 /* ============================================================
  * إعدادات منصة Agora للمكالمات الصوتية والمرئية
  * ------------------------------------------------------------
  * ⚠️ ملاحظات أمنية مهمّة:
- *   1) App ID الخاص بـ Agora ليس سرّاً — يُستخدم في العميل بشكل طبيعي.
+ *   1) App ID الخاص بـ Agora ليس سرّاً — يأتي من VITE_AGORA_APP_ID.
  *   2) App Certificate (المفتاح السري) يجب ألّا يوضع هنا إطلاقاً.
- *      إن فعّلت وضع الشهادة (Secured mode) فيجب توليد التوكن من
- *      خادم آمن (Supabase Edge Function مثلاً) عبر AGORA_TOKEN_ENDPOINT.
+ *      لتوليد التوكن يُستدعى خادم آمن (دالة agora-token) التي تقرأ
+ *      AGORA_APP_CERTIFICATE من Deno.env.
  *   3) يمكن تجاوز أي قيمة أثناء التشغيل دون تعديل الكود عبر:
  *        window.__AGORA_CONFIG__ = { appId: "...", tokenEndpoint: "..." }
  *      أو عبر localStorage: agora_app_id / agora_token_endpoint
  * ============================================================ */
 
 const AGORA_DEFAULTS = {
-  // ضع App ID مشروعك من لوحة تحكم Agora (Console > Project Management)
-  appId: "c72cf98bdff64feebd17688f95764943",
+  // من متغير البيئة VITE_AGORA_APP_ID (أو window.__ENV__ وقت التشغيل)
+  appId: AGORA_APP_ID,
 
-  // نقطة نهاية آمنة تُرجع { token, uid, expiresAt } — اتركها فارغة في وضع Testing
-  tokenEndpoint: "https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/agora-token",
+  // نقطة نهاية آمنة تُرجع { token, uid, expiresAt } — مشتقّة من SUPABASE_URL
+  tokenEndpoint: AGORA_TOKEN_ENDPOINT,
 
   // مصادر SDK مرتّبة حسب الأفضلية، تُحمَّل بشكل كسول عند أول مكالمة فقط.
   // ملاحظة: وسم <script> العادي لا يخضع لسياسة CORS إطلاقاً، لذا يجب
@@ -48,6 +79,11 @@ const AGORA_DEFAULTS = {
   mode: "rtc",
 };
 
+/**
+ * @param {string} key مفتاح التجاوز في window.__AGORA_CONFIG__
+ * @param {string} storageKey مفتاح التجاوز في localStorage
+ * @returns {string|null}
+ */
 function readAgoraOverride(key, storageKey) {
   try {
     const runtime = typeof window !== "undefined" ? window.__AGORA_CONFIG__ : null;
@@ -68,10 +104,7 @@ export const AGORA = {
     return readAgoraOverride("appId", "agora_app_id") || AGORA_DEFAULTS.appId;
   },
   get tokenEndpoint() {
-    return (
-      readAgoraOverride("tokenEndpoint", "agora_token_endpoint") ||
-      AGORA_DEFAULTS.tokenEndpoint
-    );
+    return readAgoraOverride("tokenEndpoint", "agora_token_endpoint") || AGORA_DEFAULTS.tokenEndpoint;
   },
   /** قائمة مصادر SDK للمحاولة بالتتابع (التجاوز اليدوي يتصدّر القائمة) */
   get sdkUrls() {
@@ -94,7 +127,11 @@ export function isAgoraConfigured() {
   return typeof AGORA.appId === "string" && AGORA.appId.trim().length > 0;
 }
 
-/** اسم قناة ثابت ومتطابق لدى الطرفين مشتق من معرّف المحادثة */
+/**
+ * اسم قناة ثابت ومتطابق لدى الطرفين مشتق من معرّف المحادثة
+ * @param {unknown} conversationId
+ * @returns {string}
+ */
 export function buildAgoraChannelName(conversationId) {
   const safe = String(conversationId || "").replace(/[^a-zA-Z0-9]/g, "").slice(0, 48);
   return `${AGORA.channelPrefix}_${safe}`;
@@ -126,27 +163,11 @@ export const MEDIA_LIMITS = {
   skipCompressionUnderBytes: 60 * 1024,
 };
 
-export const ADMINS = [
-  { email: "aabntlal680@gmail.com", name: "الوليد بن طلال" },
-  { email: "almgawell17@gmail.com", name: "لمياء بنت ماجد" },
-  { email: "almgawell@gmail.com", name: "ريم بنت الوليد" },
-  { email: "almgawell1992@gmail.com", name: "ملاك العتيبي" },
-  { email: "almgawell1121@gmail.com", name: "عبير الدوسري" },
-  { email: "almgawell1212@gmail.com", name: "اسماء المليكي" },
-  { email: "almgawell5@gmail.com", name: "لمياء بنت ماجد" },
-  { email: "almgawell4@gmail.com", name: "ريم بنت الوليد" },
-  { email: "almgawell3@gmail.com", name: "ملاك العتيبي" },
-  { email: "almgawell2@gmail.com", name: "عبير الدوسري" },
-  { email: "almgawell1@gmail.com", name: "اسماء المليكي" },
-  { email: "almgawell6@gmail.com", name: "لمياء بنت ماجد" },
-  { email: "almgawell7@gmail.com", name: "ريم بنت الوليد" },
-  { email: "almgawell8@gmail.com", name: "ملاك العتيبي" },
-  { email: "almgawell9@gmail.com", name: "عبير الدوسري" },
-  { email: "almgawell10@gmail.com", name: "اسماء المليكي" },
-  { email: "almgawell0@gmail.com", name: "عبير الدوسري" },
-  { email: "almgawell11@gmail.com", name: "اسماء المليكي" },
-];
-
-export function isAdminEmail(email) {
-  return ADMINS.some((a) => a.email.toLowerCase() === (email || "").toLowerCase());
-}
+/* ============================================================
+ * ملاحظة بخصوص قائمة المشرفين
+ * ------------------------------------------------------------
+ * أُزيلت القائمة الثابتة للبُرد الإلكتروني من الواجهة نهائياً.
+ * المشرف هو من يمنحه السيرفر علامة `profiles.is_admin` /
+ * `profiles.is_super_admin` — والقرار النهائي داخل قاعدة البيانات
+ * (دالة is_admin_email / handle_new_user و سياسات RLS).
+ * ============================================================ */

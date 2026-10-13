@@ -7,37 +7,70 @@
    - سياسات RLS تضمن أن كل طرف يرى محادثاته فقط
    - Trigger تلقائي ينشئ صف `profiles` عند التسجيل، ويحدد `is_admin` تلقائياً بمطابقة البريد مع القائمة الثابتة
    - Buckets تخزين: `avatars`, `attachments`, `wallpapers`
-3. من **Settings > API** انسخ:
-   - `Project URL` → ضعه في `js/config.js` باسم `SUPABASE_URL`
-   - `anon public key` → ضعه في `js/config.js` باسم `SUPABASE_ANON_KEY`
+3. من **Settings > API** انسخ `Project URL` و `anon public key` — ولا تضعهما في الكود:
+   ضعهما في متغيرات البيئة `VITE_SUPABASE_URL` و `VITE_SUPABASE_ANON_KEY` (انظر القسم 2).
 4. من **Authentication > Providers** تأكد أن تسجيل الدخول بالبريد/كلمة المرور مُفعّل.
    (اختياري) عطّل "Confirm email" أثناء التطوير لتسريع الاختبار.
 5. من **Database > Replication** تأكد أن الجداول `messages`, `typing_status`, `profiles`,
    `message_reactions` مضافة إلى `supabase_realtime` (السكربت يفعل هذا تلقائياً).
 
-## 2. تشغيل التطبيق محلياً
+## 2. متغيرات البيئة (إلزامية — لا مفاتيح في الكود)
+
+كل المفاتيح والروابط تُقرأ من متغيرات البيئة، ولا يوجد أي مفتاح مكتوب في المستودع.
+
+```bash
+cp .env.example .env     # ثم املأ القيم
+npm run env:generate     # يولّد env.js في جذر الموقع (مُستثنى من Git)
+```
+
+| المتغير | مكانه | ملاحظة |
+|---|---|---|
+| `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` | الواجهة | المفتاح العام (anon) مصمَّم للظهور؛ الحماية من RLS |
+| `VITE_FIREBASE_API_KEY` / `VITE_FIREBASE_PROJECT_ID` / `VITE_FIREBASE_MESSAGING_SENDER_ID` / `VITE_FIREBASE_APP_ID` | الواجهة | من Firebase Console → Project Settings → Web app |
+| `VITE_VAPID_PUBLIC_KEY` | الواجهة | Cloud Messaging → Web Push certificates |
+| `VITE_AGORA_APP_ID` | الواجهة (اختياري) | معرّف عام غير سرّي |
+| `FIREBASE_*` / `SEND_PUSH_*` / `AGORA_APP_CERTIFICATE` | الدوال فقط | أسرار Supabase Edge Functions (`Deno.env`) — انظر القسم 6 |
+
+آلية القراءة في الواجهة: `import.meta.env.VITE_*` (Vite) ← `self.__ENV__` (ملف `env.js` المولَّد)،
+عبر وحدة واحدة هي `js/env.js`. `firebase-messaging-sw.js` يقرأ نفس الملف بـ `importScripts("./env.js")`.
+إن غابت القيم تظهر **شاشة إعداد واضحة** تسمّي المتغيرات الناقصة بدل الانهيار.
+
+> 🚫 ممنوع في الواجهة إطلاقاً: `SUPABASE_SERVICE_ROLE_KEY`، `FIREBASE_PRIVATE_KEY`،
+> `FIREBASE_SERVICE_ACCOUNT`، `AGORA_APP_CERTIFICATE`، `SEND_PUSH_SECRET`.
+> اختبار `tests/env-config.mjs` يفشل تلقائياً إذا ظهر أي منها — ويحمي أيضاً `scripts/generate-env.mjs`.
+
+## 3. تشغيل التطبيق محلياً
 التطبيق Vanilla JS بدون build step — يكفي خادم استاتيكي بسيط:
 
 ```bash
-cd wa-app
+npm run env:generate     # مرة واحدة (وبعد كل تغيير في .env)
 python3 -m http.server 8080
 # افتح http://localhost:8080
 ```
 
+> من يفضّل Vite: `npx vite` يقرأ `.env` ويحقن `import.meta.env` مباشرة (نفس الأسماء).
 > ملاحظة: وحدات ES Modules (`type="module"`) لا تعمل من `file://` مباشرة، يجب تقديمها عبر خادم HTTP.
 
-## 3. أيقونات وصوت الإشعار
+## 4. أيقونات وصوت الإشعار
 المجلد `icons/` يحتاج منك إضافة:
 - `icon-192.png` و `icon-512.png` (أيقونة التطبيق لتثبيت PWA)
 - `notify.mp3` (صوت إشعار الرسائل الجديدة)
 
 هذه ملفات ثنائية لم يتم توليدها هنا — أضف ملفاتك الخاصة بنفس الأسماء.
 
-## 4. نشر التطبيق (Deploy)
+## 5. نشر التطبيق (Deploy)
 يعمل على أي استضافة استاتيكة: Vercel, Netlify, GitHub Pages, Cloudflare Pages.
-فقط ارفع محتوى مجلد `wa-app/` كما هو (تأكد أن `manifest.json` و `sw.js` في الجذر).
+ارفع محتوى المجلد كما هو (تأكد أن `manifest.json` و `sw.js` في الجذر)، مع خطوة واحدة
+قبل النشر: توليد `env.js` من متغيرات بيئة المنصة.
 
-## 5. ما تم تنفيذه في هذا الإصدار
+| المنصة | الطريقة |
+|---|---|
+| Vercel | أضف المتغيرات في Project Settings → Environment Variables — ملف `vercel.json` يشغّل `node scripts/generate-env.mjs` تلقائياً وقت البناء |
+| Netlify / Cloudflare Pages | Build command: `node scripts/generate-env.mjs` + Environment variables |
+| GitHub Pages | خطوة في GitHub Actions: `npm run env:generate` مع أسرار المستودع قبل النشر |
+| أي استضافة يدوية | `npm run env:generate` محلياً ثم ارفع `env.js` مع الملفات (لا يحتوي أي سرّ سيرفري) |
+
+## 6. ما تم تنفيذه في هذا الإصدار
 - تسجيل/دخول عبر البريد وكلمة المرور + حفظ الاسم في `profiles`
 - توجيه حسب الدور: مستخدم عادي يرى المشرفين الستة، والمشرف يرى بقية المشرفين + محادثاته
 - رسائل فورية عبر Supabase Realtime
@@ -81,15 +114,23 @@ python3 -m http.server 8080
 > - [`docs/notification-realtime-fixes-ar.md`](docs/notification-realtime-fixes-ar.md)
 > - [`docs/message-status-presence-welcome-ar.md`](docs/message-status-presence-welcome-ar.md) — التذكيرات التلقائية،
 >   علامات حالة الرسالة (✓ / ✓✓ رمادي / ✓✓ أزرق)، وحضور المشرفين الثابت («متصل الآن» دائماً)
+> - [`docs/multidevice-push-ar.md`](docs/multidevice-push-ar.md) — تعدّد الأجهزة: صف مستقل لكل جهاز،
+>   هوية إشعار لكل جهاز، ونقل التوكن بين المستخدمين بأمان (v2.7)
+> - [`docs/environment-secrets-ar.md`](docs/environment-secrets-ar.md) — تنظيف المفاتيح الثابتة:
+>   `import.meta.env.VITE_*` في الواجهة، `Deno.env.get()` في الدوال، وقائمة المشرفين من قاعدة البيانات
+> - [`docs/admin-new-user-alerts-directory-ar.md`](docs/admin-new-user-alerts-directory-ar.md) — إشعار كل المشرفين
+>   عند تسجيل مستخدم جديد + دليل المستخدمين الشامل وبحث حي يفتح محادثة فورية (v2.8)
 
 ### اختبارات سريعة
 ```bash
 npm test        # 3 أدوار (user/admin/super) + 4 سيناريوهات لنقر الإشعار والعدّاد
-npm run lint    # ESLint على js/
-npm run check   # صياغة app.js + علامات الدوال الأساسية + lint
+npm run lint        # ESLint على js/
+npm run typecheck   # فحص أنواع دوال Deno + طبقة إعداد الواجهة (tsc)
+npm run check       # صياغة app.js + العلامات الأساسية + lint + typecheck
+npm run env:check   # التأكد من وجود كل متغيرات البيئة المطلوبة
 ```
 
-## 6. إعداد الإشعارات الحقيقية (Firebase Cloud Messaging) — تم التحويل من Web Push/VAPID
+## 7. إعداد الإشعارات الحقيقية (Firebase Cloud Messaging) — تم التحويل من Web Push/VAPID
 ⚠️ **تغيير معماري مهم:** المشروع لم يعد يستخدم Web Push (VAPID) + Supabase Edge Function
 (`supabase/functions/send-push` وجدول `push_subscriptions` أصبحا **قديمين/غير مُستخدَمين**،
 تُركا في المشروع للمرجعية فقط). الإشعارات الآن بالكامل عبر **Firebase Cloud Messaging (FCM)**.
@@ -110,11 +151,13 @@ npm run check   # صياغة app.js + علامات الدوال الأساسية
    فعّل **Cloud Messaging**، واحصل على `firebaseConfig` من Project Settings → General → Your apps → Web app.
 2. **مفتاح VAPID الخاص بـ Firebase** (مختلف عن VAPID القديم): Project Settings → Cloud Messaging →
    Web Push certificates → Generate key pair.
-3. ضع نفس `firebaseConfig` **حرفياً بلا اختصار** في مكانين (يجب أن يتطابقا تماماً):
-   - `js/push.js` (المتغيّر `firebaseConfig`)
-   - `firebase-messaging-sw.js` (نفس المتغيّر) — هذا كان مصدر خطأ "ServiceWorker script
-     evaluation failed" سابقاً بسبب نسخة مبتورة (`"...":`) من `apiKey`/`appId`.
-4. ضع مفتاح VAPID في `js/push.js` بالمتغيّر `VAPID_KEY`.
+3. ضع قيم الإعداد في متغيرات البيئة **مرة واحدة فقط** (بدل نسخها في ملفين):
+   `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_MESSAGING_SENDER_ID`,
+   `VITE_FIREBASE_APP_ID`. يقرأها `js/push.js` من `js/env.js`، ويقرأها
+   `firebase-messaging-sw.js` من نفس `env.js` عبر `importScripts` — فلا يمكن أن يختلفا
+   (كان اختلاف النسخ/الاختصار سبب خطأ "ServiceWorker script evaluation failed" سابقاً).
+   `authDomain` و `storageBucket` مشتقّان تلقائياً من `projectId`.
+4. ضع مفتاح VAPID في `VITE_VAPID_PUBLIC_KEY` (نفس المتغير يقرأه `js/push.js`).
 5. **نفّذ قسم 8 و 9 من `sql/schema.sql`** في SQL Editor (جدول `fcm_tokens` + صلاحيات).
 6. من داخل التطبيق: **الإعدادات ⚙️ → تفعيل إشعارات الجهاز**.
 
@@ -126,6 +169,11 @@ Firebase بصلاحية إرسال الرسائل، ثم خزّن الأسرار
 
 ```bash
 supabase functions deploy send-push
+
+# الطريقة المفضّلة: سرّ واحد يحوي ملف حساب الخدمة كاملاً
+supabase secrets set FIREBASE_SERVICE_ACCOUNT="$(cat service-account.json)"
+
+# أو الحقول منفصلة (لاحظ المحافظة على \\n داخل المفتاح — الدالة تحوّلها لأسطر حقيقية)
 supabase secrets set \
   FIREBASE_PROJECT_ID="..." \
   FIREBASE_CLIENT_EMAIL="firebase-adminsdk-...@....iam.gserviceaccount.com" \
@@ -150,11 +198,13 @@ select vault.create_secret(
 ```
 
 لا تضع `FIREBASE_PRIVATE_KEY` أو `SEND_PUSH_SECRET` في JavaScript أو في مستودع Git.
+كل أسرار الدالتين تُقرأ من `Deno.env.get()` فقط، ولا توجد قيمة واحدة مكتوبة داخل الكود
+(اختبار `tests/env-config.mjs` يتحقق من ذلك في كل تشغيل).
 
 > ملاحظة: iOS Safari لا يدعم FCM Web Push إلا عندما يكون التطبيق **مثبّتاً كـ PWA** على
 > الشاشة الرئيسية (iOS 16.4+)، تماماً كحال Web Push العادي.
 
-## 7. صلاحيات المشرف العام (Super Admin)
+## 8. صلاحيات المشرف العام (Super Admin)
 حساب `almgawell17@gmail.com` يملك الآن صلاحيات مطلقة على **كل** المحادثات و**كل** المشرفين
 (قراءة وكتابة/رد كامل)، وليس فقط محادثاته الخاصة — مُفعَّلة عبر عمود `profiles.is_super_admin`
 وسياسات RLS في قسم 9 من `sql/schema.sql`. تظهر محادثات المشرفين الآخرين في قائمته مع شارة
@@ -163,7 +213,7 @@ select vault.create_secret(
 لإضافة حساب مشرف عام آخر لاحقاً: نفّذ فقط سطر `update public.profiles set is_super_admin =
 true, is_admin = true where email = '...';` من قسم 9 بالبريد الجديد — لا حاجة لتعديل أي كود.
 
-## 8. المرحلة التالية (لم تُبنَ بعد — يمكن إضافتها عند الطلب)
+## 9. المرحلة التالية (لم تُبنَ بعد — يمكن إضافتها عند الطلب)
 - مزامنة صراعات التعديل (conflict resolution) عند تعديل نفس الرسالة من أكثر من جهاز أثناء العمل دون اتصال
 - بحث فعلي داخل قائمة المحادثات وداخل الرسائل (الحقل موجود شكلياً فقط حالياً)
 - ضغط وتصغير الصور قبل الرفع لتوفير الباندويدث
@@ -175,7 +225,7 @@ true, is_admin = true where email = '...';` من قسم 9 بالبريد الج�
 
 ### أ) تهيئة المنصة
 1. أنشئ مشروعاً على [Agora Console](https://console.agora.io) ثم انسخ **App ID**.
-2. افتح `js/config.js` وضع القيمة داخل `AGORA_DEFAULTS.appId`.
+2. ضع القيمة في متغير البيئة `VITE_AGORA_APP_ID` (بدل كتابتها في الكود).
 3. بدون تعديل الكود يمكنك ضبطها وقت التشغيل:
    ```js
    // من وحدة تحكم المتصفح
@@ -267,7 +317,7 @@ true, is_admin = true where email = '...';` من قسم 9 بالبريد الج�
 supabase functions deploy agora-token --no-verify-jwt
 supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 ```
-لا تضع App Certificate في `js/config.js`. الدالة تتحقق من جلسة Supabase وتصدر توكناً صالحاً لمدة ساعة.
+لا تضع App Certificate في الواجهة إطلاقاً — يبقى سرّاً في `Deno.env.get("AGORA_APP_CERTIFICATE")` داخل الدالة، وهي تتحقق من جلسة Supabase وتصدر توكناً صالحاً لمدة ساعة.
 
 ---
 

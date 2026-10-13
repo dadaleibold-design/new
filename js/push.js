@@ -5,23 +5,23 @@ import {
   onMessage,
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
 import { buildDeviceInfo, decideServerWrite, getOrCreateDeviceId } from "./push-policy.js";
+import { FIREBASE_CONFIG, VAPID_PUBLIC_KEY, isFirebaseConfigured, missingEnvKeys } from "./config.js";
 
 // ⚠️ لا يوجد onTokenRefresh في Firebase Web SDK v9+ (modular). استيراده يُسقط
 // الوحدة كلها بـ SyntaxError فيتجمّد التطبيق. تدوير التوكن يُعالَج بإعادة
 // استدعاء getToken دورياً (syncPushToken) — وهو الأسلوب الموصى به رسمياً.
 const onTokenRefresh = null;
 
-const firebaseConfig = {
-  apiKey: "AIzaSyDeg6RBNC9bWw1QYxBkYtCuMMFPBzxpw4o",
-  authDomain: "studio-6422025604-b97aa.firebaseapp.com",
-  projectId: "studio-6422025604-b97aa",
-  storageBucket: "studio-6422025604-b97aa.firebasestorage.app",
-  messagingSenderId: "599267399266",
-  appId: "1:599267399266:web:4cd19dbf69068019f5e33b",
-  measurementId: "G-FFX14GZB51"
-};
-const VAPID_KEY =
-  "BGKcsJH4YH7vV384UCmx_FKD0xGiWTNuMA7skLLUWzIodKXTSFLRleq1K0ttPMnXZfzQO42bQig8nSKTSIw1jts";
+/**
+ * تهيئة Firebase — كل القيم من متغيرات البيئة (js/env.js)، لا شيء ثابت هنا:
+ *   VITE_FIREBASE_API_KEY / VITE_FIREBASE_PROJECT_ID /
+ *   VITE_FIREBASE_MESSAGING_SENDER_ID / VITE_FIREBASE_APP_ID
+ * و authDomain/storageBucket مشتقّان من معرّف المشروع.
+ */
+const firebaseConfig = { ...FIREBASE_CONFIG };
+
+/** مفتاح VAPID العام (من VITE_VAPID_PUBLIC_KEY) */
+const VAPID_KEY = VAPID_PUBLIC_KEY;
 
 export const TOKEN_KEY = "fcm_token";
 export const TOKEN_SYNC_KEY = "wa_fcm_last_sync";
@@ -32,11 +32,19 @@ let messaging = null;
 let syncPushTokenPromise = null;
 
 try {
-  firebaseApp = getApps().length
-    ? getApps()[0]
-    : initializeApp(firebaseConfig);
+  if (!isFirebaseConfigured()) {
+    // لا نُسقط التطبيق: الإشعارات تُعطَّل بلطف مع بيان المتغيرات الناقصة
+    console.warn(
+      "[FCM] إعدادات Firebase ناقصة — الإشعارات معطّلة. المتغيرات الناقصة:",
+      missingEnvKeys()
+        .filter((k) => k.startsWith("VITE_FIREBASE"))
+        .join(", ")
+    );
+  } else {
+    firebaseApp = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
 
-  messaging = getMessaging(firebaseApp);
+    messaging = getMessaging(firebaseApp);
+  }
 } catch (error) {
   console.error("[FCM] Firebase initialization failed:", error);
 }
