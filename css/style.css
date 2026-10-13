@@ -435,3 +435,19 @@ body.lightbox-open{overflow:hidden}
   padding-inline-start: 20px;
   font-size: 0.9rem;
 }
+
+/* زر إعادة المحاولة في شاشة فشل الإقلاع (boot-error) */
+.boot-retry {
+  margin-top: 16px;
+  padding: 11px 22px;
+  border: none;
+  border-radius: 10px;
+  background: var(--wa-green, #00a884);
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.95rem;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.boot-retry:hover { filter: brightness(1.08); }
+.boot-retry:active { transform: scale(0.97); }

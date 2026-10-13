@@ -29,6 +29,15 @@ function readSupabaseLibrary() {
   }
 }
 
+/** localStorage قد يرمي عند الوصول إليه (حظر التخزين) — عندها نكمل بدونه */
+function readSafeStorage() {
+  try {
+    return typeof window !== "undefined" ? window.localStorage : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** يُنشئ العميل بأمان ويعيد سبب الفشل بدل إسقاط التطبيق كاملاً */
 function createSupabaseClient() {
   const factory = readSupabaseLibrary()?.createClient;
@@ -56,7 +65,7 @@ function createSupabaseClient() {
         auth: {
           persistSession: true,
           autoRefreshToken: true,
-          storage: window.localStorage,
+          storage: readSafeStorage(),
           storageKey: "wa_browser_session",
           detectSessionInUrl: false,
         },

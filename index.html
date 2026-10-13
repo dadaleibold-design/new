@@ -52,6 +52,24 @@
   </div>
 </div>
 
+<!-- ============ شاشة فشل الإقلاع (تظهر من حارس مستقل إن لم يُقلع التطبيق) ============ -->
+<div id="boot-error" class="config-error hidden" role="alert">
+  <div class="config-error-card">
+    <h1>⚠️ تعذّر تشغيل التطبيق</h1>
+    <p>
+      توقّف التحميل قبل فتح الواجهة. غالباً السبب فشل تحميل أحد ملفات التطبيق
+      أو غياب متغيرات البيئة على بيئة النشر — وليس من حسابك.
+    </p>
+    <p id="boot-error-detail" class="config-error-detail"></p>
+    <ol class="config-error-steps">
+      <li>تحقق من الاتصال ثم اضغط «إعادة المحاولة».</li>
+      <li>إن استمرت المشكلة بعد النشر: تأكد من ضبط <code>VITE_SUPABASE_URL</code> و<code>VITE_SUPABASE_ANON_KEY</code> في متغيرات بيئة الاستضافة ومن نجاح خطوة توليد <code>env.js</code>.</li>
+      <li>افتح وحدة تحكم المتصفح (Console) — أول خطأ أحمر هناك هو سبب التوقف.</li>
+    </ol>
+    <button id="boot-retry" class="boot-retry" type="button">إعادة المحاولة</button>
+  </div>
+</div>
+
 <!-- ================= AUTH SCREEN ================= -->
 <div id="auth-screen" class="auth-screen hidden">
   <div class="auth-top-actions">
@@ -198,6 +216,66 @@
 
 <audio id="notification-sound" src="./icons/notify.mp3" preload="auto"></audio>
 <div id="global-toast" class="global-toast hidden"></div>
+
+<!--
+  حارس الإقلاع (Boot Watchdog): سكربت كلاسيكي مستقل بلا أي استيراد، حتى
+  يعمل حتى لو فشل تحميل رسم وحدات ES كاملاً (ملف مفقود/404/شبكة) — وهو
+  بالضبط السيناريو الذي كان يترك شاشة التحميل تدور إلى الأبد، لأن كل
+  معالجات الأخطاء الأخرى تعيش داخل الوحدات التي لم تُحمَّل أصلاً.
+  إن لم يُخفِ التطبيق شاشة التحميل خلال المهلة، يُوقفها الحارس ويعرض
+  شاشة خطأ صريحة بزر إعادة محاولة. وإن أقلع التطبيق متأخراً بعد ظهورها،
+  فإن __WA_MARK_BOOT_OK__ يُخفيها ويكمل كالمعتاد.
+-->
+<script>
+(function () {
+  var BOOT_TIMEOUT_MS = 12000;
+  window.__WA_BOOT_OK__ = false;
+  window.__WA_BOOT_RESOURCE_ERROR__ = "";
+
+  function el(id) { return document.getElementById(id); }
+  function isVisible(node) { return !!node && !node.classList.contains("hidden"); }
+
+  function showBootError(reason) {
+    if (window.__WA_BOOT_OK__) return;
+    var boot = el("boot-loading");
+    if (boot) boot.classList.add("hidden");
+    var box = el("boot-error");
+    if (!box) return;
+    var detail = el("boot-error-detail");
+    if (detail) {
+      detail.textContent =
+        reason || window.__WA_BOOT_RESOURCE_ERROR__ || "لم تكتمل تهيئة التطبيق خلال " + BOOT_TIMEOUT_MS / 1000 + " ثوانٍ.";
+    }
+    box.classList.remove("hidden");
+  }
+
+  window.__WA_SHOW_BOOT_ERROR__ = showBootError;
+  window.__WA_MARK_BOOT_OK__ = function () {
+    window.__WA_BOOT_OK__ = true;
+    var box = el("boot-error");
+    if (box) box.classList.add("hidden");
+  };
+
+  // فشل تحميل سكربت (CDN/ملف تطبيق) لا يصل دائماً كاستثناء — نلتقطه في طور الالتقاط
+  window.addEventListener("error", function (event) {
+    var target = event && event.target;
+    if (target && target !== window && (target.src || target.href)) {
+      window.__WA_BOOT_RESOURCE_ERROR__ = "فشل تحميل ملف: " + (target.src || target.href);
+    }
+  }, true);
+
+  var retry = el("boot-retry");
+  if (retry) retry.addEventListener("click", function () { window.location.reload(); });
+
+  window.setTimeout(function () {
+    if (window.__WA_BOOT_OK__) return;
+    // التطبيق تولّى الشاشة (دخول/واجهة/إعداد) — لا حاجة للتدخل
+    if (!isVisible(el("boot-loading"))) return;
+    if (isVisible(el("auth-screen")) || isVisible(el("app-shell")) || isVisible(el("config-error"))) return;
+    showBootError();
+  }, BOOT_TIMEOUT_MS);
+})();
+</script>
 
 <script type="module" src="./js/app.js?v=28"></script>
 

@@ -69,17 +69,39 @@ import {
   dispatchRoute,
 } from "./notification-router.js";
 
-// يُشغَّل عند استيراد الوحدة (قبل boot) حتى لا يضيع نقر إشعار وقع أثناء الإقلاع
-initNotificationRouter();
+/**
+ * قراءة آمنة من localStorage عند تهيئة الوحدة: الوصول المباشر قد يرمي
+ * (وضع التصفّح الخاص الصارم/حظر التخزين/iframe رملي) — واستثناءٌ هنا،
+ * قبل أي try/catch، كان يُسقط الوحدة كلها ويترك شاشة التحميل للأبد.
+ */
+function readStoredValue(key, fallback) {
+  try {
+    return localStorage.getItem(key) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// يُشغَّل عند استيراد الوحدة (قبل boot) حتى لا يضيع نقر إشعار وقع أثناء الإقلاع.
+// مُغلَّف بـ try/catch للسبب نفسه: فشل تهيئة جانبية لا يجوز أن يمنع الإقلاع.
+try {
+  initNotificationRouter();
+} catch (err) {
+  console.error("[boot] initNotificationRouter failed (continuing):", err);
+}
 
 // عارض الصور بملء الشاشة: تفويض أحداث على الوثيقة (يعمل مع الصور الجديدة والقديمة)
-initImageLightbox();
+try {
+  initImageLightbox();
+} catch (err) {
+  console.error("[boot] initImageLightbox failed (continuing):", err);
+}
 
 const state = {
   me: null,
   t: null,
-  lang: localStorage.getItem("wa_lang") || "ar",
-  theme: localStorage.getItem("wa_theme") || "dark",
+  lang: readStoredValue("wa_lang", "ar"),
+  theme: readStoredValue("wa_theme", "dark"),
 
   contacts: [],
   contactRowsByConversation: {},
@@ -128,7 +150,7 @@ const state = {
 
   foregroundMessagesUnsub: null,
 
-  authRole: localStorage.getItem("wa_auth_role") || "user",
+  authRole: readStoredValue("wa_auth_role", "user"),
   callsChannel: null,
   callHistoryFilter: "all",
   lastRenderedSignature: "",
@@ -164,16 +186,56 @@ const MESSAGE_COLUMNS =
 
 const $ = (sel) => document.querySelector(sel);
 
+/** مهلة فحص الجلسة الأولية وخطوات الإقلاع الشبكية (ملّي ثانية) */
+const BOOT_STEP_TIMEOUT_MS = 8000;
+
+/**
+ * يُعلم حارس الإقلاع المستقل في index.html أن التطبيق تولّى الشاشة،
+ * ويُخفي شاشة فشل الإقلاع إن كانت ظهرت أثناء تحميل بطيء ثم نجح.
+ */
+function markBootOk() {
+  try {
+    window.__WA_MARK_BOOT_OK__?.();
+  } catch {
+    /* حارس الإقلاع اختياري — غيابه لا يؤثر */
+  }
+  safeDom("boot:hide-boot-error", () => {
+    document.querySelector("#boot-error")?.classList.add("hidden");
+  });
+}
+
+/**
+ * يفرض مهلة على وعد قد لا يستقر أبداً (شبكة معلّقة/جلسة تالفة):
+ * عند انقضائها يرفض بخطأ واضح بدل تعليق الإقلاع على شاشة التحميل.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} label
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`انتهت مهلة ${label} (${ms}ms)`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 /**
  * شاشة «إعداد البيئة ناقص»: تظهر فقط عندما يتعذّر إنشاء عميل Supabase
  * (أي أن المفاتيح لم تُضبط في متغيرات البيئة). لا مفاتيح ثابتة في الكود،
  * لذا نُخبر المسؤول بالخطوات الدقيقة بدل شاشة بيضاء أو خطأ غامض.
  */
 function showConfigErrorScreen() {
+  // شاشة الإعداد نهاية مقصودة للإقلاع — لا تترك الحارس يعرض خطأً فوقها
+  markBootOk();
   safeDom("boot:config-error", () => {
     document.querySelector("#boot-loading")?.classList.add("hidden");
     document.querySelector("#auth-screen")?.classList.add("hidden");
     document.querySelector("#app-shell")?.classList.add("hidden");
+    document.querySelector("#boot-error")?.classList.add("hidden");
 
     const box = document.querySelector("#config-error");
     if (!box) return;
@@ -201,20 +263,30 @@ function showConfigErrorScreen() {
 }
 
 async function boot() {
+  // حاجز الأخطاء العام أولاً: يمنع أي استثناء غير معالج من تجميد/إسقاط الواجهة،
+  // ويعمل أيضاً في مسار غياب الإعدادات أدناه.
+  try {
+    installGlobalErrorBoundary({ notify: (msg) => showAuthError(msg) });
+  } catch (err) {
+    console.error("[boot] installGlobalErrorBoundary failed (continuing):", err);
+  }
+
   // لا نُقلع بلا عميل Supabase: نعرض شاشة الإعداد بدل الانهيار الصامت
   if (!isSupabaseReady()) {
     showConfigErrorScreen();
     return;
   }
 
-  // حاجز الأخطاء العام: يمنع أي استثناء غير معالج من تجميد/إسقاط الواجهة
-  installGlobalErrorBoundary({ notify: (msg) => showAuthError(msg) });
-
   document.body.setAttribute("data-theme", state.theme);
 
   safeDom("boot:pwa", () => setupPWAInstallPrompt());
 
-  await safeAsync("boot:partial", () => loadChatPanelPartial(), { retries: 1 });
+  // تحميل واجهة المحادثة بمهلة: fetch معلّق لا يجوز أن يعلّق الإقلاع كله
+  await safeAsync(
+    "boot:partial",
+    () => withTimeout(loadChatPanelPartial(), BOOT_STEP_TIMEOUT_MS, "تحميل واجهة المحادثة"),
+    { retries: 1 }
+  );
 
   state.t = applyLanguage(state.lang);
 
@@ -237,8 +309,15 @@ async function boot() {
     })
   );
 
+  // فحص الجلسة الأولية بمهلة صريحة: getSession() يقرأ التخزين المحلي
+  // عادةً، لكن جلسة تالفة أو تخزيناً محجوباً قد يعلّقه — عندها نكمل
+  // بلا جلسة إلى شاشة الدخول بدل شاشة تحميل لا تنتهي.
   const sessionResult = await safeAsync("boot:session", async () => {
-    const { data, error } = await supabase.auth.getSession();
+    const { data, error } = await withTimeout(
+      supabase.auth.getSession(),
+      BOOT_STEP_TIMEOUT_MS,
+      "فحص الجلسة"
+    );
     if (error) throw error;
     return data?.session || null;
   });
@@ -248,6 +327,8 @@ async function boot() {
   wireAuthForms();
   wireChrome();
 
+  // الإقلاع وصل شاشة حقيقية (دخول/تطبيق): أوقف حارس الانتظار نهائياً
+  markBootOk();
   $("#boot-loading")?.classList.add("hidden");
 
   if (session) {
@@ -479,6 +560,9 @@ async function loadChatPanelPartial() {
 }
 
 function showAuthScreen() {
+  markBootOk();
+  $("#boot-loading")?.classList.add("hidden");
+  $("#boot-error")?.classList.add("hidden");
   $("#auth-screen")?.classList.remove("hidden");
   $("#app-shell")?.classList.add("hidden");
 
@@ -7276,7 +7360,9 @@ function startApp() {
     }
 
     // آخر خط دفاع: لا تترك المستخدم أمام شاشة تحميل لا تنتهي
+    markBootOk();
     document.querySelector("#boot-loading")?.classList.add("hidden");
+    document.querySelector("#boot-error")?.classList.add("hidden");
     document.querySelector("#auth-screen")?.classList.remove("hidden");
 
     const el = document.querySelector("#auth-error");
