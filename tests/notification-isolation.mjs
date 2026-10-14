@@ -162,17 +162,20 @@ check("لا يتقاطع منطق التوزيع: دالتا الرسائل وا
 
 // ⑦ سياسات RLS للمشرف العام (مراقبة كاملة بلا تنبيهات)
 for (const policy of [
-  "conversations full access superadmin",
-  "messages full access superadmin",
-  "call rooms superadmin",
+  "conversations read superadmin",
+  "messages read superadmin",
+  "call rooms read superadmin",
   "call logs superadmin",
   "push log superadmin read",
   "call history hidden superadmin read",
 ]) {
   check(`سياسة RLS موجودة: ${policy}`, MIGRATION.includes(policy));
 }
-check("سياسات المشرف العام مقيّدة بـ is_super_admin_user",
-  /for all using \(public\.is_super_admin_user\(\)\)/.test(MIGRATION));
+check("سياسات المشرف العام مقيّدة بـ is_super_admin_user (قراءة فقط)",
+  /for select using \(public\.is_super_admin_user\(\)\)/.test(MIGRATION));
+// v2.11: المشرف العام مراقب للقراءة فقط — لا سياسة كتابة ALL له
+check("لا سياسة ALL للمشرف العام (v2.11: قراءة فقط)",
+  !/for all using \(public\.is_super_admin_user\(\)\)/.test(MIGRATION));
 
 // ⑧ send-push: نفس قواعد العزل من جهة الدالة
 check("send-push يعزل مستلم الرسالة عبر conversationCounterpart",

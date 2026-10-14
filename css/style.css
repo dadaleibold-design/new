@@ -462,3 +462,7 @@ body.lightbox-open{overflow:hidden}
 #call-btn-flip.busy .call-ctrl-icon{animation:call-flip-spin .6s linear infinite}
 @keyframes call-flip-spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){#call-btn-flip.busy .call-ctrl-icon{animation:none}}
+
+/* ============ v2.11 — حقل الرسالة textarea: Enter سطر جديد، Shift+Enter إرسال ============ */
+.composer textarea#composer-input{flex:1 1 auto;width:0;min-width:0;max-height:140px;min-height:42px;resize:none;overflow-y:auto;padding:11px 16px;border:none;border-radius:22px;background:rgba(134,150,160,0.15);color:inherit;outline:none;font:inherit;font-size:14.5px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}

@@ -418,9 +418,9 @@ const policyExists = async (table, policy) =>
     [table, policy],
   )).rows[0].n > 0;
 
-check("RLS: محادثات المشرف العام الكاملة", await policyExists("conversations", "conversations full access superadmin"));
-check("RLS: رسائل المشرف العام الكاملة", await policyExists("messages", "messages full access superadmin"));
-check("RLS: غرف المكالمات للمشرف العام", await policyExists("call_rooms", "call rooms superadmin"));
+check("RLS: محادثات المشرف العام (قراءة فقط v2.11)", await policyExists("conversations", "conversations read superadmin"));
+check("RLS: رسائل المشرف العام (قراءة فقط v2.11)", await policyExists("messages", "messages read superadmin"));
+check("RLS: غرف المكالمات للمشرف العام (قراءة فقط v2.11)", await policyExists("call_rooms", "call rooms read superadmin"));
 check("RLS: سجلات المكالمات للمشرف العام", await policyExists("call_logs", "call logs superadmin"));
 check("RLS: سجل الإشعارات للمشرف العام", await policyExists("push_delivery_log", "push log superadmin read"));
 check("RLS: سجل المكالمات المخفي مرئي للمشرف العام", await policyExists("call_history_hidden", "call history hidden superadmin read"));
@@ -585,7 +585,8 @@ await setUid("");
     $$;
     insert into vault.decrypted_secrets (name, decrypted_secret) values
       ('SEND_PUSH_URL', 'https://example.supabase.co/functions/v1/send-push'),
-      ('SEND_PUSH_SECRET', 'test-secret');
+      ('SEND_PUSH_SECRET', 'test-secret'),
+      ('SUPABASE_ANON_KEY', 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.signature');
   `);
 
   let bareError = null;

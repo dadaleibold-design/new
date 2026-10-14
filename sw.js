@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v19";
+const CACHE_NAME = "wa-clone-shell-v20";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -21,8 +21,12 @@ const APP_SHELL = [
   "./js/realtime.js",
   "./js/notification-router.js",
   "./js/lightbox.js",
+  "./js/composer.js",
+  "./js/call-media.js",
+  "./js/notification-scope.js",
   "./manifest.json",
   "./icons/icon.png",
+  "./icons/icon1.png",
   "./icons/notify.mp3",
 ];
 

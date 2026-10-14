@@ -36,6 +36,7 @@ import {
   isIncomingCallChannelAlive,
   presentIncomingCallFromRoom,
 } from "./calls.js";
+import { composerKeyAction } from "./composer.js";
 // عزل التنبيهات (v2.9): لا صوت ولا إشعار إلا لطرف مباشر في المحادثة
 import { shouldAlertForMessage, isConversationParty } from "./notification-scope.js";
 import {
@@ -2263,6 +2264,14 @@ function toggleTheme() {
   applyThemeVars();
 }
 
+/** يضبط ارتفاع حقل الرسالة تلقائياً حتى حد أقصى (ثم يتمرّر داخلياً) */
+function autoGrowComposer() {
+  const input = $("#composer-input");
+  if (!input || input.tagName !== "TEXTAREA") return;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
+}
+
 function wireChatPanel() {
   $("#composer-form")?.addEventListener(
     "submit",
@@ -2281,6 +2290,7 @@ function wireChatPanel() {
       if (!text) return;
 
       input.value = "";
+      autoGrowComposer();
 
       await sendMessage({
         content: text,
@@ -2290,7 +2300,34 @@ function wireChatPanel() {
 
   $("#composer-input")?.addEventListener(
     "input",
-    handleTypingInput
+    () => {
+      autoGrowComposer();
+      handleTypingInput();
+    }
+  );
+
+  // ⌨️ مفاتيح حقل الرسالة (textarea):
+  //   • Enter        ⇒ سطر جديد (السلوك الطبيعي — لا نمنعه)
+  //   • Shift+Enter  ⇒ إرسال الرسالة، ولا شيء إن كان الحقل فارغاً
+  //   • أثناء تركيب الحروف (IME، مثل العربية/اليابانية) لا يُرسَل شيء
+  $("#composer-input")?.addEventListener(
+    "keydown",
+    guard("composer:keys", (e) => {
+      const input = e.currentTarget;
+      const action = composerKeyAction(e, {
+        value: input.value,
+        uploading: state.mediaUploading,
+      });
+      // Enter وحدها: لا نتدخل (سطر جديد). Shift+Enter: نمنع السطر ونرسل.
+      if (action === "newline" || action === "none") {
+        if (action === "none" && e.key === "Enter" && e.shiftKey) e.preventDefault();
+        return;
+      }
+      e.preventDefault();
+      const form = $("#composer-form");
+      if (form?.requestSubmit) form.requestSubmit();
+      else form?.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    })
   );
 
   $("#attach-input")?.addEventListener(
@@ -3011,13 +3048,14 @@ function buildContactRow(c, opts) {
         ? `<div class="unread-badge">${c._unread}</div>`
         : ""
     }
-    ${state.me.is_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="${c.is_blocked ? "إلغاء الحظر" : "حظر المستخدم"}">${c.is_blocked ? "✅" : "⛔"}</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
+    ${state.me.is_admin && !state.me.is_super_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="${c.is_blocked ? "إلغاء الحظر" : "حظر المستخدم"}">${c.is_blocked ? "✅" : "⛔"}</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
   `;
 
   row.querySelectorAll("[data-admin-action]").forEach((button) => {
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
-      if (!state.me.is_admin) return;
+      // المشرف العام مراقب للقراءة فقط: لا حظر ولا حذف لمستخدمين
+      if (!state.me.is_admin || state.me.is_super_admin) return;
       const action = button.dataset.adminAction;
       if (action === "block") {
         const blocking = !c.is_blocked;
@@ -6981,6 +7019,7 @@ function wireEmojiPicker() {
       ) {
         $("#composer-input").value +=
           e.target.textContent;
+        autoGrowComposer();
 
         panel.classList.add(
           "hidden"

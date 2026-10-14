@@ -17,7 +17,6 @@ function delay(ms) {
 }
 
 function logError(label, error) {
-  // eslint-disable-next-line no-console
   console.error(`[safety] ${label}:`, error);
 }
 

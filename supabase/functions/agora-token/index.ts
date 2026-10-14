@@ -53,6 +53,33 @@ Deno.serve(async (req) => {
       return json({ error: "Invalid uid" }, 400);
     }
 
+    // 🔒 التفويض (v2.11): اسم القناة = "wa_<conversationId بلا شرطات>" (راجع buildAgoraChannelName).
+    //    لا توكن إلا لطرف في تلك المحادثة وغير محظور. الاستعلام بعميل المستخدم نفسه،
+    //    فيحصره RLS على صفوف المستخدم (لا مفتاح خدمة هنا). المشرف العام ليس طرفاً ⇒ مرفوض.
+    const channelMatch = /^wa_([0-9a-fA-F]{32})$/.exec(String(channelName));
+    if (!channelMatch) return json({ error: "Invalid channel" }, 400);
+    const h = channelMatch[1].toLowerCase();
+    const conversationId = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+
+    const { data: participant, error: participantError } = await supabase
+      .from("conversations")
+      .select("id")
+      .eq("id", conversationId)
+      .maybeSingle();
+    if (participantError) {
+      console.error("agora-token: participant check failed", participantError.message);
+      return json({ error: "Unable to verify call participation" }, 500);
+    }
+    if (!participant) return json({ error: "Forbidden" }, 403);
+
+    const { data: me, error: meError } = await supabase
+      .from("profiles")
+      .select("is_blocked")
+      .eq("id", user.id)
+      .maybeSingle();
+    if (meError) return json({ error: "Unable to verify account" }, 500);
+    if (!me || me.is_blocked) return json({ error: "Forbidden" }, 403);
+
     const appId = AGORA_APP_ID;
     const appCertificate = AGORA_APP_CERTIFICATE;
     if (!appId || !appCertificate) {

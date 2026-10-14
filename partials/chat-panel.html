@@ -50,7 +50,8 @@
       <button type="button" id="emoji-toggle">😊</button>
       <div id="emoji-panel" class="emoji-panel hidden"></div>
       <label class="attach-btn">📎<input id="attach-input" type="file" hidden /></label>
-      <input id="composer-input" type="text" autocomplete="off" data-i18n-placeholder="type_message" placeholder="اكتب رسالة" />
+      <textarea id="composer-input" rows="1" autocomplete="off" data-i18n-placeholder="type_message" placeholder="اكتب رسالة" aria-describedby="composer-hint"></textarea>
+      <span id="composer-hint" class="sr-only">Enter لسطر جديد، Shift+Enter للإرسال</span>
       <button type="button" id="mic-btn" class="mic-btn" title="رسالة صوتية">🎤</button>
       <button type="submit" id="send-btn" class="send-btn">➤</button>
     </form>
