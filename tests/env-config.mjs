@@ -44,6 +44,7 @@ const SOURCE_FILES = [
   "firebase-messaging-sw.js",
   "js/app.js",
   "js/auth.js",
+  "js/call-media.js",
   "js/calls.js",
   "js/config.js",
   "js/db.js",
@@ -63,6 +64,7 @@ const SOURCE_FILES = [
   "supabase/functions/send-push/index.ts",
   "supabase/functions/agora-token/index.ts",
   "scripts/generate-env.mjs",
+  "scripts/copy-agora-sdk.mjs",
 ];
 
 for (const [label, literal] of LEAKED_LITERALS) {

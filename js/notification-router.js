@@ -247,6 +247,17 @@ export function initNotificationRouter() {
         const message = event?.data;
         if (!message || typeof message !== "object") return;
 
+        // 📞 دفعة Push لمكالمة (incoming_call / call_ended) والتطبيق ظاهر في هذا التبويب.
+        //    الـ SW يرسلها فقط للنافذة الظاهرة، فلا يرن إلا تبويب واحد.
+        if (message.type === "WA_CALL_PUSH") {
+          window.dispatchEvent(
+            new CustomEvent("wa-call-push", {
+              detail: { type: String(message.pushType || ""), data: message.data || {} },
+            })
+          );
+          return;
+        }
+
         if (message.type === "OPEN_CONVERSATION") {
           const route = routeFromNotificationData(message) || routeFromRoutePayload(message);
           if (route) {

@@ -451,3 +451,14 @@ body.lightbox-open{overflow:hidden}
 }
 .boot-retry:hover { filter: brightness(1.08); }
 .boot-retry:active { transform: scale(0.97); }
+
+/* ============ v2.10 — أزرار الوسائط في المكالمة: تبديل الكاميرا ومخرج الصوت ============ */
+/* زر مخرج الصوت حين لا يدعم المتصفح تغيير المخرج: يبقى مرئياً بحالة «محدود» (لا يَعِد بما لا يتحقق) */
+.call-ctrl.unsupported{opacity:.6}
+/* أثناء تنفيذ تبديل مخرج الصوت أو الكاميرا: منع النقر المزدوج مع إشارة بصرية */
+.call-ctrl.busy,.call-ctrl:disabled{opacity:.55;cursor:progress}
+.call-ctrl:disabled{pointer-events:none}
+/* زر تبديل الكاميرا يدور أثناء التبديل — الحركة تُلغى تحت prefers-reduced-motion */
+#call-btn-flip.busy .call-ctrl-icon{animation:call-flip-spin .6s linear infinite}
+@keyframes call-flip-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){#call-btn-flip.busy .call-ctrl-icon{animation:none}}

@@ -5,6 +5,7 @@ import {
   onMessage,
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
 import { buildDeviceInfo, decideServerWrite, getOrCreateDeviceId } from "./push-policy.js";
+import { isCallPushType } from "./call-media.js";
 import { FIREBASE_CONFIG, VAPID_PUBLIC_KEY, isFirebaseConfigured, missingEnvKeys } from "./config.js";
 
 // ⚠️ لا يوجد onTokenRefresh في Firebase Web SDK v9+ (modular). استيراده يُسقط
@@ -213,6 +214,19 @@ export function listenForForegroundMessages({
 
       const data =
         payload.data || {};
+
+      // 📞 إشعارات المكالمات لا تُعرض ولا تُشغَّل فيها الأصوات هنا:
+      //    الرنين داخل التطبيق يملكه calls.js (Realtime + ringtone). نمرّر الحدث
+      //    إليه ليقرر (ويمنع التكرار). إشعار النظام يُعرض من SW فقط عند الخلفية.
+      if (isCallPushType(data.type)) {
+        window.dispatchEvent(
+          new CustomEvent("wa-call-push", {
+            detail: { type: String(data.type), data },
+          })
+        );
+        return;
+      }
+
       const conversationId = String(data.conversationId || data.conversation_id || "");
       const title =
         notification.title ||

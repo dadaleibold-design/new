@@ -2339,6 +2339,31 @@ grant execute on function public.push_diagnostics() to authenticated;
 -- ============================================================
 
 -- ============================================================
+-- v2.10 (2026-10-14): حداثة الرنين من ساعة قاعدة البيانات
+-- (مطابق لـ sql/migrations/2026-10-14_v2_10_call_ring_freshness.sql)
+-- ============================================================
+create or replace function public.call_room_is_ringing(p_room uuid)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.call_rooms r
+    where r.id = p_room
+      and r.callee_id = auth.uid()
+      and r.status = 'ringing'
+      and r.started_at > now() - interval '2 minutes'
+  );
+$$;
+
+revoke all on function public.call_room_is_ringing(uuid) from public;
+grant execute on function public.call_room_is_ringing(uuid) to authenticated;
+
+
+-- ============================================================
 -- ① دوال الحراسة المركزية (مصدر واحد للحقيقة لِمن يحق له الاستلام)
 -- ============================================================
 
@@ -3058,3 +3083,4 @@ end $$;
 --     select public.mark_messages_delivered('<conversation-id>'::uuid);  -- المتوقع 0
 -- • فحص الوضع الصامت: يجب أن يكون سوبر أدمن واحد فقط (almgawell17@gmail.com):
 --     select id, email, is_super_admin from public.profiles where is_super_admin;
+

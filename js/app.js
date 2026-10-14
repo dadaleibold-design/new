@@ -34,6 +34,7 @@ import {
   endCall,
   startCallWith,
   isIncomingCallChannelAlive,
+  presentIncomingCallFromRoom,
 } from "./calls.js";
 // عزل التنبيهات (v2.9): لا صوت ولا إشعار إلا لطرف مباشر في المحادثة
 import { shouldAlertForMessage, isConversationParty } from "./notification-scope.js";
@@ -1729,13 +1730,19 @@ async function openConversationById(conversationId, { messageId = null, attempt 
 async function openRouteFromNotification(route) {
   if (!route) return;
 
-  // مكالمة واردة: قناة الإشارات هي المسار الأساسي للرنين، وهذا المسار يضمن
-  // أن واجهة المكالمة تُفتح حتى لو كان التطبيق مُغلقاً تماماً.
-  if (route.action === "answer" && route.roomId) {
+  // 📞 مكالمة واردة: النقر على إشعار المكالمة (التطبيق مغلق أو في الخلفية)
+  //    يعرض شاشة الرنين نفسها عبر تحقق من قاعدة البيانات (callee + ringing)،
+  //    أو يرفض مباشرة عند action = decline. إن لم تعد الغرفة ترنّ نفتح المحادثة.
+  const isCallRoute =
+    Boolean(route.roomId) &&
+    (route.type === "incoming_call" || route.action === "answer" || route.action === "decline");
+  if (isCallRoute) {
     const handled = await safeAsync("route:call", () =>
-      openCallFromNotification(route.roomId, route.conversationId)
+      presentIncomingCallFromRoom(route.roomId, {
+        action: route.action === "decline" ? "decline" : "answer",
+      })
     );
-    if (handled.data) return;
+    if (handled.ok && handled.data) return;
   }
 
   if (!route.conversationId) {
@@ -1755,25 +1762,6 @@ async function openRouteFromNotification(route) {
   resetUnreadFor(route.conversationId);
 
   await openConversationById(route.conversationId, { messageId: route.messageId });
-}
-
-/** يحاول فتح/استئناف واجهة مكالمة واردة من إشعار */
-async function openCallFromNotification(roomId, conversationId) {
-  const { ok, data } = await safeQuery("route:call-room", () =>
-    supabase
-      .from("call_rooms")
-      .select("id,status,conversation_id,caller_id,callee_id")
-      .eq("id", roomId)
-      .maybeSingle()
-  );
-
-  if (!ok || !data) return false;
-  if (!["ringing", "active"].includes(data.status)) return false;
-
-  if (conversationId && state.activeConversation?.id !== conversationId) {
-    await openConversationById(conversationId);
-  }
-  return true;
 }
 
 /**

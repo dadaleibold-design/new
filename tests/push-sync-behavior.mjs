@@ -18,6 +18,8 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "push-sync-"));
 fs.mkdirSync(path.join(TMP, "js"), { recursive: true });
 fs.writeFileSync(path.join(TMP, "package.json"), '{"type":"module"}');
 fs.copyFileSync(path.join(ROOT, "js/push-policy.js"), path.join(TMP, "js/push-policy.js"));
+// push.js يستورد call-media.js (تمييز إشعارات المكالمات)
+fs.copyFileSync(path.join(ROOT, "js/call-media.js"), path.join(TMP, "js/call-media.js"));
 fs.writeFileSync(
   path.join(TMP, "js/push.js"),
   fs
