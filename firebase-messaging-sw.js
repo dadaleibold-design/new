@@ -2,7 +2,7 @@
  * firebase-messaging-sw.js
  * Service Worker لإشعارات Firebase Cloud Messaging (Web Push).
  *
- * المبدأ الحاكم (SW_BUILD 2026-10-13.4):
+ * المبدأ الحاكم (SW_BUILD 2026-10-14.1):
  *   «مصدر واحد يعرض الإشعار، والبقية تسجّل فقط».
  *
  *  1) الخادم (send-push) يرسل دفعة data-only للويب (بلا webpush.notification).
@@ -21,7 +21,7 @@
  *     أصلاً إلى الجهاز، ومن قرّر العرض أو التخطّي ولماذا.
  * ============================================================ */
 
-const SW_BUILD = "2026-10-13.4";
+const SW_BUILD = "2026-10-14.1";
 const LOG = "[push-sw]";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
 
@@ -434,6 +434,44 @@ async function handleCallEnded(payload) {
   }
 }
 
+/**
+ * دفعة مكالمة (incoming_call / call_ended) والتطبيق ظاهر: نُرسلها إلى النوافذ
+ * الظاهرة فقط (لا المخفية) كي لا يرنّ أكثر من تبويب. يعيد عدد النوافذ التي استلمت.
+ * لا نقارن الطوابع الزمنية هنا (ساعة الجهاز قد تنحرف)؛ الفصل بين المكالمة الحقيقية
+ * والمنتهية يتم بفحص حالة الغرفة في قاعدة البيانات عند الرنين/النقر.
+ */
+async function forwardCallPushToVisibleClients(payload) {
+  let clientList = [];
+  try {
+    clientList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  } catch {
+    return 0;
+  }
+  const base = appBaseUrl();
+  const targets = clientList.filter((client) => {
+    if (client.visibilityState !== "visible") return false;
+    try {
+      return new URL(client.url).href.startsWith(base);
+    } catch {
+      return false;
+    }
+  });
+  let delivered = 0;
+  for (const client of targets) {
+    try {
+      client.postMessage({
+        type: "WA_CALL_PUSH",
+        pushType: payload.type,
+        data: payload.data,
+      });
+      delivered += 1;
+    } catch (error) {
+      swWarn("WA_CALL_PUSH postMessage failed", String(error));
+    }
+  }
+  return delivered;
+}
+
 async function hasVisibleClient() {
   try {
     const clientList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
@@ -543,8 +581,19 @@ async function handlePush(raw, received) {
     swError("payload normalization failed", String(error));
   }
 
-  // نافذة ظاهرة: الصفحة تتولّى العرض عبر onMessage (لا إشعار مزدوج)
-  if (await hasVisibleClient()) {
+  // 📞 دفعات المكالمات: تُسلَّم للنافذة الظاهرة فقط (فيرنّ الهاتف داخل التطبيق)،
+  //    وإن لم توجد نافذة ظاهرة نعرض إشعار النظام بزر الرد/الرفض أدناه.
+  const isCallPayload = Boolean(payload && (payload.isCall || payload.isCallEnded));
+  if (isCallPayload) {
+    const delivered = await forwardCallPushToVisibleClients(payload);
+    if (delivered > 0) {
+      swLog("decision: call push → visible app window(s)", { type: payload.type, delivered });
+      return;
+    }
+  }
+
+  // نافذة ظاهرة (غير المكالمات): الصفحة تتولّى العرض عبر onMessage (لا إشعار مزدوج)
+  if (!isCallPayload && (await hasVisibleClient())) {
     swLog("decision: app window visible → page renders via onMessage", {
       type: payload?.type || "",
       messageId: payload?.messageId || "",
@@ -606,6 +655,13 @@ async function focusOrOpenClient(payload, event) {
   );
 
   const base = appBaseUrl();
+  // 📞 نقرة الجسم (بلا زر) على إشعار مكالمة = «رد» كما في زر الرد.
+  //    الرفض يأتي فقط من الزر صراحةً. بقية الإشعارات تبقى كما هي.
+  const action = payload.isCall
+    ? event?.action === "decline"
+      ? "decline"
+      : "answer"
+    : event?.action || "open";
   const message = {
     type: "OPEN_CONVERSATION",
     conversationId,
@@ -613,7 +669,7 @@ async function focusOrOpenClient(payload, event) {
     roomId: payload.roomId,
     userId,
     notificationType: payload.type,
-    action: event?.action || "open",
+    action,
     url: targetUrl,
   };
 

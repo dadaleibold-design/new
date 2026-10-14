@@ -1,5 +1,5 @@
 {
-  "buildCommand": "node scripts/generate-env.mjs",
+  "buildCommand": "node scripts/copy-agora-sdk.mjs && node scripts/generate-env.mjs",
   "outputDirectory": ".",
   "headers": [
     {

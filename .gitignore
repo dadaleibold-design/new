@@ -15,6 +15,10 @@ node_modules/
 # مخرجات Vite (إن استُخدم البناء لاحقاً)
 dist/
 
+# نسخة Agora SDK المولَّدة من node_modules عند البناء (scripts/copy-agora-sdk.mjs)
+# — تُولَّد ولا تُرفع إلى Git (المصدر الحقيقي هو الحزمة المثبّتة في package.json)
+/vendor/agora/
+
 # ملفات مؤقتة من Supabase CLI
 supabase/.temp/
 

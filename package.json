@@ -1,11 +1,9 @@
 {
   "dependencies": {
-    "agora-rtc-sdk-ng": "^4.24.8",
-    "eslint": "^9.39.5",
-    "jsdom": "^24.1.3"
+    "agora-rtc-sdk-ng": "4.24.8"
   },
   "scripts": {
-    "test": "node tests/smoke.mjs user && node tests/smoke.mjs admin && node tests/smoke.mjs super && node tests/notification-flow.mjs && node tests/ticks-presence.mjs && node tests/realtime-resilience.mjs && node tests/push-sw.mjs && node tests/multidevice-push.mjs && node tests/push-sync-behavior.mjs && node tests/admin-directory.mjs && node tests/notification-isolation.mjs && node tests/sql-v28-postgres.mjs && node tests/sql-v29-postgres.mjs && node tests/env-config.mjs && node tests/boot-fallback.mjs",
+    "test": "node tests/smoke.mjs user && node tests/smoke.mjs admin && node tests/smoke.mjs super && node tests/composer-keys.mjs && node tests/notification-flow.mjs && node tests/ticks-presence.mjs && node tests/realtime-resilience.mjs && node tests/push-sw.mjs && node tests/multidevice-push.mjs && node tests/push-sync-behavior.mjs && node tests/admin-directory.mjs && node tests/notification-isolation.mjs && node tests/rls-hardening-postgres.mjs && node tests/sql-v28-postgres.mjs && node tests/sql-v29-postgres.mjs && node tests/env-config.mjs && node tests/boot-fallback.mjs && node tests/agora-sdk-deps.mjs && node tests/agora-token-auth.mjs && node tests/calls-media.mjs && node tests/call-push-routing.mjs && node tests/sql-v210-postgres.mjs",
     "test:flow": "node tests/notification-flow.mjs",
     "lint": "eslint --config tests/eslint.config.mjs js/ *.js",
     "check": "bash tests/check-app.sh && npm run lint && npm run typecheck",
@@ -16,9 +14,18 @@
     "env:check": "node scripts/generate-env.mjs --check",
     "typecheck": "tsc -p tsconfig.frontend.json && tsc -p tsconfig.functions.json",
     "test:isolation": "node tests/notification-isolation.mjs",
-    "test:sql:v29": "node tests/sql-v29-postgres.mjs"
+    "test:sql:v29": "node tests/sql-v29-postgres.mjs",
+    "postinstall": "node scripts/copy-agora-sdk.mjs",
+    "vendor:agora": "node scripts/copy-agora-sdk.mjs",
+    "test:calls": "node tests/calls-media.mjs && node tests/call-push-routing.mjs && node tests/agora-sdk-deps.mjs && node tests/sql-v210-postgres.mjs",
+    "test:agora": "node tests/agora-sdk-deps.mjs",
+    "test:sql:v210": "node tests/sql-v210-postgres.mjs",
+    "test:rls": "node tests/rls-hardening-postgres.mjs"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17",
+    "eslint": "^9.39.5",
+    "jsdom": "^24.1.3",
     "typescript": "^7.0.2"
   }
 }

@@ -9,7 +9,7 @@
  *      والإرسال إلى كل توكنات المستخدم في send-push.
  *
  * التشغيل: node tests/multidevice-push.mjs
- * التحقق من دالة SQL نفسها على PostgreSQL حقيقي: انظر docs/multidevice-push-ar.md
+ * التحقق من دالة SQL نفسها على PostgreSQL حقيقي عبر tests/sql-v28-postgres.mjs
  */
 import fs from "node:fs";
 import path from "node:path";

@@ -34,7 +34,9 @@ import {
   endCall,
   startCallWith,
   isIncomingCallChannelAlive,
+  presentIncomingCallFromRoom,
 } from "./calls.js";
+import { composerKeyAction } from "./composer.js";
 // عزل التنبيهات (v2.9): لا صوت ولا إشعار إلا لطرف مباشر في المحادثة
 import { shouldAlertForMessage, isConversationParty } from "./notification-scope.js";
 import {
@@ -1729,13 +1731,19 @@ async function openConversationById(conversationId, { messageId = null, attempt 
 async function openRouteFromNotification(route) {
   if (!route) return;
 
-  // مكالمة واردة: قناة الإشارات هي المسار الأساسي للرنين، وهذا المسار يضمن
-  // أن واجهة المكالمة تُفتح حتى لو كان التطبيق مُغلقاً تماماً.
-  if (route.action === "answer" && route.roomId) {
+  // 📞 مكالمة واردة: النقر على إشعار المكالمة (التطبيق مغلق أو في الخلفية)
+  //    يعرض شاشة الرنين نفسها عبر تحقق من قاعدة البيانات (callee + ringing)،
+  //    أو يرفض مباشرة عند action = decline. إن لم تعد الغرفة ترنّ نفتح المحادثة.
+  const isCallRoute =
+    Boolean(route.roomId) &&
+    (route.type === "incoming_call" || route.action === "answer" || route.action === "decline");
+  if (isCallRoute) {
     const handled = await safeAsync("route:call", () =>
-      openCallFromNotification(route.roomId, route.conversationId)
+      presentIncomingCallFromRoom(route.roomId, {
+        action: route.action === "decline" ? "decline" : "answer",
+      })
     );
-    if (handled.data) return;
+    if (handled.ok && handled.data) return;
   }
 
   if (!route.conversationId) {
@@ -1755,25 +1763,6 @@ async function openRouteFromNotification(route) {
   resetUnreadFor(route.conversationId);
 
   await openConversationById(route.conversationId, { messageId: route.messageId });
-}
-
-/** يحاول فتح/استئناف واجهة مكالمة واردة من إشعار */
-async function openCallFromNotification(roomId, conversationId) {
-  const { ok, data } = await safeQuery("route:call-room", () =>
-    supabase
-      .from("call_rooms")
-      .select("id,status,conversation_id,caller_id,callee_id")
-      .eq("id", roomId)
-      .maybeSingle()
-  );
-
-  if (!ok || !data) return false;
-  if (!["ringing", "active"].includes(data.status)) return false;
-
-  if (conversationId && state.activeConversation?.id !== conversationId) {
-    await openConversationById(conversationId);
-  }
-  return true;
 }
 
 /**
@@ -2275,6 +2264,14 @@ function toggleTheme() {
   applyThemeVars();
 }
 
+/** يضبط ارتفاع حقل الرسالة تلقائياً حتى حد أقصى (ثم يتمرّر داخلياً) */
+function autoGrowComposer() {
+  const input = $("#composer-input");
+  if (!input || input.tagName !== "TEXTAREA") return;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
+}
+
 function wireChatPanel() {
   $("#composer-form")?.addEventListener(
     "submit",
@@ -2293,6 +2290,7 @@ function wireChatPanel() {
       if (!text) return;
 
       input.value = "";
+      autoGrowComposer();
 
       await sendMessage({
         content: text,
@@ -2302,7 +2300,34 @@ function wireChatPanel() {
 
   $("#composer-input")?.addEventListener(
     "input",
-    handleTypingInput
+    () => {
+      autoGrowComposer();
+      handleTypingInput();
+    }
+  );
+
+  // ⌨️ مفاتيح حقل الرسالة (textarea):
+  //   • Enter        ⇒ سطر جديد (السلوك الطبيعي — لا نمنعه)
+  //   • Shift+Enter  ⇒ إرسال الرسالة، ولا شيء إن كان الحقل فارغاً
+  //   • أثناء تركيب الحروف (IME، مثل العربية/اليابانية) لا يُرسَل شيء
+  $("#composer-input")?.addEventListener(
+    "keydown",
+    guard("composer:keys", (e) => {
+      const input = e.currentTarget;
+      const action = composerKeyAction(e, {
+        value: input.value,
+        uploading: state.mediaUploading,
+      });
+      // Enter وحدها: لا نتدخل (سطر جديد). Shift+Enter: نمنع السطر ونرسل.
+      if (action === "newline" || action === "none") {
+        if (action === "none" && e.key === "Enter" && e.shiftKey) e.preventDefault();
+        return;
+      }
+      e.preventDefault();
+      const form = $("#composer-form");
+      if (form?.requestSubmit) form.requestSubmit();
+      else form?.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    })
   );
 
   $("#attach-input")?.addEventListener(
@@ -3023,13 +3048,14 @@ function buildContactRow(c, opts) {
         ? `<div class="unread-badge">${c._unread}</div>`
         : ""
     }
-    ${state.me.is_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="${c.is_blocked ? "إلغاء الحظر" : "حظر المستخدم"}">${c.is_blocked ? "✅" : "⛔"}</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
+    ${state.me.is_admin && !state.me.is_super_admin && !c.is_admin ? `<div class="admin-user-actions"><button type="button" data-admin-action="block" title="${c.is_blocked ? "إلغاء الحظر" : "حظر المستخدم"}">${c.is_blocked ? "✅" : "⛔"}</button><button type="button" data-admin-action="delete" title="حذف المستخدم">🗑️</button></div>` : ""}
   `;
 
   row.querySelectorAll("[data-admin-action]").forEach((button) => {
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
-      if (!state.me.is_admin) return;
+      // المشرف العام مراقب للقراءة فقط: لا حظر ولا حذف لمستخدمين
+      if (!state.me.is_admin || state.me.is_super_admin) return;
       const action = button.dataset.adminAction;
       if (action === "block") {
         const blocking = !c.is_blocked;
@@ -6993,6 +7019,7 @@ function wireEmojiPicker() {
       ) {
         $("#composer-input").value +=
           e.target.textContent;
+        autoGrowComposer();
 
         panel.classList.add(
           "hidden"

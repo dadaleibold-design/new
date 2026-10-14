@@ -47,6 +47,12 @@ export {
  *      أو عبر localStorage: agora_app_id / agora_token_endpoint
  * ============================================================ */
 
+/**
+ * إصدار Agora Web SDK — مطابق تماماً لـ agora-rtc-sdk-ng في package.json.
+ * لا تغيّره هنا وحده: غيّر package.json ثم شغّل `npm install`.
+ */
+export const AGORA_SDK_VERSION = "4.24.8";
+
 const AGORA_DEFAULTS = {
   // من متغير البيئة VITE_AGORA_APP_ID (أو window.__ENV__ وقت التشغيل)
   appId: AGORA_APP_ID,
@@ -55,13 +61,19 @@ const AGORA_DEFAULTS = {
   tokenEndpoint: AGORA_TOKEN_ENDPOINT,
 
   // مصادر SDK مرتّبة حسب الأفضلية، تُحمَّل بشكل كسول عند أول مكالمة فقط.
+  // ⚠️ يجب أن تطابق النسخة في package.json (agora-rtc-sdk-ng) — يتحقق من ذلك
+  //    tests/agora-sdk-deps.mjs، فلا تنحرف الواجهة عن الحزمة المثبّتة.
+  // 1) نسخة محلية من الحزمة نفسها (تُنسخ عند البناء بـ scripts/copy-agora-sdk.mjs)
+  //    — من الأصل نفسه، فلا تعتمد المكالمات على CDN خارجي ولا على CORS.
+  // 2) مرايا npm عبر CDN (احتياطي إن لم تُنسخ النسخة المحلية)
+  // 3) download.agora.io — آخر احتياط (قد لا يتوفر هذا الإصدار هناك).
   // ملاحظة: وسم <script> العادي لا يخضع لسياسة CORS إطلاقاً، لذا يجب
   // عدم ضبط crossOrigin عليه (ضبطه يُفعّل فحص CORS ويُفشل التحميل).
-  // نضع مرايا npm أولاً لأن download.agora.io يعطي 503 أحياناً.
   sdkUrls: [
-    "https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@4.20.2/AgoraRTC_N-production.js",
-    "https://unpkg.com/agora-rtc-sdk-ng@4.20.2/AgoraRTC_N-production.js",
-    "https://download.agora.io/sdk/release/AgoraRTC_N-4.20.2.js",
+    "./vendor/agora/AgoraRTC_N-production.js",
+    `https://cdn.jsdelivr.net/npm/agora-rtc-sdk-ng@${AGORA_SDK_VERSION}/AgoraRTC_N-production.js`,
+    `https://unpkg.com/agora-rtc-sdk-ng@${AGORA_SDK_VERSION}/AgoraRTC_N-production.js`,
+    `https://download.agora.io/sdk/release/AgoraRTC_N-${AGORA_SDK_VERSION}.js`,
   ],
 
   // بادئة أسماء القنوات لتفادي التعارض بين المشاريع على نفس الـ App ID

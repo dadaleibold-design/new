@@ -113,18 +113,7 @@ python3 -m http.server 8080
   لـ `callee_id` في غرفة المكالمة حصراً، وبوابة مركزية ترفض أي مستلم لا يطابق الحدث —
   **المشرف العام يرى كل شيء (RLS) لكن لا يرن هاتفه ولا يصله إشعار لأي محادثة/مكالمة ليس طرفاً فيها**.
 
-> 📄 التقارير الفنية الكاملة (التشخيص + كل التعديلات + خطوات التحقق):
-> - [`docs/notification-realtime-fixes-ar.md`](docs/notification-realtime-fixes-ar.md)
-> - [`docs/message-status-presence-welcome-ar.md`](docs/message-status-presence-welcome-ar.md) — التذكيرات التلقائية،
->   علامات حالة الرسالة (✓ / ✓✓ رمادي / ✓✓ أزرق)، وحضور المشرفين الثابت («متصل الآن» دائماً)
-> - [`docs/multidevice-push-ar.md`](docs/multidevice-push-ar.md) — تعدّد الأجهزة: صف مستقل لكل جهاز،
->   هوية إشعار لكل جهاز، ونقل التوكن بين المستخدمين بأمان (v2.7)
-> - [`docs/environment-secrets-ar.md`](docs/environment-secrets-ar.md) — تنظيف المفاتيح الثابتة:
->   `import.meta.env.VITE_*` في الواجهة، `Deno.env.get()` في الدوال، وقائمة المشرفين من قاعدة البيانات
-> - [`docs/admin-new-user-alerts-directory-ar.md`](docs/admin-new-user-alerts-directory-ar.md) — إشعار كل المشرفين
->   عند تسجيل مستخدم جديد + دليل المستخدمين الشامل وبحث حي يفتح محادثة فورية (v2.8)
-> - [`docs/notification-recipient-isolation-ar.md`](docs/notification-recipient-isolation-ar.md) — عزل مستلمي إشعارات
->   الرسائل والمكالمات (الطرف المباشر فقط) + الوضع الصامت الكامل للمشرف العام (v2.9)
+> ℹ️ تقارير الخطوات القديمة حُذفت من المستودع؛ سجلّ التغييرات محفوظ في تاريخ Git.
 
 ### اختبارات سريعة
 ```bash
@@ -378,7 +367,9 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **قسم المشرفين قابل للطي**: مطوي افتراضياً للسوبر أدمن مع زر إظهار؛ الحالة محفوظة في `localStorage`.
 - **الإشعارات في الخلفية** — قائمة التحقق بعد النشر:
   1. نفّذ `sql/migrations/2026-09-21_v2_1_unread_push.sql` (Triggers لا تكسر الإدراج + جدول `push_delivery_log` للتشخيص).
-  2. في Vault: `SEND_PUSH_URL` = `https://<project>.supabase.co/functions/v1/send-push` و `SEND_PUSH_SECRET`.
+  2. في Vault: `SEND_PUSH_URL` = `https://<project>.supabase.co/functions/v1/send-push` و `SEND_PUSH_SECRET`،
+     و**`SUPABASE_ANON_KEY`** (المفتاح العام للمشروع — مطلوب لترويسة `Authorization` عند استدعاء الدالة).
+     لا يوجد مفتاح مكتوب في الكود بعد v2.11؛ إن لم يُضبط يسجّل `push_delivery_log` الحالة `SKIPPED` ولا يُرسل شيء.
   3. `supabase functions deploy send-push --no-verify-jwt` (أو اعتمد `supabase/config.toml`) وضبط `SEND_PUSH_SECRET` و `FIREBASE_SERVICE_ACCOUNT` كأسرار للدالة.
   4. من التطبيق: **🔔 إرسال إشعار تجريبي** ثم أغلق التطبيق — يجب أن يصل. إن لم يصل راجع `select * from push_delivery_log order by id desc`.
 - اختبارات دخانية: `cd tests && npm i jsdom && node smoke.mjs user|admin|super`.
@@ -423,3 +414,20 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   و`skipped_total` و`super_admin_silenced`.
 - **اختبارات**: `npm run test:isolation` (منطق + مصادر) و`npm run test:sql:v29`
   (تنفيذ الهجرة على PostgreSQL حقيقي: 66 فحصاً) — وكلاهما ضمن `npm test`.
+
+## الإصدار v2.11 — تدقيق الأمان وتشديد RLS ومراجعة الإنتاج
+
+الهجرة: `sql/migrations/2026-10-14_v2_11_security_hardening.sql` (مطابقة لما في `sql/schema.sql`).
+للقواعد القائمة: نفّذ الهجرة في SQL Editor، ثم أعد نشر `supabase/functions/agora-token` و`send-push`.
+
+- **لا مفاتيح ثابتة في SQL**: `push_call_edge` يقرأ `SUPABASE_ANON_KEY` من **Vault** (ثم `SUPABASE_SERVICE_ROLE_KEY` من Vault كاحتياط).
+  بلا مفتاح صالح ⇒ يُسجَّل `SKIPPED` ولا يُرسل شيء (fail-closed).
+- **المشرف العام = مراقب للقراءة فقط**: يرى المحادثات والرسائل والمكالمات، لكنه لا يكتب ولا يحذف ولا يحظر
+  (السياسات `SELECT` فقط، والحظر/الحذف يرفضهما الخادم، وأزرارهما مخفية عنه). لا يصله أي إشعار.
+- **لا RPC للزوار** وسحب الدوال الداخلية (تنظيف المكالمات، توزيع الإشعارات، قائمة المشرفين) من `anon` و`authenticated`.
+- **التخزين**: لا سياسة سرد عامة على المرفقات/الصور (الروابط العامة للحاويات تعمل كما هي).
+- **توكن Agora مُقيَّد**: `agora-token` لا يُصدر توكناً إلا لطرف في المحادثة التي تُنتج القناة `wa_<conversationId>`، وغير المحظور.
+- **Enter / Shift+Enter** في حقل الرسالة: Enter = سطر جديد، Shift+Enter = إرسال (ولا شيء عند الحقل الفارغ).
+- **الاعتمادات**: `eslint` و`jsdom` صارا devDependencies، و`@electric-sql/pglite` صار devDependency مثبّتاً
+  فتعمل اختبارات PostgreSQL فعلياً في `npm ci` (كانت تتخطّى صامتةً).
+- **الاختبار**: `npm run test:rls` (تدقيق العزل والصلاحيات على PostgreSQL حقيقي) ضمن `npm test`.

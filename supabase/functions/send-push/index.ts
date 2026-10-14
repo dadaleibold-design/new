@@ -113,6 +113,9 @@ const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 const encoder = new TextEncoder();
 let firebaseAccessToken: { value: string; expiresAt: number } | null = null;
 
+/** أقصى عمر لدفعة رنين مكالمة (يطابق expire_stale_ringing_calls: دقيقتان) */
+const CALL_RING_MAX_AGE_MS = 2 * 60 * 1000;
+
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -509,6 +512,24 @@ Deno.serve(async (req) => {
       if (roomError) return json({ error: "Call room lookup failed" }, 500);
       if (!room) return refuse("call room not found", 404);
       if (String(room.callee_id || "") !== calleeId) return refuse("callee mismatch", 409);
+
+      // 🔔 لا رنين إلا لمكالمة ما زالت ترنّ فعلاً. مكالمة أُجيبت/رُفضت/انتهت/فاتت
+      //    بالفعل لا يجوز أن تُرسل دفعة رنين متأخرة (مثلاً إعادة محاولة trigger).
+      //    الرد 200 لا خطأ: الحالة المتوقعة، لا تُعاد المحاولة.
+      if (input.type === "incoming_call") {
+        if (String(room.status || "") !== "ringing") return refuse("call not ringing", 200);
+        // نافذة حداثة من ساعة الخادم/قاعدة البيانات (لا ساعة الجهاز): تطابق
+        // expire_stale_ringing_calls (دقيقتان). الغرفة الأقدم لا ترنّ.
+        const { data: timing } = await supabase
+          .from("call_rooms")
+          .select("started_at")
+          .eq("id", roomId)
+          .maybeSingle();
+        const startedMs = Date.parse(String(timing?.started_at || ""));
+        if (Number.isFinite(startedMs) && Date.now() - startedMs > CALL_RING_MAX_AGE_MS) {
+          return refuse("call ring window expired", 200);
+        }
+      }
 
       const recipientId = String(room.callee_id || "");
       const resolvedCallerId = String(room.caller_id || callerId);

@@ -15,6 +15,20 @@ import { AGORA, isAgoraConfigured, buildAgoraChannelName } from "./config.js";
 import { safeAsync, safeQuery, safeDom, guard } from "./safety.js";
 // عزل الرنين (v2.9): لا يرن إلا الجهاز الذي هو callee_id في غرفة المكالمة
 import { shouldRingForInvite } from "./notification-scope.js";
+// منطق وسائط نقي: الكاميرا الأمامية/الخلفية، ومخرج الصوت، ومنع تكرار الرنين
+import {
+  AUDIO_ROUTE_EARPIECE,
+  AUDIO_ROUTE_SPEAKER,
+  createExpiringSet,
+  facingFromSettings,
+  isCallPushType,
+  nextFacingMode,
+  normalizeFacing,
+  pickAlternateCamera,
+  pickOutputDevice,
+  shouldMirrorLocalPreview,
+  supportsAudioRouting,
+} from "./call-media.js";
 import {
   startRingtone,
   stopRingtone as stopRingtoneEngine,
@@ -153,11 +167,23 @@ const callState = {
 
   micMuted: false,
   cameraOff: false,
-  speakerOn: true,
   minimized: false,
   ringtoneKind: null,
   joining: false,
   onCallLogged: null, // callback يُستدعى بعد كتابة بطاقة المكالمة في المحادثة
+
+  // مخرج الصوت: "speaker" | "earpiece" — الافتراضي حسب نوع المكالمة (تُضبط عند البدء)
+  audioRoute: AUDIO_ROUTE_SPEAKER,
+  // هل طلب المستخدم تغيير المخرج يدوياً؟ (لا نطبّق شيئاً تلقائياً قبل ذلك)
+  audioRouteTouched: false,
+  routeBusy: false,
+  // الكاميرا الحالية: "user" (أمامية) | "environment" (خلفية)
+  facingMode: "user",
+  switchingCamera: false,
+
+  // غرف رُنّ لها أو أُنهيت مؤخراً — تمنع تكرار الرنين عندما تصل الدعوة مرتين
+  // (Realtime + Push) أو تصل متأخرة بعد الرفض/الانتهاء.
+  handledRooms: createExpiringSet({ ttlMs: 120000 }),
 };
 
 function t(key, fallback) {
@@ -216,7 +242,6 @@ function ensureCallOverlay() {
         <div class="call-topbar-center">
           <span class="call-secure">🔒 <span>مشفّرة من طرف إلى طرف</span></span>
         </div>
-        <button type="button" id="call-btn-flip" class="call-top-btn hidden" title="تبديل الكاميرا" aria-label="تبديل الكاميرا">🔄</button>
       </header>
 
       <div class="call-peer-card" id="call-peer-card">
@@ -233,17 +258,17 @@ function ensureCallOverlay() {
       </div>
 
       <div class="call-controls" id="call-controls">
-        <button type="button" id="call-btn-speaker" class="call-ctrl" title="مكبّر الصوت" aria-label="مكبّر الصوت" data-label="السماعة">
-          <span class="call-ctrl-icon">🔊</span><span class="call-ctrl-label">السماعة</span>
+        <button type="button" id="call-btn-speaker" class="call-ctrl" title="مكبّر الصوت / سماعة الأذن" aria-label="تبديل مخرج الصوت بين مكبّر الصوت وسماعة الأذن" aria-pressed="false" data-label="السماعة">
+          <span class="call-ctrl-icon">🔈</span><span class="call-ctrl-label">المخرج</span>
         </button>
         <button type="button" id="call-btn-cam" class="call-ctrl" title="إيقاف الكاميرا" aria-label="إيقاف الكاميرا">
           <span class="call-ctrl-icon">📷</span><span class="call-ctrl-label">الكاميرا</span>
         </button>
+        <button type="button" id="call-btn-flip" class="call-ctrl hidden" title="تبديل الكاميرا بين الأمامية والخلفية" aria-label="تبديل الكاميرا بين الأمامية والخلفية">
+          <span class="call-ctrl-icon">🔄</span><span class="call-ctrl-label">تبديل</span>
+        </button>
         <button type="button" id="call-btn-mic" class="call-ctrl" title="كتم الصوت" aria-label="كتم الصوت">
           <span class="call-ctrl-icon">🎙️</span><span class="call-ctrl-label">كتم</span>
-        </button>
-        <button type="button" id="call-btn-switch" class="call-ctrl hidden" title="تبديل الكاميرا" aria-label="تبديل الكاميرا">
-          <span class="call-ctrl-icon">🔄</span><span class="call-ctrl-label">تبديل</span>
         </button>
         <button type="button" id="call-btn-end" class="call-ctrl call-ctrl-end" title="إنهاء" aria-label="إنهاء المكالمة">
           <span class="call-ctrl-icon">
@@ -262,14 +287,11 @@ function ensureCallOverlay() {
     .querySelector("#call-btn-cam")
     ?.addEventListener("click", guard("call:cam", toggleCamera));
   overlay
-    .querySelector("#call-btn-switch")
-    ?.addEventListener("click", guard("call:switch", switchCamera));
-  overlay
     .querySelector("#call-btn-flip")
     ?.addEventListener("click", guard("call:flip", switchCamera));
   overlay
     .querySelector("#call-btn-speaker")
-    ?.addEventListener("click", guard("call:speaker", toggleSpeaker));
+    ?.addEventListener("click", guard("call:speaker", toggleAudioRoute));
   overlay
     .querySelector("#call-btn-minimize")
     ?.addEventListener("click", guard("call:minimize", () => setMinimized(true)));
@@ -774,6 +796,35 @@ async function setCallPresence(status) {
 }
 
 /* ------------------------------------------------------------
+ * 5-ب) حالة الوسائط لكل مكالمة + تلميح جلسة الصوت
+ * ---------------------------------------------------------- */
+
+/** يضبط القيم الافتراضية لمكالمة جديدة: مكبّر للفيديو وسماعة أذن للصوت (كواتساب) */
+function beginCallMediaState(callType) {
+  callState.audioRoute = callType === "video" ? AUDIO_ROUTE_SPEAKER : AUDIO_ROUTE_EARPIECE;
+  callState.audioRouteTouched = false;
+  callState.routeBusy = false;
+  callState.facingMode = "user";
+  callState.switchingCamera = false;
+  setAudioSessionType("play-and-record");
+}
+
+/**
+ * تلميح لنظام التشغيل بأن الصفحة في مكالمة (تسجيل + تشغيل). مدعوم في Safari
+ * (iOS 16.4+) فقط؛ وفي غيره يُتجاهل بصمت. لا نغيّره أثناء المكالمة لتفادي
+ * مقاطعة الصوت.
+ */
+function setAudioSessionType(type) {
+  try {
+    if ("audioSession" in navigator && navigator.audioSession) {
+      navigator.audioSession.type = type;
+    }
+  } catch {
+    /* متصفح لا يسمح بالتغيير — تجاهل */
+  }
+}
+
+/* ------------------------------------------------------------
  * 6) إدارة Agora RTC
  * ---------------------------------------------------------- */
 async function fetchAgoraToken(channel, uid) {
@@ -830,6 +881,10 @@ function attachClientHandlers(client) {
 
       if (mediaType === "audio") {
         user.audioTrack?.play();
+        // طبّق مخرج الصوت الذي اختاره المستخدم (إن اختار صراحةً)
+        if (callState.audioRouteTouched) {
+          applyAudioRoute(callState.audioRoute).catch(() => {});
+        }
       }
     });
   });
@@ -933,7 +988,10 @@ async function joinAgoraChannel({ channel, callType }) {
         if (container) {
           container.innerHTML = "";
           container.classList.remove("hidden");
-          videoResult.data.play(container, { fit: "cover", mirror: true });
+          videoResult.data.play(container, {
+            fit: "cover",
+            mirror: shouldMirrorLocalPreview(callState.facingMode),
+          });
         }
       });
     } else {
@@ -1070,6 +1128,7 @@ export async function startCall(callType = "audio") {
   };
 
   unlockAudio();
+  beginCallMediaState(callType);
   setPeerInfo(peer);
   setCallPhase("ringing");
   setCallStatus("جارٍ الاتصال", { animated: true });
@@ -1141,12 +1200,19 @@ export async function startCall(callType = "audio") {
 
 /* ------------------------------------------------------------
  * 8) تدفق المكالمة الواردة
+ *    مصدر الدعوة إما Realtime (التطبيق مفتوح) أو Push (التطبيق مغلق/في الخلفية
+ *    أو Realtime متأخر). كلاهما يمر من هنا فيُطبَّق التحقق نفسه ومنع التكرار.
  * ---------------------------------------------------------- */
 async function handleIncomingInvite(payload) {
-  if (!payload?.roomId || !payload?.channel) return;
+  if (!payload?.roomId) return;
 
   const me = callState.ctx?.getMe?.();
   if (!me?.id) return;
+
+  // 🔁 منع التكرار: الدعوة قد تصل مرتين (Realtime + Push) أو بعد أن رنّت/أُنهيت.
+  //    نسجّل الغرفة فوراً (قبل أي await) حتى لا تمرّ النسختان معاً.
+  if (callState.handledRooms.has(payload.roomId)) return;
+  callState.handledRooms.add(payload.roomId);
 
   // ⛔ عزل الرنين: لا يرن هذا الجهاز إلا إذا كان هو callee_id الفعلي في غرفة
   //    المكالمة المسجَّلة في قاعدة البيانات. أي دعوة أخرى (بث خاطئ، مراقبة
@@ -1155,7 +1221,7 @@ async function handleIncomingInvite(payload) {
   const { ok, data: room } = await safeQuery("calls:verify-invite", () =>
     supabase
       .from("call_rooms")
-      .select("id, caller_id, callee_id, status")
+      .select("id, caller_id, callee_id, status, conversation_id, channel_name, call_type")
       .eq("id", payload.roomId)
       .maybeSingle()
   );
@@ -1166,16 +1232,28 @@ async function handleIncomingInvite(payload) {
     return;
   }
 
+  // دعوة Push لا تحمل القناة ولا النوع (حمولة قصيرة): نكمّلها من الغرفة نفسها
+  const invite = {
+    ...payload,
+    channel: payload.channel || room?.channel_name || "",
+    callType: payload.callType || room?.call_type || "audio",
+    conversationId: payload.conversationId || room?.conversation_id || null,
+  };
+  if (!invite.channel) {
+    console.warn("[calls] دعوة بلا قناة صالحة — تعذّر الرنين");
+    return;
+  }
+
   // مشغول بمكالمة أخرى → ارفض تلقائياً
   if (callState.current || callState.incoming) {
-    await sendSignal(payload.caller?.id, "call:decline", {
-      roomId: payload.roomId,
+    await sendSignal(invite.caller?.id, "call:decline", {
+      roomId: invite.roomId,
       reason: "busy",
     });
     return;
   }
 
-  callState.incoming = payload;
+  callState.incoming = invite;
 
   safeDom("incoming-show", () => {
     const box = ensureIncomingDialog();
@@ -1184,18 +1262,18 @@ async function handleIncomingInvite(payload) {
     const kindEl = box.querySelector("#incoming-kind");
     const avatarEl = box.querySelector("#incoming-avatar");
     const initialEl = box.querySelector("#incoming-initial");
-    const isVideo = payload.callType === "video";
+    const isVideo = invite.callType === "video";
 
-    if (nameEl) nameEl.textContent = payload.caller?.display_name || "مكالمة واردة";
+    if (nameEl) nameEl.textContent = invite.caller?.display_name || "مكالمة واردة";
     if (kindEl) kindEl.textContent = isVideo ? "🎥 مكالمة فيديو واردة" : "📞 مكالمة صوتية واردة";
     if (subEl) subEl.textContent = "🔒 مشفّرة من طرف إلى طرف";
-    const hasAvatar = Boolean(payload.caller?.avatar_url);
+    const hasAvatar = Boolean(invite.caller?.avatar_url);
     if (avatarEl) {
-      avatarEl.src = hasAvatar ? payload.caller.avatar_url : "";
+      avatarEl.src = hasAvatar ? invite.caller.avatar_url : "";
       avatarEl.classList.toggle("hidden", !hasAvatar);
     }
     if (initialEl) {
-      initialEl.textContent = initialOf(payload.caller?.display_name);
+      initialEl.textContent = initialOf(invite.caller?.display_name);
       initialEl.classList.toggle("hidden", hasAvatar);
     }
 
@@ -1203,24 +1281,130 @@ async function handleIncomingInvite(payload) {
   });
 
   playRingtone("incoming");
-  showIncomingSystemNotification(payload);
+  showIncomingSystemNotification(invite);
 
   clearTimeout(callState.ringTimer);
   callState.ringTimer = setTimeout(() => {
-    if (callState.incoming?.roomId === payload.roomId) {
+    if (callState.incoming?.roomId === invite.roomId) {
       hideIncomingDialog();
-      logCallEvent(payload.roomId, "missed", {});
+      logCallEvent(invite.roomId, "missed", {});
       writeCallMessage({
-        roomId: payload.roomId,
-        conversationId: payload.conversationId,
-        callType: payload.callType,
-        callerId: payload.caller?.id,
-        peer: payload.caller,
+        roomId: invite.roomId,
+        conversationId: invite.conversationId,
+        callType: invite.callType,
+        callerId: invite.caller?.id,
+        peer: invite.caller,
         direction: "incoming",
       }, "missed");
       callState.incoming = null;
     }
   }, AGORA.ringTimeoutMs);
+}
+
+/**
+ * يعالج حدث Push للمكالمات (incoming_call / call_ended) القادم من:
+ *   • Service Worker عندما يكون التطبيق ظاهراً (window event: wa-call-push)
+ *   • onMessage لـ FCM في المقدمة (نفس الحدث)
+ * الحمولة من send-push: { type, roomId, callerId, calleeId, callType, conversationId, title, icon }
+ */
+async function handleCallPushEvent(detail) {
+  const type = String(detail?.type || "");
+  const data = detail?.data || {};
+  const roomId = String(data.roomId || "");
+  if (!roomId || !isCallPushType(type)) return;
+
+  if (type === "call_ended") {
+    // إنهاء من الطرف الآخر: يُغلق الرنين أو المكالمة الجارية لهذه الغرفة فقط
+    handlePeerEnded({ roomId });
+    return;
+  }
+
+  const me = callState.ctx?.getMe?.();
+  if (!me?.id) return;
+
+  // 🔒 الحمولة تصرّح بالمستهدف: أي دعوة لغير هذا الحساب تُتجاهل فوراً
+  if (data.calleeId && data.calleeId !== me.id) {
+    console.warn("[calls] push مكالمة موجّه لحساب آخر — تجاهل");
+    return;
+  }
+
+  await handleIncomingInvite({
+    roomId,
+    calleeId: me.id,
+    callType: data.callType === "video" ? "video" : "audio",
+    conversationId: data.conversationId || null,
+    caller: {
+      id: data.callerId || null,
+      display_name: data.title || "مكالمة واردة",
+      avatar_url: data.icon || null,
+    },
+  });
+}
+
+/**
+ * يفتح شاشة الرنين لغرفة مكالمة محددة — يُستدعى عند النقر على إشعار المكالمة
+ * (التطبيق كان مغلقاً فلم تصل دعوة Realtime أصلاً). يتحقق من الغرفة في قاعدة
+ * البيانات: يجب أن يكون هذا الحساب callee والغرفة ما زالت «ringing».
+ *
+ * @returns {Promise<boolean>} true إن عُولج الطلب (رنين معروض أو رفض أُرسل)
+ */
+export async function presentIncomingCallFromRoom(roomId, { action = "answer" } = {}) {
+  const supabase = callState.ctx?.supabase;
+  const me = callState.ctx?.getMe?.();
+  if (!supabase || !me?.id || !roomId) return false;
+
+  if (callState.current?.roomId === roomId) return true;
+  if (callState.incoming?.roomId === roomId) return true;
+
+  const { ok, data: room } = await safeQuery("calls:route-room", () =>
+    supabase
+      .from("call_rooms")
+      .select("id, caller_id, callee_id, status, conversation_id, channel_name, call_type")
+      .eq("id", roomId)
+      .maybeSingle()
+  );
+  if (!ok || !room) return false;
+  // 🔒 عزل: لا يُعرض رنين إلا لـ callee الفعلي، وبشرط أن الغرفة ما زالت ترنّ
+  if (room.callee_id !== me.id || room.status !== "ringing") return false;
+
+  // حداثة الرنين تُحسب بساعة قاعدة البيانات (RPC) لا بساعة الجهاز.
+  // إن لم تكن الهجرة v2.10 مُطبَّقة، يُكتفى بفحص الحالة أعلاه.
+  const fresh = await safeQuery("calls:ring-fresh", () =>
+    supabase.rpc("call_room_is_ringing", { p_room: roomId })
+  );
+  if (fresh.ok && fresh.data === false) return false;
+
+  const { data: caller } = await safeQuery("calls:route-caller", () =>
+    supabase
+      .from("profiles")
+      .select("id, display_name, avatar_url")
+      .eq("id", room.caller_id)
+      .maybeSingle()
+  );
+
+  const invite = {
+    roomId,
+    channel: room.channel_name,
+    callType: room.call_type === "video" ? "video" : "audio",
+    conversationId: room.conversation_id,
+    calleeId: me.id,
+    caller: {
+      id: room.caller_id,
+      display_name: caller?.display_name || "مكالمة واردة",
+      avatar_url: caller?.avatar_url || null,
+    },
+  };
+
+  if (action === "decline") {
+    // الرفض من الإشعار: نفس مسار الرفض من الشاشة (يُرسل للمتصل ويحدّث الغرفة)
+    callState.handledRooms.add(roomId);
+    callState.incoming = invite;
+    await declineIncomingCall();
+    return true;
+  }
+
+  await handleIncomingInvite(invite);
+  return callState.incoming?.roomId === roomId || callState.current?.roomId === roomId;
 }
 
 function hideIncomingDialog() {
@@ -1258,6 +1442,7 @@ async function acceptIncomingCall() {
   };
 
   unlockAudio();
+  beginCallMediaState(invite.callType);
   setPeerInfo(invite.caller);
   setCallPhase("connecting");
   setCallStatus("جارٍ الانضمام", { animated: true });
@@ -1326,6 +1511,7 @@ function handlePeerAccepted(payload) {
 }
 
 function handlePeerDeclined(payload) {
+  if (payload?.roomId) callState.handledRooms.add(payload.roomId);
   if (!callState.current || callState.current.roomId !== payload?.roomId) return;
   notify(payload?.reason === "busy" ? "الطرف الآخر مشغول حالياً." : "تم رفض المكالمة.");
   setCallStatus(payload?.reason === "busy" ? "مشغول" : "تم الرفض");
@@ -1335,6 +1521,7 @@ function handlePeerDeclined(payload) {
 }
 
 function handlePeerEnded(payload) {
+  if (payload?.roomId) callState.handledRooms.add(payload.roomId);
   if (callState.current && callState.current.roomId === payload?.roomId) {
     endCall("ended", { silent: true });
     return;
@@ -1387,17 +1574,22 @@ export async function endCall(reason = "ended", { silent = false } = {}) {
 
   callState.micMuted = false;
   callState.cameraOff = false;
-  callState.speakerOn = true;
   callState.current = null;
+  callState.audioRouteTouched = false;
+  callState.routeBusy = false;
+  callState.switchingCamera = false;
+  callState.facingMode = "user";
+  setAudioSessionType("auto");
   safeDom("reset-ctrls", () => {
     document.getElementById("call-btn-mic")?.classList.remove("active");
     document.getElementById("call-btn-cam")?.classList.remove("active");
-    document.getElementById("call-btn-speaker")?.classList.remove("active");
     const micIcon = document.querySelector("#call-btn-mic .call-ctrl-icon");
     if (micIcon) micIcon.textContent = "🎙️";
     const camIcon = document.querySelector("#call-btn-cam .call-ctrl-icon");
     if (camIcon) camIcon.textContent = "📷";
+    setFlipBusy(false);
   });
+  renderAudioRouteButton();
 
   await setCallPresence("available");
 
@@ -1430,30 +1622,227 @@ function updateControlsForType(callType) {
     const isVideo = callType === "video";
     document.getElementById("call-stage")?.setAttribute("data-type", isVideo ? "video" : "audio");
     document.getElementById("call-btn-cam")?.classList.toggle("hidden", !isVideo);
+    // زر التبديل بين الأمامية والخلفية: للفيديو فقط
     document.getElementById("call-btn-flip")?.classList.toggle("hidden", !isVideo);
-    document.getElementById("call-btn-switch")?.classList.add("hidden");
-    document.getElementById("call-btn-speaker")?.classList.toggle("hidden", isVideo);
-    document.getElementById("call-local-video")?.classList.toggle("hidden", !isVideo);
+    // زر مخرج الصوت متاح للصوت والفيديو معاً
+    document.getElementById("call-btn-speaker")?.classList.remove("hidden");
+    // المعاينة المحلية تظهر فقط عند تشغيل مسار الفيديو فعلياً (renderLocalPreview)
+    if (!isVideo) document.getElementById("call-local-video")?.classList.add("hidden");
+  });
+  renderAudioRouteButton();
+}
+
+/* ------------------------------------------------------------
+ * مخرج الصوت: مكبّر الصوت ⇄ سماعة الأذن
+ *
+ * الآلية: Agora `IRemoteAudioTrack.setPlaybackDevice(deviceId)` بعد اختيار
+ * جهاز الإخراج المناسب من `AgoraRTC.getPlaybackDevices()` بالاسم.
+ * الدعم الفعلي يعتمد على المتصفح:
+ *   • Chrome/Edge للحاسوب: يعمل (اختيار مخرج معيّن من القائمة).
+ *   • Chrome/Firefox للأندرويد وأغلب متصفحات الهاتف: setSinkId غير متاح ⇒ «محدود».
+ *   • Safari (iOS): setSinkId متاح من iOS 18.4 لكن قائمة الإخراج قد لا تحوي سماعة أذن.
+ * عند عدم الدعم لا نخفّض الصوت كبديل (كان ذلك تمثيلاً زائفاً)، بل نُبلغ المستخدم.
+ * ---------------------------------------------------------- */
+
+/** هل يحتمل هذا المتصفح تغيير مخرج الصوت؟ (لتلوين الزر وشرح الحد) */
+function audioRoutingSupported() {
+  return supportsAudioRouting({
+    hasSetSinkId:
+      typeof window !== "undefined" &&
+      Boolean(window.HTMLAudioElement?.prototype) &&
+      "setSinkId" in window.HTMLAudioElement.prototype,
   });
 }
 
-/** مكبّر الصوت: على الويب نتحكم بمستوى الصوت البعيد (تجربة مشابهة للهاتف) */
-async function toggleSpeaker() {
-  callState.speakerOn = !callState.speakerOn;
-  callState.remoteUsers.forEach((user) => {
+/** يطبّق المخرج على كل مسارات الصوت البعيدة الحالية. يعيد { ok, reason } */
+async function applyAudioRoute(route) {
+  const tracks = [...callState.remoteUsers.values()]
+    .map((user) => user.audioTrack)
+    .filter(Boolean);
+
+  if (!tracks.length) return { ok: true, reason: "pending" };
+  if (!audioRoutingSupported()) return { ok: false, reason: "unsupported" };
+
+  const AgoraRTC = await loadAgoraSdk();
+  let devices = [];
+  try {
+    devices = await AgoraRTC.getPlaybackDevices();
+  } catch {
+    return { ok: false, reason: "unsupported" };
+  }
+
+  const deviceId = pickOutputDevice(devices, route);
+  if (!deviceId) {
+    return {
+      ok: false,
+      reason: route === AUDIO_ROUTE_EARPIECE ? "no-earpiece" : "no-speaker",
+    };
+  }
+
+  let applied = 0;
+  for (const track of tracks) {
     try {
-      user.audioTrack?.setVolume(callState.speakerOn ? 100 : 35);
-    } catch {
-      /* تجاهل */
+      await track.setPlaybackDevice(deviceId);
+      applied += 1;
+    } catch (error) {
+      if (/NOT_SUPPORTED/i.test(String(error?.code || error?.message || ""))) {
+        return { ok: false, reason: "unsupported" };
+      }
+      console.warn("[calls] تعذّر تعيين مخرج الصوت:", error);
     }
-  });
+  }
+  return { ok: applied > 0, reason: applied > 0 ? "applied" : "failed" };
+}
+
+const ROUTE_MESSAGES = {
+  unsupported:
+    "هذا المتصفح لا يتيح للتطبيق تغيير مخرج الصوت. استخدم زر الصوت في جهازك، أو غيّر المخرج من مركز التحكم بالهاتف.",
+  "no-earpiece": "لا توجد سماعة أذن منفصلة على هذا الجهاز — الصوت يعمل عبر المخرج الافتراضي.",
+  "no-speaker": "لم يُعثر على مكبّر صوت منفصل على هذا الجهاز — الصوت يعمل عبر المخرج الافتراضي.",
+  failed: "تعذّر تغيير مخرج الصوت الآن. حاول مرة أخرى.",
+};
+
+/** يبدّل المخرج بين السماعة وسماعة الأذن عند الضغط على الزر */
+async function toggleAudioRoute() {
+  if (!callState.current || callState.routeBusy) return;
+
+  const next =
+    callState.audioRoute === AUDIO_ROUTE_SPEAKER ? AUDIO_ROUTE_EARPIECE : AUDIO_ROUTE_SPEAKER;
+
+  callState.routeBusy = true;
+  renderAudioRouteButton();
+  const result = await safeAsync("calls:audio-route", () => applyAudioRoute(next));
+  callState.routeBusy = false;
+
+  const outcome = result.ok && result.data ? result.data : { ok: false, reason: "failed" };
+
+  if (outcome.ok) {
+    callState.audioRoute = next;
+    callState.audioRouteTouched = true;
+    // لا توجد أجهزة بعد (الطرف الآخر لم ينشر صوته) ⇒ يُطبَّق عند وصوله
+  } else {
+    notify(ROUTE_MESSAGES[outcome.reason] || ROUTE_MESSAGES.failed);
+  }
+  renderAudioRouteButton();
+}
+
+/** يحدّث شكل زر المخرج: الحالة النشطة + الشرح عند عدم الدعم */
+function renderAudioRouteButton() {
   safeDom("speaker-btn", () => {
     const btn = document.getElementById("call-btn-speaker");
     if (!btn) return;
-    btn.classList.toggle("active", !callState.speakerOn);
-    const icon = btn.querySelector(".call-ctrl-icon");
-    if (icon) icon.textContent = callState.speakerOn ? "🔊" : "🔈";
+    const supported = audioRoutingSupported();
+    // لا نعرض حالة مخرج قبل أن يُطبَّق توجيه فعلي: قبل لمس الزر يبقى الصوت على
+    // المخرج الافتراضي للمتصفح/الجهاز، فيكون الزر محايداً (لا «سماعة أذن» كاذبة).
+    const applied = supported && callState.audioRouteTouched;
+    const isSpeaker = callState.audioRoute === AUDIO_ROUTE_SPEAKER;
+    const label = applied ? (isSpeaker ? "السماعة" : "سماعة الأذن") : "المخرج";
+    const icon = applied ? (isSpeaker ? "🔊" : "📱") : "🔈";
+
+    btn.classList.toggle("active", applied && isSpeaker);
+    btn.classList.toggle("unsupported", !supported);
+    btn.classList.toggle("busy", callState.routeBusy);
+    btn.disabled = callState.routeBusy;
+    btn.setAttribute("aria-pressed", String(applied && isSpeaker));
+    btn.title = !supported
+      ? "هذا المتصفح لا يتيح تغيير مخرج الصوت — يتحكم فيه نظام الجهاز"
+      : !applied
+        ? "المخرج الافتراضي للجهاز — اضغط لتغييره"
+        : isSpeaker
+          ? "المخرج: مكبّر الصوت — اضغط للتحويل إلى سماعة الأذن"
+          : "المخرج: سماعة الأذن — اضغط للتحويل إلى مكبّر الصوت";
+
+    const iconEl = btn.querySelector(".call-ctrl-icon");
+    if (iconEl) iconEl.textContent = icon;
+    const labelEl = btn.querySelector(".call-ctrl-label");
+    if (labelEl) labelEl.textContent = label;
   });
+}
+
+/** يُظهر/يُخفي حالة «جارٍ التبديل» على زر الكاميرا */
+function setFlipBusy(busy) {
+  safeDom("flip-busy", () => {
+    const btn = document.getElementById("call-btn-flip");
+    if (!btn) return;
+    btn.disabled = Boolean(busy);
+    btn.classList.toggle("busy", Boolean(busy));
+  });
+}
+
+/** يعيد عرض المعاينة المحلية بالاتجاه الحالي (مرآة للأمامية فقط) */
+function renderLocalPreview(track) {
+  safeDom("local-preview", () => {
+    const container = document.getElementById("call-local-video");
+    if (!container || !track) return;
+    try {
+      track.stop();
+    } catch {
+      /* تجاهل — قد لا يكون مُشغَّلاً بعد */
+    }
+    container.innerHTML = "";
+    track.play(container, {
+      fit: "cover",
+      mirror: shouldMirrorLocalPreview(callState.facingMode),
+    });
+    container.classList.remove("hidden");
+  });
+}
+
+/* ------------------------------------------------------------
+ * تبديل الكاميرا: الأمامية ⇄ الخلفية دون قطع المكالمة
+ *
+ * الآلية الأساسية: ICameraVideoTrack.setDevice({ facingMode }) (مدعومة منذ
+ * Agora 4.19) — تبدّل مصدر الفيديو على المسار نفسه، فلا يُعاد النشر ولا تنقطع
+ * المكالمة. احتياطياً (متصفحات لا تدعم facingMode): التبديل بين الكاميرات بالمعرّف.
+ * ---------------------------------------------------------- */
+async function switchCamera() {
+  const track = callState.localVideoTrack;
+  if (!track || callState.switchingCamera || callState.cameraOff) {
+    if (callState.cameraOff) notify("شغّل الكاميرا أولاً ثم بدّل بينها.");
+    return;
+  }
+
+  callState.switchingCamera = true;
+  setFlipBusy(true);
+
+  try {
+    const target = nextFacingMode(callState.facingMode);
+
+    const result = await safeAsync("calls:switch-cam", async () => {
+      try {
+        await track.setDevice({ facingMode: target });
+        return facingFromSettings(track.getMediaStreamTrack?.()?.getSettings?.()) || target;
+      } catch (primaryError) {
+        // احتياط: تبديل بالمعرّف بين الكاميرات المتاحة
+        const AgoraRTC = await loadAgoraSdk();
+        const cameras = await AgoraRTC.getCameras();
+        const currentDeviceId = track.getMediaStreamTrack?.()?.getSettings?.()?.deviceId || "";
+        const alt = pickAlternateCamera(cameras, currentDeviceId);
+        if (!alt) {
+          const err = new Error("NO_OTHER_CAMERA");
+          err.cause = primaryError;
+          throw err;
+        }
+        await track.setDevice(alt.deviceId);
+        return facingFromSettings(track.getMediaStreamTrack?.()?.getSettings?.()) || target;
+      }
+    });
+
+    if (result.ok && result.data) {
+      callState.facingMode = normalizeFacing(result.data);
+      renderLocalPreview(track);
+    } else {
+      const noOther = /NO_OTHER_CAMERA/.test(String(result.error?.message || ""));
+      notify(
+        noOther
+          ? "لا توجد كاميرا أخرى متاحة على هذا الجهاز."
+          : "تعذّر تبديل الكاميرا الآن. حاول مرة أخرى."
+      );
+    }
+  } finally {
+    callState.switchingCamera = false;
+    setFlipBusy(false);
+  }
 }
 
 /** يُظهر إشعار نظام للمكالمة الواردة عندما يكون التبويب في الخلفية */
@@ -1521,23 +1910,6 @@ async function toggleCamera() {
   });
 }
 
-async function switchCamera() {
-  const track = callState.localVideoTrack;
-  if (!track) return;
-
-  await safeAsync("calls:switch-cam", async () => {
-    const AgoraRTC = await loadAgoraSdk();
-    const cameras = await AgoraRTC.getCameras();
-    if (!cameras || cameras.length < 2) {
-      notify("لا توجد كاميرا أخرى متاحة.");
-      return;
-    }
-    const currentLabel = track.getTrackLabel?.();
-    const next = cameras.find((c) => c.label !== currentLabel) || cameras[0];
-    await track.setDevice(next.deviceId);
-  });
-}
-
 /* ------------------------------------------------------------
  * 12) التهيئة العامة + ربط أزرار الواجهة
  * ---------------------------------------------------------- */
@@ -1573,6 +1945,13 @@ export function initCalls(ctx) {
   // Esc لإنهاء المكالمة
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && callState.current) endCall("ended");
+  });
+
+  // دفعات Push للمكالمات حين يكون التطبيق ظاهراً (يرسلها Service Worker أو onMessage)
+  window.addEventListener("wa-call-push", (event) => {
+    handleCallPushEvent(event?.detail).catch((error) =>
+      console.error("[calls] push event", error)
+    );
   });
 }
 
