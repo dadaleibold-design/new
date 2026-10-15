@@ -280,7 +280,7 @@ const APP_WINDOW = (visibilityState) => ({ visibilityState, url: "https://app.te
 /* ---------- (أ-8) بناء SW ---------- */
 {
   const env = createSwEnv({ clientsSpec: [] });
-  check("SW_BUILD = 2026-10-15.1", env.self.__WA_MESSAGING_SW_BUILD === "2026-10-15.1", env.self.__WA_MESSAGING_SW_BUILD);
+  check("SW_BUILD = 2026-10-15.2", env.self.__WA_MESSAGING_SW_BUILD === "2026-10-15.2", env.self.__WA_MESSAGING_SW_BUILD);
 }
 
 /* ---------- (ب) فحص المصادر ---------- */
