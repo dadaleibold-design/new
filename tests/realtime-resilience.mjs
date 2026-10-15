@@ -13,7 +13,14 @@
  *
  * التشغيل: node tests/realtime-resilience.mjs
  */
-import { createResilientChannel, getManagedChannel } from "../js/realtime.js";
+import {
+  createResilientChannel,
+  diagnoseRealtime,
+  getManagedChannel,
+  isChannelAlive,
+  isRealtimeConnected,
+  startRealtimeWatchdog,
+} from "../js/realtime.js";
 
 let fails = 0;
 const check = (name, ok, extra = "") => {
@@ -85,6 +92,34 @@ function createFakeSupabase({ failingTopics = new Set() } = {}) {
     },
   };
   return client;
+}
+
+/* 0) عقد Supabase الحقيقي: connectionState() يعيد "open" لا "connected" ---- */
+{
+  const sb = createFakeSupabase();
+  sb.realtime.connectionState = () => "open";
+  const handle = createResilientChannel(sb, { topic: "t-open-state" });
+  await handle.ready;
+  await tick(10);
+
+  const report = diagnoseRealtime(sb);
+  check("connectionState='open' يُفسَّر كاتصال حيّ", isRealtimeConnected(sb));
+  check("قناة joined على socket open تُعدّ حيّة", isChannelAlive(sb, handle.channel));
+  check("تقرير الصحة لا يطلق healthy=false على open + joined", report.healthy, JSON.stringify(report));
+
+  let revives = 0;
+  let lost = 0;
+  const watchdog = startRealtimeWatchdog({
+    supabase: sb,
+    visibleIntervalMs: 60_000,
+    hiddenIntervalMs: 60_000,
+    onRevive: () => { revives += 1; },
+    onConnectionLost: () => { lost += 1; },
+  });
+  await Promise.all([watchdog.ping(), watchdog.ping()]);
+  check("Watchdog لا يعيد الإحياء ولا يبلغ عن فقد الاتصال عند open + joined", revives === 0 && lost === 0);
+  watchdog.stop();
+  handle.stop();
 }
 
 /* 1) إعادة البناء المتكررة لا تُولّد حلقة ------------------------------ */
