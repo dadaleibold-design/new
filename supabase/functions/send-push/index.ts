@@ -1,5 +1,9 @@
 // supabase/functions/send-push/index.ts
-// Sends Firebase Cloud Messaging notifications for newly inserted messages.
+// طبقة الأمان والتحقق للإشعارات — الإرسال الفعلي عبر Cloudflare Worker (Gateway).
+//
+// المسار الكامل (v2026-10-15.1):
+//   Database Trigger (pg_net) ➔ Edge Function (التحقق والعزل) ➔ Cloudflare Worker
+//   (بوابة FCM: توليد OAuth2/JWT والاتصال بـ Firebase) ➔ FCM ➔ firebase-messaging-sw.js
 //
 // أنواع الطلبات المدعومة:
 //   • (افتراضي) رسالة جديدة        — message_id / conversation_id / sender_id
@@ -17,19 +21,36 @@
 //     البيانات (لا من الحمولة وحدها). لا رنين لأي حساب آخر — ومنهم المشرف العام.
 //   • new_user: هو الإشعار الجماعي الوحيد (كل المشرفين النشطين) ولا يقبل مستلماً واحداً.
 //
-// كل الأسرار تُقرأ حصرياً من Deno.env.get() — لا مفتاح واحد داخل الكود:
+// 🚪 بوابة الإرسال (v2026-10-15.1) — التعديل المعماري:
+//   هذه الدالة لم تعد تتصل بـ FCM مباشرة ولا تولّد توكنات Google OAuth2/JWT
+//   (أُزيلت getFirebaseAccessToken و sendToFcm ومعها اعتماد jose وحساب الخدمة).
+//   لكل جهاز مستلم يُرسل POST واحد إلى Cloudflare Worker بالشكل:
+//     { "token": "<FCM_DEVICE_TOKEN>", "title": "...", "body": "...", "data": { ... } }
+//   (+ حقول اختيارية priority / ttlSeconds كتلميحات أولوية يحترمها الـ Worker إن
+//    دعمها، ويجوز له تجاهلها دون كسر العقد.)
+//   الـ Worker هو من يبني رسالة FCM HTTP v1 بنفس عقد الويب data-only
+//   (v2026-10-13.2) ويوقّعها بحساب خدمة Firebase الخاص به.
 //
-// Required (one of the two Firebase forms):
-//   • FIREBASE_SERVICE_ACCOUNT — كامل JSON لحساب الخدمة (يُفضّل: سرّ واحد)
-//   • أو الحقول منفصلة: FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL +
-//     FIREBASE_PRIVATE_KEY  (PEM؛ يدعم \n مُهرَّبة — يُعاد تحويلها لأسطر حقيقية)
-//   SEND_PUSH_SECRET      — السرّ المشترك الذي يستخدمه trigger قاعدة البيانات
-//                           (نفس قيمة Vault: SEND_PUSH_SECRET؛ والرابط المقابل
-//                           محفوظ في Vault باسم SEND_PUSH_URL)
-// Optional:
-//   SUPABASE_URL
-//   SUPABASE_SERVICE_ROLE_KEY
-//   PUSH_NORMAL_URGENCY   ("1" لإعادة الأولوية العادية)
+// متغيرات البيئة (Deno.env.get فقط — لا سرّ واحد داخل الكود):
+//   Required:
+//     SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY — عميل Supabase الداخلي
+//     SEND_PUSH_SECRET — السرّ المشترك الذي يستخدمه trigger قاعدة البيانات
+//                        (نفس قيمة Vault: SEND_PUSH_SECRET)
+//   Gateway (بوابة الـ Worker):
+//     PUSH_GATEWAY_URL    — رابط الـ Cloudflare Worker (الأسمى والأوضح)
+//     SEND_PUSH_URL       — بديل مقبول لرابط الـ Worker في أسرار الدالة نفسها
+//                           (تنبيه: قيمة Vault بهذا الاسم تبقى رابط **هذه الدالة**
+//                           لتستدعيها الـ Triggers — متجرّان مختلفان بقيمتين مختلفتين)
+//     PUSH_GATEWAY_SECRET — سرّ مصادقة الـ Worker (Authorization: Bearer)؛
+//                           إن لم يُضبَط يُستخدم SEND_PUSH_SECRET بديلاً.
+//     ⛔ حارس حلقة: أي رابط يحوي /functions/v1/ يُرفض عند الإقلاع — لو توجّهت
+//        الدالة إلى نفسها لتسبب ذلك في استدعاء لا نهائي (send-push ➔ send-push).
+//   Optional:
+//     PUSH_NORMAL_URGENCY ("1" لإعادة الأولوية العادية)
+//
+// أسرار Firebase (FIREBASE_SERVICE_ACCOUNT / FIREBASE_PROJECT_ID /
+// FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY) لم تعد تُقرأ هنا إطلاقاً —
+// انتقلت إلى الـ Worker (wrangler secret put ...) فهو طرف الاتصال بـ Google.
 //
 // عقد الويب (v2026-10-13.2): كل دفعة ويب data-only — بلا webpush.notification.
 // الإشعار المرئي يُبنى حصرياً في firebase-messaging-sw.js من حقول data، فيتطابق
@@ -38,81 +59,73 @@
 // APP_PUBLIC_URL لم يعد مطلوباً للويب (إن ضُبط فهو غير مستخدم).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
 import { fitFcmData } from "./payload.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
 
-/** حقول حساب خدمة Firebase كما تظهر في ملف JSON الرسمي */
-interface ServiceAccount {
-  project_id?: string;
-  client_email?: string;
-  private_key?: string;
-}
-
 /**
- * يعيد مفتاح PEM إلى صيغته الصحيحة: الأسرار تُخزَّن غالباً في سطر واحد
- * مع `\n` مُهرَّبة، فيجب تحويلها إلى أسطر حقيقية قبل importPKCS8.
+ * 🚪 رابط بوابة الإرسال (Cloudflare Worker) — يُقرأ من البيئة مع قيمة افتراضية معتمدة.
+ * الترتيب: PUSH_GATEWAY_URL ثم SEND_PUSH_URL (كما ورد في أسرار الدالة) ثم الافتراضي.
  */
-function normalizePrivateKey(value?: string | null): string | undefined {
-  const key = typeof value === "string" ? value.trim() : "";
-  if (!key) return undefined;
-  return key.replace(/\\n/g, "\n");
+const DEFAULT_GATEWAY_URL = "https://nameless-dew-aac1.aabntlal680.workers.dev/";
+
+function resolveGatewayUrl(): string {
+  const candidate =
+    Deno.env.get("PUSH_GATEWAY_URL")?.trim() ||
+    Deno.env.get("SEND_PUSH_URL")?.trim() ||
+    DEFAULT_GATEWAY_URL;
+
+  if (!/^https?:\/\//i.test(candidate)) {
+    throw new Error(
+      "PUSH_GATEWAY_URL/SEND_PUSH_URL must be an absolute http(s) URL pointing to the Cloudflare Worker",
+    );
+  }
+  // ⛔ حارس الحلقة: البوابة لا يجوز أن تكون دالة Supabase نفسها —
+  // send-push ➔ send-push يعني إشعارات لا نهائية وفاتورة حسابية بلا نهاية.
+  if (candidate.includes("/functions/v1/")) {
+    throw new Error(
+      "PUSH_GATEWAY_URL/SEND_PUSH_URL must point to the Cloudflare Worker, " +
+        "not back to this Edge Function (/functions/v1/…) — that would create an infinite loop. " +
+        "ملاحظة: قيمة Vault باسم SEND_PUSH_URL تبقى رابط هذه الدالة للـ Triggers، " +
+        "أما أسرار الدالة (Edge Function Secrets) فتأخذ رابط الـ Worker.",
+    );
+  }
+  return candidate;
 }
 
-/**
- * يقرأ FIREBASE_SERVICE_ACCOUNT (JSON كامل) — ويدعم أيضاً تمريره Base64.
- * لا يُسجَّل أي جزء من قيمته في السجلات.
- */
-function loadServiceAccount(): ServiceAccount {
-  const raw = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
-  if (!raw) return {};
-
-  const attempts: string[] = [raw];
-  if (!raw.trim().startsWith("{")) {
-    try {
-      attempts.push(atob(raw.trim()));
-    } catch {
-      /* ليست Base64 — نكتفي بالمحاولة الأولى */
-    }
-  }
-
-  for (const candidate of attempts) {
-    try {
-      const parsed = JSON.parse(candidate) as ServiceAccount;
-      if (parsed && typeof parsed === "object") return parsed;
-    } catch {
-      /* جرّب الصيغة التالية */
-    }
-  }
-
-  console.error("[send-push] FIREBASE_SERVICE_ACCOUNT is not valid JSON — ignoring it");
-  return {};
+/** سرّ مصادقة الـ Worker: PUSH_GATEWAY_SECRET إن وُجد، وإلا SEND_PUSH_SECRET */
+function resolveGatewaySecret(): string {
+  return (
+    Deno.env.get("PUSH_GATEWAY_SECRET")?.trim() ||
+    SEND_PUSH_SECRET?.trim() ||
+    ""
+  );
 }
-
-const SERVICE_ACCOUNT = loadServiceAccount();
-
-const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") || SERVICE_ACCOUNT.project_id;
-const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") || SERVICE_ACCOUNT.client_email;
-const FIREBASE_PRIVATE_KEY = normalizePrivateKey(
-  Deno.env.get("FIREBASE_PRIVATE_KEY") || SERVICE_ACCOUNT.private_key
-);
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
 }
-if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-  throw new Error(
-    "Firebase secrets are not configured: provide FIREBASE_SERVICE_ACCOUNT " +
-      "(full service-account JSON) or FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY"
+
+const GATEWAY_URL = resolveGatewayUrl();
+const GATEWAY_SECRET = resolveGatewaySecret();
+
+if (!SEND_PUSH_SECRET) {
+  console.warn(
+    "[send-push] SEND_PUSH_SECRET is not set — database triggers cannot authenticate (fail-closed)",
   );
 }
+if (!GATEWAY_SECRET) {
+  // الـ Worker قد يقبل طلبات بلا مصادقة، لكن يُنصح بشدّة بضبط PUSH_GATEWAY_SECRET
+  // ومطابقته في الـ Worker حتى لا تُفتح بوابة الدفع للعموم.
+  console.warn(
+    "[send-push] PUSH_GATEWAY_SECRET/SEND_PUSH_SECRET is not set — requests to the Cloudflare Worker will be sent WITHOUT an Authorization header",
+  );
+}
+console.log(`[send-push] push gateway configured (${GATEWAY_URL})`);
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
-const encoder = new TextEncoder();
-let firebaseAccessToken: { value: string; expiresAt: number } | null = null;
 
 /** أقصى عمر لدفعة رنين مكالمة (يطابق expire_stale_ringing_calls: دقيقتان) */
 const CALL_RING_MAX_AGE_MS = 2 * 60 * 1000;
@@ -131,106 +144,65 @@ function isAuthorized(req: Request) {
   return supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET || bearer === SERVICE_ROLE_KEY;
 }
 
-async function getFirebaseAccessToken() {
-  if (firebaseAccessToken && firebaseAccessToken.expiresAt > Date.now() + 60_000) {
-    return firebaseAccessToken.value;
-  }
+/* ------------------------------------------------------------------
+ * 🚪 بوابة الإرسال: Cloudflare Worker
+ * ------------------------------------------------------------------
+ * عقد الطلب (لكل جهاز POST واحد):
+ *   {
+ *     "token":  "<FCM_DEVICE_TOKEN>",   // إلزامي
+ *     "title":  "عنوان الإشعار",         // إلزامي (نسخة للعرض عند الحاجة)
+ *     "body":   "نص الإشعار",            // إلزامي
+ *     "data":   { ... }                  // إلزامي — مصدر الحقيقة للـ Service Worker
+ *     "priority": "high" | "normal",     // اختياري (تلميح أولوية)
+ *     "ttlSeconds": 60 | 86400           // اختياري (تلميح مدة صلاحية)
+ *   }
+ * عقد الاستجابة المتسامح:
+ *   • 2xx ⇒ نجاح قبول/تسليم.
+ *   • نص/JSON الاستجابة يُفحص لأنماط أخطاء توكن FCM (UNREGISTERED…) لحذف
+ *     التوكنات الميّتة — راجع isDeadToken أدناه.
+ * ------------------------------------------------------------------ */
 
-  const key = await importPKCS8(FIREBASE_PRIVATE_KEY!, "RS256");
-  const now = Math.floor(Date.now() / 1000);
-  const assertion = await new SignJWT({
-    iss: FIREBASE_CLIENT_EMAIL,
-    scope: "https://www.googleapis.com/auth/firebase.messaging",
-    aud: "https://oauth2.googleapis.com/token",
-  })
-    .setProtectedHeader({ alg: "RS256", typ: "JWT" })
-    .setIssuer(FIREBASE_CLIENT_EMAIL!)
-    .setSubject(FIREBASE_CLIENT_EMAIL!)
-    .setAudience("https://oauth2.googleapis.com/token")
-    .setIssuedAt(now)
-    .setExpirationTime(now + 3600)
-    .sign(key);
-
-  const response = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion,
-    }),
-  });
-  if (!response.ok) throw new Error(`Google OAuth token request failed: ${response.status}`);
-
-  const token = await response.json();
-  firebaseAccessToken = {
-    value: token.access_token,
-    expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000,
-  };
-  return firebaseAccessToken.value;
-}
-
-/**
- * عقد الإرسال للويب (data-only):
- *   • الحمولة كلها في `data` (قيمها نصوص). الإشعار المرئي يبنيه الـ Service Worker
- *     في firebase-messaging-sw.js من هذه الحقول: title / body / icon / type / ...
- *   • لا `webpush.notification` ولا `notification` على المستوى الأعلى:
- *     - لا يعرض Firebase SDK إشعاراً تلقائياً بحمولة مختلفة عن حمولتنا.
- *     - الـ SW هو المصدر الوحيد للعرض، فيستوفي userVisibleOnly دائماً.
- *   • webpush.headers: Urgency/TTL فقط (تحكّم في التسليم، لا في العرض).
- *   • tag/renotify/requireInteraction/actions تُحدَّد في الـ SW (مصدر واحد).
- */
-function buildWebPushHeaders(opts: { highPriority?: boolean }, urgent: boolean) {
-  return {
-    Urgency: urgent ? "high" : "normal",
-    // رسائل المكالمات/الاختبار تنتهي بسرعة (لا فائدة من إيصالها متأخرة)
-    TTL: opts.highPriority ? "60" : "86400",
-  };
-}
-
-async function sendToFcm(
+async function sendToGateway(
   token: string,
   data: Record<string, string>,
   opts: { highPriority?: boolean } = {},
 ) {
-  const accessToken = await getFirebaseAccessToken();
-
   // أولوية عالية للكل: رسائل الدردشة رسائل مرئية للمستخدم يجب أن تصل فوراً،
   // والأولوية العادية (Urgency: normal) يجوز لمزوّد الدفع تأخيرها على جهاز
   // في وضع توفير الطاقة/Doze — وهو أحد أسباب "توقّف الإشعارات بعد فترة في
   // الخلفية". يمكن إرجاع السلوك القديم بمتغيّر البيئة PUSH_NORMAL_URGENCY=1.
   const urgent = Deno.env.get("PUSH_NORMAL_URGENCY") !== "1";
 
+  // لا تجعل رسالة دردشة طويلة تتجاوز حد FCM وتفشل الدفعة كاملة.
+  // البيانات تظل data-only؛ الـ Service Worker هو المسؤول الوحيد عن العرض.
+  const fittedData = fitFcmData(data);
+
   const body: Record<string, unknown> = {
     token,
-    // لا تجعل رسالة دردشة طويلة تتجاوز حد FCM وتفشل الدفعة كاملة.
-    // البيانات تظل data-only؛ الـ Service Worker هو المسؤول الوحيد عن العرض.
-    data: fitFcmData(data),
-    android: {
-      priority: urgent ? "high" : "normal",
-      ttl: opts.highPriority ? "60s" : "86400s",
-    },
-    webpush: {
-      headers: buildWebPushHeaders(opts, urgent),
-    },
-    apns: {
-      headers: {
-        "apns-priority": urgent ? "10" : "5",
-        "apns-push-type": "alert",
-      },
-    },
+    title: fittedData.title || "",
+    body: fittedData.body || "",
+    data: fittedData,
+    // تلميحات اختيارية: الـ Worker يترجمها إلى android.priority / apns-priority /
+    // Urgency / TTL في رسالة FCM HTTP v1. تجاهلها لا يكسر العقد.
+    priority: urgent ? "high" : "normal",
+    ttlSeconds: opts.highPriority ? 60 : 86400,
   };
 
-  const response = await fetch(
-    `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(FIREBASE_PROJECT_ID!)}/messages:send`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ message: body }),
-    },
-  );
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (GATEWAY_SECRET) {
+    // ترويستان متكافئتان: Authorization القياسية + ترويسة السر المشترك،
+    // ليقبل الـ Worker أيّ أسلوب تحقق يعتمده.
+    headers["Authorization"] = `Bearer ${GATEWAY_SECRET}`;
+    headers["x-send-push-secret"] = GATEWAY_SECRET;
+  }
+
+  const response = await fetch(GATEWAY_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    // مهلة قصوى لكل جهاز: دفعة الإرسال لا يجوز أن تتعطل بجهازٍ بلا جواب
+    signal: AbortSignal.timeout(10_000),
+  });
 
   let details: any = null;
   try { details = await response.json(); } catch { /* empty response */ }
@@ -342,15 +314,19 @@ async function loadAdminIds(): Promise<string[]> {
 function conversationCounterpart(
   conversation: { user_id?: string | null; admin_id?: string | null } | null | undefined,
   senderId: string,
+  senderIsSuperAdmin = false,
 ): string | null {
   if (!conversation || !senderId) return null;
   if (conversation.user_id === senderId) return conversation.admin_id || null;
   if (conversation.admin_id === senderId) return conversation.user_id || null;
+  // v2.13: المرسل مشرف عام وليس طرفاً في المحادثة ⇒ المستلم = المستخدم صاحب
+  // المحادثة (العميل المنتظر للجواب) — مطابق لبوابة قاعدة البيانات.
+  if (senderIsSuperAdmin) return conversation.user_id || null;
   return null;
 }
 
 /**
- * 🔒 رفض مكتوم: لا إشعار ولا طلب FCM — يُعاد السبب للـ Trigger (يُسجَّل في
+ * 🔒 رفض مكتوم: لا إشعار ولا طلب إرسال — يُعاد السبب للـ Trigger (يُسجَّل في
  * push_delivery_log من جهة قاعدة البيانات إن مرّ بها الطلب).
  */
 function refuse(reason: string, status = 200) {
@@ -360,10 +336,13 @@ function refuse(reason: string, status = 200) {
 
 /**
  * هل التوكن ميّت فعلاً (ألغى الجهاز التسجيل أو التوكن غير صالح بنيوياً)؟
- * لا نحذف عند INVALID_ARGUMENT عام: خطأ في الحمولة يُسقط توكنات الأجهزة كلها بالخطأ.
+ * عبر البوابة لم نعد نعتبر 404 وحدها دليلاً على توكن ميّت: الـ Worker قد يرد
+ * 404 لمسار/توجيه خاطئ، وحذف كل التوكنات بسبب خطأ توجيه كارثي. نحذف فقط عند:
+ *   • 410 Gone (دليل نهائي)، أو
+ *   • نص استجابة يطابق أنماط رفض توكن FCM الصريحة.
  */
 function isDeadToken(status: number, details: any): boolean {
-  if (status === 404) return true;
+  if (status === 410) return true;
   const text = JSON.stringify(details || {});
   if (/UNREGISTERED|registration-token-not-registered|Requested entity was not found/i.test(text)) {
     return true;
@@ -376,7 +355,7 @@ async function sendWithRetry(token: string, data: Record<string, string>, opts: 
   let last: SendResult = { ok: false, status: 0, details: null };
   for (let attempt = 1; attempt <= FCM_MAX_ATTEMPTS; attempt++) {
     try {
-      const result = await sendToFcm(token, data, opts);
+      const result = await sendToGateway(token, data, opts);
       if (result.ok || !FCM_RETRY_STATUSES.has(result.status)) return result;
       last = result;
     } catch (error) {
@@ -422,8 +401,8 @@ async function sendToAllDevices(rows: DeviceRow[], data: Record<string, string>,
 /**
  * سجلات التشخيص في Supabase Logs (Edge Function logs):
  *   • ملخّص لكل دفعة: النوع + عدد النجاح/الفشل + عدد التوكنات المحذوفة.
- *   • سبب كل فشل (HTTP status + رسالة FCM) — لتعرف هل رفض FCM الدفعة أصلاً.
- * لا نطبع التوكنات نفسها (بيانات حسّاسة)، فقط معرّف الصف.
+ *   • سبب كل فشل (HTTP status + رسالة البوابة/FCM) — لتعرف هل رفضت البوابة
+ *     أو FCM الدفعة أصلاً. لا نطبع التوكنات نفسها (بيانات حسّاسة)، فقط معرّف الصف.
  */
 function logDelivery(
   type: string,
@@ -435,7 +414,7 @@ function logDelivery(
   for (const r of results) {
     if (r.ok) continue;
     console.warn(
-      `[send-push] FCM rejected row=${r.tokenId} status=${r.status}${r.removed ? " (token pruned)" : ""} reason=${r.error || "unknown"}`,
+      `[send-push] gateway/FCM rejected row=${r.tokenId} status=${r.status}${r.removed ? " (token pruned)" : ""} reason=${r.error || "unknown"}`,
     );
   }
 }
@@ -478,7 +457,7 @@ Deno.serve(async (req) => {
       }, { highPriority: true });
       const sent = results.filter((r) => r.ok).length;
       const firstError = results.find((r) => !r.ok)?.error;
-      return json({ sent, total: results.length, results, error: sent ? undefined : `FCM رفض كل التوكنات: ${firstError || "unknown"}` }, 200);
+      return json({ sent, total: results.length, results, error: sent ? undefined : `البوابة رفضت كل التوكنات: ${firstError || "unknown"}` }, 200);
     }
 
     if (!isAuthorized(req)) return json({ error: "Unauthorized: x-send-push-secret does not match SEND_PUSH_SECRET" }, 401);
@@ -491,7 +470,7 @@ Deno.serve(async (req) => {
       if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
       const results = await sendToAllDevices(tokens, {
         type: "test", title: "✅ مسار الخلفية يعمل",
-        body: "وصل هذا الإشعار عبر قاعدة البيانات → send-push → FCM (نفس مسار الرسائل الحقيقية).",
+        body: "وصل هذا الإشعار عبر قاعدة البيانات → send-push → Cloudflare Worker → FCM (نفس مسار الرسائل الحقيقية).",
         conversationId: "",
       }, { highPriority: true });
       return json({ sent: results.filter((x) => x.ok).length, total: results.length, results });
@@ -642,17 +621,23 @@ Deno.serve(async (req) => {
     if (!conversation) return json({ error: "Conversation not found" }, 404);
 
     // 🔒 عزل المستلم: الطرف الآخر في نفس المحادثة حصراً (user_id ⇄ admin_id).
-    // المرسل ليس طرفاً في المحادثة ⇒ لا إشعار لأي جهة (وضع المراقبة/المشاهدة).
-    const recipientId = conversationCounterpart(conversation, senderId);
+    // v2.13: المرسل مشرف عام يردّ في محادثة ليست طرفاً فيها ⇒ المستلم =
+    // المستخدم صاحب المحادثة (مطابق لبوابة قاعدة البيانات). أي مرسل آخر
+    // ليس طرفاً ⇒ لا إشعار لأي جهة (وضع المراقبة/الانتحال).
+    // نقرأ is_super_admin من الملف الشخصي (مصدر الحقيقة) لا من الحمولة.
+    const { data: sender } = await supabase
+      .from("profiles")
+      .select("display_name, is_super_admin")
+      .eq("id", senderId)
+      .maybeSingle();
+    const senderIsSuperAdmin = Boolean(sender?.is_super_admin);
+    const recipientId = conversationCounterpart(conversation, senderId, senderIsSuperAdmin);
     if (!recipientId || recipientId === senderId) return refuse("sender is not a conversation party");
     // تصريح قاعدة البيانات بالمستلم (v2.9) — أي تباين يعني طلباً مُلفَّقاً ⇒ رفض
     const declaredRecipient = String(input.recipient_id || "");
     if (declaredRecipient && declaredRecipient !== recipientId) return refuse("recipient mismatch", 409);
 
-    const [{ data: sender }, tokens] = await Promise.all([
-      supabase.from("profiles").select("display_name").eq("id", senderId).maybeSingle(),
-      loadDeviceTokens(recipientId),
-    ]);
+    const tokens = await loadDeviceTokens(recipientId);
     if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
     const title = sender?.display_name || "رسالة جديدة";
@@ -674,7 +659,7 @@ Deno.serve(async (req) => {
     const results = await sendToAllDevices(tokens, data);
 
     // ✓✓ رمادي (تم التسليم): نجاح إرسال الإشعار إلى جهاز واحد على الأقل
-    // يعني أن الرسالة وصلت إلى جهاز المستلم عبر جهة الدفع.
+    // يعني أن الرسالة وصلت إلى جهاز المستلم عبر البوابة وجهة الدفع.
     // يبقى التحديث محصوراً في الحالة 'sent' فلا يُنقص أبداً حالة أحدث.
     const delivered = results.some((item) => item.ok);
     if (delivered) {

@@ -4,7 +4,8 @@
  * يشغّل sql/schema.sql ثم هجرة v2.11 (مرتين: إعادة التنفيذ آمنة) فوق بيئة
  * تحاكي Supabase (auth.uid / roles / storage / vault / net)، ويتحقق سلوكياً من:
  *   • عزل المستخدم: لا قراءة لرسائل/توكنات/مرفقات الآخرين، ولا تعديل لصلاحياته
- *   • المشرف العام قراءة فقط: لا كتابة على المحادثات/الرسائل/المكالمات، ولا حظر/حذف
+ *   • المشرف العام: كتابة كاملة على المحادثات/الرسائل/الكتابة/التفاعلات (v2.13)،
+ *     المكالمات وإدارة المستخدمين (حظر/حذف) تبقى قراءة فقط
  *   • المشرف العادي يحظر ويفتح محادثاته فقط
  *   • الزائر (anon) لا يصل لأي بيانات ولا ينفّذ دوال داخلية
  *   • لا مفتاح JWT ثابت في ملفات SQL
@@ -197,21 +198,53 @@ check("U1 لا يحظر نفسه/غيره عبر admin_set_user_blocked", await 
   return !r.ok && /غير مصرّح|42501|permission denied/i.test(r.error);
 })());
 
-// ---------- 3) المشرف العام S: قراءة فقط + صامت ----------
+// ---------- 3) المشرف العام S: كتابة كاملة على المحادثات/الرسائل (v2.13) ----------
 check("S يرى كل الرسائل (مراقبة)", (await count({ uid: S }, `select id from public.messages`)) === 2);
 check("S يرى كل المحادثات (مراقبة)", (await count({ uid: S }, `select id from public.conversations`)) === 2);
-const sInsert = await writeCount({ uid: S }, `insert into public.messages (conversation_id, sender_id, content) values ('${C1}','${S}','x')`);
-check("S لا يُدرج رسالة في محادثة ليس طرفاً فيها", typeof sInsert === "string", String(sInsert));
-check("S لا يعدّل رسالة (صامت: 0 صفوف)", (await writeCount({ uid: S }, `update public.messages set content='tampered' where id='${M1}'`)) === 0);
-check("S لا يحذف رسالة (صامت: 0 صفوف)", (await writeCount({ uid: S }, `delete from public.messages where id='${M1}'`)) === 0);
-check("S لا يحذف محادثة (صامت: 0 صفوف)", (await writeCount({ uid: S }, `delete from public.conversations where id='${C1}'`)) === 0);
-check("S لا يعدّل غرف المكالمات (صامت: 0 صفوف)", (await writeCount({ uid: S }, `update public.call_rooms set status='ended'`)) === 0);
+// v2.13: الرد في محادثة المستخدم مع مشرف آخر أصبح مسموحاً (بلا 403)
+const sReply = await writeCount({ uid: S }, `insert into public.messages (conversation_id, sender_id, content) values ('${C1}','${S}','رد المشرف العام')`);
+check("S يردّ في محادثة ليس طرفاً فيها (v2.13: كتابة كاملة)", sReply === 1, String(sReply));
+// صف رسالة مثبّت (فوق RLS — إدراج as() يُلف بمعاملة تُلغى) ليختبر الحذف بجلسة S
+await db.query(`insert into public.messages (id, conversation_id, sender_id, content) values ('00000000-0000-4000-8000-0000000000d9','${C1}','${S}','رد قابل للحذف')`);
+const sReplyId = "00000000-0000-4000-8000-0000000000d9";
+const sTyping = await as({ uid: S }, `insert into public.typing_status (conversation_id, user_id, is_typing) values ('${C1}','${S}',true)
+  on conflict (conversation_id, user_id) do update set is_typing = true, updated_at = now()`);
+check("S يرسل «يكتب الآن» في أي محادثة يردّ فيها (v2.13)", sTyping.ok, sTyping.error ?? "");
+const sReact = await as({ uid: S }, `insert into public.message_reactions (message_id, user_id, emoji) values ('${M1}','${S}','👍') on conflict do nothing`);
+check("S يتفاعل مع رسائل أي محادثة (v2.13)", sReact.ok, sReact.error ?? "");
+// صلاحية التحديث تشمل الصف، لكن حماية العبث (trigger) تمنع تغيير محتوى رسالة غيره
+const sEdit = await writeCount({ uid: S }, `update public.messages set content='tampered' where id='${M1}'`);
+check("S يستطيع تحديث صف رسالة (كتابة كاملة v2.13)", sEdit === 1, String(sEdit));
+const contentAfter = await as({ uid: S }, `select content from public.messages where id='${M1}'`);
+check("حماية العبث باقية: محتوى رسالة الآخرين لا يتغير حتى مع صلاحية التحديث", contentAfter.rows?.[0]?.content === "secret-of-u1", String(contentAfter.rows?.[0]?.content));
+// الحذف متاح لكتابة كاملة — نحذف ردّه هو فقط (لا نمسّ بيانات بقية الاختبار)
+const sDelOwn = await writeCount({ uid: S }, `delete from public.messages where id='${sReplyId}'`);
+check("S يحذف رسالة (كتابة كاملة v2.13 — حذف ردّه هو)", sDelOwn === 1, String(sDelOwn));
+// محادثة مؤقتة لحذفها: تُنشأ فوق RLS (بصلاحية المالك — ككتلة البيانات الأولى)
+// زوج جديد (U2 ⇄ S) تفادياً لقيد الفريد user_id+admin_id مع C2 (U2 ⇄ A)
+await db.query(`insert into public.conversations (id, user_id, admin_id) values ('00000000-0000-4000-8000-0000000000c3','${U2}','${S}')`);
+const sDelConv = await writeCount({ uid: S }, `delete from public.conversations where id='00000000-0000-4000-8000-0000000000c3'`);
+check("S يحذف محادثة (كتابة كاملة v2.13)", sDelConv === 1, String(sDelConv));
+check("S لا يعدّل غرف المكالمات (خارج نطاق v2.13: قراءة فقط تبقى)", (await writeCount({ uid: S }, `update public.call_rooms set status='ended'`)) === 0);
 const sBlock = await as({ uid: S }, `select public.admin_set_user_blocked('${U1}', true)`);
-check("S لا يحظر مستخدماً (قراءة فقط)", !sBlock.ok && /للقراءة فقط/.test(sBlock.error), sBlock.error ?? "");
+check("S لا يحظر مستخدماً (إدارة المستخدمين قراءة فقط)", !sBlock.ok && /للقراءة فقط/.test(sBlock.error), sBlock.error ?? "");
 const sDel = await as({ uid: S }, `select public.admin_delete_user('${U1}')`);
-check("S لا يحذف مستخدماً (قراءة فقط)", !sDel.ok && /للقراءة فقط/.test(sDel.error), sDel.error ?? "");
+check("S لا يحذف مستخدماً (إدارة المستخدمين قراءة فقط)", !sDel.ok && /للقراءة فقط/.test(sDel.error), sDel.error ?? "");
 const stillThere = await as({}, `select count(*)::int n from public.profiles where id='${U1}' and is_blocked=false`);
 check("بقاء U1 غير متأثر بمحاولات S", stillThere.rows?.[0]?.n === 1);
+// v2.13: توجيه إشعار ردّ S ⇒ المستخدم صاحب المحادثة (وليس المشرف المالك).
+// الدالتان داخليتان (REVOKEd من الأدوار عمداً — مسار Triggers) ⇒ تُستدعيان فوق RLS.
+const directRecipient = async (conv, sender) =>
+  (await db.query(`select public.conversation_direct_recipient('${conv}','${sender}') r`)).rows?.[0]?.r;
+const pushAllowed = async (recipient, sender, conv) =>
+  (await db.query(`select public.push_recipient_allowed('new_message','${M1}','${recipient}', jsonb_build_object('sender_id','${sender}','conversation_id','${conv}')) ok`)).rows?.[0]?.ok;
+
+check("conversation_direct_recipient: ردّ S ⇒ المستخدم صاحب المحادثة", (await directRecipient(C1, S)) === U1, String(await directRecipient(C1, S)));
+check("conversation_direct_recipient: ردّ المستخدم ⇒ المشرف المالك (كما هو)", (await directRecipient(C1, U1)) === A);
+check("conversation_direct_recipient: مرسل غريب ليس طرفاً ولا مشرفاً عاماً ⇒ null", (await directRecipient(C1, U2)) === null);
+check("push_recipient_allowed: يسمح بردّ S إلى صاحب المحادثة", (await pushAllowed(U1, S, C1)) === true);
+check("push_recipient_allowed: يرفض توجيه ردّ S للمشرف المالك (المستخدم حصراً)", (await pushAllowed(A, S, C1)) === false);
+check("push_recipient_allowed: يرفض مرسلاً غريباً (كما في v2.9)", (await pushAllowed(U1, U2, C1)) === false);
 
 // ---------- 4) المشرف العادي A: صلاحياته الفعلية ----------
 const aBlock = await as({ uid: A }, `select public.admin_set_user_blocked('${U1}', true)`);

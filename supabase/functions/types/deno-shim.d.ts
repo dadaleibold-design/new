@@ -26,20 +26,6 @@ declare module "https://esm.sh/@supabase/supabase-js@2" {
   export function createClient(url: string, key: string, options?: Record<string, unknown>): any;
 }
 
-declare module "https://esm.sh/jose@5.10.0" {
-  export function importPKCS8(pkcs8: string, alg: string): Promise<CryptoKey>;
-  export class SignJWT {
-    constructor(payload: Record<string, unknown>);
-    setProtectedHeader(header: Record<string, unknown>): this;
-    setIssuer(issuer: string): this;
-    setAudience(audience?: string): this;
-    setSubject(subject: string): this;
-    setIssuedAt(value?: number): this;
-    setExpirationTime(value: number | string): this;
-    sign(key: CryptoKey): Promise<string>;
-  }
-}
-
 declare module "https://esm.sh/agora-access-token@2.0.0" {
   export const RtcRole: { PUBLISHER: number; SUBSCRIBER: number };
   export const RtcTokenBuilder: {
