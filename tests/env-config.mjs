@@ -117,6 +117,8 @@ const FORBIDDEN_IN_FRONTEND = [
   "AGORA_APP_CERTIFICATE",
   "SEND_PUSH_SECRET",
   "SEND_PUSH_URL",
+  "PUSH_GATEWAY_URL",
+  "PUSH_GATEWAY_SECRET",
 ];
 
 /** يزيل تعليقات JS/TS/HTML حتى لا يُحتسب ذكر الاسم في التوثيق */
@@ -174,56 +176,59 @@ check("index.html يحمّل env.js", envTagIndex !== -1);
 check("env.js قبل app.js في الصفحة", envTagIndex !== -1 && envTagIndex < appTagIndex);
 check("index.html فيه شاشة إعداد البيئة", /id="config-error"/.test(html));
 check("لا مفاتيح مضمنة في index.html", !/AIza|eyJ[A-Za-z0-9_-]{10,}/.test(html));
-
 /* ------------------------------------------------------------------
- * 6) Edge Functions: Deno.env.get بالأسماء المعتمدة + معالجة \n
+ * 6) Edge Functions: Deno.env.get بالأسماء المعتمدة + بوابة الـ Worker
+ * ----------------------------------------------------------------
+ * التعديل المعماري (v2026-10-15.1): send-push لم يعد يقرأ أسرار Firebase
+ * ولا يولّد توكنات Google OAuth2/JWT — الإرسال عبر Cloudflare Worker.
  * ---------------------------------------------------------------- */
 const sendPush = read("supabase/functions/send-push/index.ts");
 const agora = read("supabase/functions/agora-token/index.ts");
+// الكود الفعلي بلا تعليقات التوثيق (التعليقات قد تذكر أسماء المتغيرات تاريخياً)
+const sendPushCode = stripComments(sendPush);
 
-for (const key of [
-  "FIREBASE_SERVICE_ACCOUNT",
-  "FIREBASE_PROJECT_ID",
-  "FIREBASE_CLIENT_EMAIL",
-  "FIREBASE_PRIVATE_KEY",
-  "SEND_PUSH_SECRET",
-]) {
+for (const key of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SEND_PUSH_SECRET"]) {
   check(`send-push يقرأ ${key} من Deno.env`, sendPush.includes(`Deno.env.get("${key}")`));
+}
+for (const key of ["PUSH_GATEWAY_URL", "PUSH_GATEWAY_SECRET", "SEND_PUSH_URL"]) {
+  check(`send-push يقرأ ${key} من Deno.env (بوابة الـ Worker)`, sendPush.includes(`Deno.env.get("${key}")`));
 }
 
 for (const key of ["AGORA_APP_ID", "AGORA_APP_CERTIFICATE"]) {
   check(`agora-token يقرأ ${key} من Deno.env`, agora.includes(`Deno.env.get("${key}")`));
 }
 
-// معالجة السطر الجديد في المفتاح الخاص: تحويل \\n المُهرَّبة إلى أسطر حقيقية
-const normalizeMatch = sendPush.match(/function normalizePrivateKey[\s\S]*?\n}/);
-check("send-push يعالج \\n في FIREBASE_PRIVATE_KEY", Boolean(normalizeMatch));
+// 🚪 البوابة: لا اتصال مباشر بـ FCM أو Google OAuth من الـ Edge Function
+check(
+  "send-push لا يتصل بـ fcm.googleapis.com مباشرة (الإرسال عبر الـ Worker)",
+  !/fcm\.googleapis\.com|fcm-dev\.googleapis\.com/.test(sendPushCode),
+);
+check(
+  "send-push لا يولّد توكنات Google OAuth2/JWT (لا jose ولا oauth2.googleapis.com)",
+  !/oauth2\.googleapis\.com|esm\.sh\/jose|importPKCS8|SignJWT/.test(sendPushCode),
+);
+check(
+  "send-push لا يقرأ أسرار Firebase (انتقلت إلى الـ Worker)",
+  !/FIREBASE_SERVICE_ACCOUNT|FIREBASE_PRIVATE_KEY|FIREBASE_CLIENT_EMAIL|FIREBASE_PROJECT_ID/.test(sendPushCode),
+);
+check(
+  "send-push يرسل لكل جهاز POST بالعقد المعتمد {token,title,body,data}",
+  /token,\s*\n\s*title:\s*fittedData\.title/.test(sendPushCode) &&
+    /body:\s*fittedData\.body/.test(sendPushCode) &&
+    /data:\s*fittedData,/.test(sendPushCode) &&
+    /method:\s*"POST"/.test(sendPushCode),
+);
+check(
+  "send-push يرسل ترويستي مصادقة للـ Worker (Authorization + x-send-push-secret)",
+  /headers\["Authorization"\]\s*=\s*`Bearer \$\{GATEWAY_SECRET\}`/.test(sendPushCode) &&
+    /headers\["x-send-push-secret"\]\s*=\s*GATEWAY_SECRET/.test(sendPushCode),
+);
+// ⛔ حارس الحلقة: منع توجيه البوابة إلى دالة send-push نفسها
+check(
+  "send-push يرفض رابط بوابة يشير إلى دالة Supabase نفسها (حماية من حلقة لا نهائية)",
+  /includes\("\/functions\/v1\/"\)/.test(sendPushCode),
+);
 
-if (normalizeMatch) {
-  // فحص سلوكي فعلي: نبني الدالة من تعبير replace الموجود في الملف نفسه
-  // (نتجاهل صياغة TypeScript التي لا يفهمها Node).
-  const body = normalizeMatch[0];
-  const replaceCall = body.match(/key\.replace\((\/.*?\/[a-z]*)\s*,\s*("(?:[^"\\]|\\.)*")\)/);
-
-  check("وجدنا تعبير replace لمفتاح Firebase", Boolean(replaceCall), body.slice(-60));
-
-  if (replaceCall) {
-    const applyReplace = new Function("key", `return key.replace(${replaceCall[1]}, ${replaceCall[2]});`);
-    const escaped = "-----BEGIN PRIVATE KEY-----\\nMIIabc\\n-----END PRIVATE KEY-----\\n";
-    const real = applyReplace(escaped);
-
-    check(
-      "المفتاح الخاص يُحوَّل إلى أسطر حقيقية",
-      !real.includes("\\n") && real.split("\n").length >= 4,
-      JSON.stringify(real)
-    );
-    check("المفتاح السليم يبقى كما هو", applyReplace("line1\nline2") === "line1\nline2");
-  }
-
-  check("الدالة تُرجع undefined للمفتاح الفارغ", /if \(!key\) return undefined/.test(body));
-}
-
-check("send-push يدعم FIREBASE_SERVICE_ACCOUNT (JSON كامل)", /loadServiceAccount\(\)/.test(sendPush));
 check("لا يوجد مفتاح خاص مكتوب في أي دالة", !/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(sendPush + agora));
 
 /* ------------------------------------------------------------------
@@ -233,11 +238,10 @@ const example = read(".env.example");
 const requiredNames = [
   ...REQUIRED_VITE,
   "VITE_AGORA_APP_ID", // إضافي/اختياري: معرّف Agora العام في الواجهة
-  "FIREBASE_SERVICE_ACCOUNT",
-  "FIREBASE_PROJECT_ID",
-  "FIREBASE_CLIENT_EMAIL",
-  "FIREBASE_PRIVATE_KEY",
+  // أسرار send-push (Firebase انتقلت إلى الـ Worker — لا تُضبط في Supabase بعد الآن)
   "SEND_PUSH_SECRET",
+  "PUSH_GATEWAY_URL",
+  "PUSH_GATEWAY_SECRET",
   "SEND_PUSH_URL",
   "AGORA_APP_ID",
   "AGORA_APP_CERTIFICATE",

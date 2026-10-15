@@ -96,8 +96,15 @@ check("دعوة بلا معرّف غرفة ⇒ لا رنين",
 // ① ملف الهجرة = قسم 17 في schema.sql (لا انحراف)
 const marker = "-- ============================================================\n-- ① ";
 const migBody = MIGRATION.slice(MIGRATION.indexOf(marker)).trimEnd();
-const schemaBody = SCHEMA.slice(SCHEMA.indexOf(marker)).trimEnd();
+// القسم 17 محصور بين علامته وبداية القسم التالي (18/v2.12 بوابة الـ Worker)
+const section18 = "-- ============================================================\n-- 18. الإصدار v2.12";
+const section18At = SCHEMA.indexOf(section18);
+const schemaBody = SCHEMA.slice(
+  SCHEMA.indexOf(marker),
+  section18At === -1 ? undefined : section18At
+).trimEnd();
 check("schema.sql §17 = ملف الهجرة v2.9 حرفياً", migBody === schemaBody);
+check("schema.sql يحوي القسم 18 (v2.12) بعد قسم العزل", section18At > SCHEMA.indexOf(marker));
 
 // ② آخر تعريف فعّال في schema.sql هو المشدّد (الترتيب مهم: last definition wins)
 const lastIndexOf = (src, needle) => src.lastIndexOf(needle);

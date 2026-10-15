@@ -180,28 +180,44 @@ npm run env:check   # التأكد من وجود كل متغيرات البيئ�
 5. **نفّذ قسم 8 و 9 من `sql/schema.sql`** في SQL Editor (جدول `fcm_tokens` + صلاحيات).
 6. من داخل التطبيق: **الإعدادات ⚙️ → تفعيل إشعارات الجهاز**.
 
-### نشر Edge Function للإشعارات
+### نشر Edge Function للإشعارات + بوابة الـ Worker (v2.12)
 
-الدالة `supabase/functions/send-push` تستخدم Firebase Cloud Messaging HTTP v1،
-ولا تستخدم جدول `push_subscriptions` القديم أو VAPID. قبل نشرها، أنشئ حساب خدمة
-Firebase بصلاحية إرسال الرسائل، ثم خزّن الأسرار التالية في إعدادات Edge Functions:
+> **البنية بعد v2.12 (2026-10-15)**: دالة `send-push` هي **طبقة الأمان والتحقق فقط**
+> (عزل المستلمين، التحقق من المحادثة وغرفة المكالمة وقواعد المشرفين) ولا تتصل بـ FCM
+> مباشرة ولا تولّد توكنات Google OAuth2/JWT. الإرسال النهائي عبر **Cloudflare Worker**:
+>
+> ```
+> Database Trigger ➔ Edge Function send-push (أمان/عزل) ➔ Cloudflare Worker ➔ FCM ➔ firebase-messaging-sw.js
+> ```
+>
+> لكل جهاز مستلم يرسل `send-push` POST واحداً إلى الـ Worker بالشكل:
+> `{ "token": "...", "title": "...", "body": "...", "data": { ... } }`.
 
 ```bash
 supabase functions deploy send-push
 
-# الطريقة المفضّلة: سرّ واحد يحوي ملف حساب الخدمة كاملاً
-supabase secrets set FIREBASE_SERVICE_ACCOUNT="$(cat service-account.json)"
-
-# أو الحقول منفصلة (لاحظ المحافظة على \\n داخل المفتاح — الدالة تحوّلها لأسطر حقيقية)
+# أسرار الدالة (Edge Function Secrets) — لا أسرار Firebase هنا بعد الآن:
 supabase secrets set \
-  FIREBASE_PROJECT_ID="..." \
-  FIREBASE_CLIENT_EMAIL="firebase-adminsdk-...@....iam.gserviceaccount.com" \
-  FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n" \
-  SEND_PUSH_SECRET="ضع-سراً-عشوائياً-طويلاً"
+  SEND_PUSH_SECRET="ضع-سراً-عشوائياً-طويلاً" \
+  PUSH_GATEWAY_URL="https://nameless-dew-aac1.aabntlal680.workers.dev/" \
+  PUSH_GATEWAY_SECRET="سر-مصادقة-الـWorker"
+# ملاحظات:
+#  • SEND_PUSH_URL مقبول بديلاً عن PUSH_GATEWAY_URL داخل أسرار الدالة.
+#  • إن لم يُضبَط PUSH_GATEWAY_SECRET يُستخدم SEND_PUSH_SECRET بديلاً.
+#  ⛔ حارس الحلقة: أي رابط بوابة يحوي /functions/v1/ يُرفض عند الإقلاع.
 ```
 
-بعد ذلك خزّن رابط الدالة والسر نفسه في Supabase Vault، ثم طبّق Trigger الرسائل
-من `sql/schema.sql`:
+أما **أسرار Firebase** (`FIREBASE_SERVICE_ACCOUNT` أو
+`FIREBASE_PROJECT_ID` + `FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY`)
+فأصبحت ملكاً للـ Worker — هو الطرف الذي يوقّع طلبات FCM الآن:
+
+```bash
+# داخل مجلد الـ Cloudflare Worker:
+wrangler secret put FIREBASE_SERVICE_ACCOUNT   # أو الحقول الثلاثة منفصلة
+```
+
+وبعد ذلك خزّن رابط **الدالة** (لا الـ Worker) والسر نفسه في Supabase Vault
+للـ Triggers، ثم طبّق Trigger الرسائل من `sql/schema.sql`:
 
 ```sql
 select vault.create_secret(
@@ -216,9 +232,15 @@ select vault.create_secret(
 );
 ```
 
+> ⚠️ **انتبه إلى التمييز**: قيمة Vault باسم `SEND_PUSH_URL` تبقى **رابط دالة
+> send-push** لأنها ما تستدعيه التريگرات (تجاوزها بالتوجيه إلى `workers.dev`
+> يعني تجاوز كل قواعد الأمان والعزل — دالة `push_gateway_check()` (v2.12) ترصد
+> ذلك وتحذّر منه). أما رابط الـ Worker فيوضع في **أسرار الدالة**
+> (`PUSH_GATEWAY_URL` أو `SEND_PUSH_URL`). متجرّان مختلفان بقيمتين مختلفتين.
+
 لا تضع `FIREBASE_PRIVATE_KEY` أو `SEND_PUSH_SECRET` في JavaScript أو في مستودع Git.
-كل أسرار الدالتين تُقرأ من `Deno.env.get()` فقط، ولا توجد قيمة واحدة مكتوبة داخل الكود
-(اختبار `tests/env-config.mjs` يتحقق من ذلك في كل تشغيل).
+كل أسرار الدالة تُقرأ من `Deno.env.get()` فقط، ولا توجد قيمة واحدة مكتوبة داخل الكود
+(اختبارا `tests/env-config.mjs` و`tests/push-gateway.mjs` يتحققان من ذلك في كل تشغيل).
 
 > ملاحظة: iOS Safari لا يدعم FCM Web Push إلا عندما يكون التطبيق **مثبّتاً كـ PWA** على
 > الشاشة الرئيسية (iOS 16.4+)، تماماً كحال Web Push العادي.
@@ -395,14 +417,14 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   2. في Vault: `SEND_PUSH_URL` = `https://<project>.supabase.co/functions/v1/send-push` و `SEND_PUSH_SECRET`،
      و**`SUPABASE_ANON_KEY`** (المفتاح العام للمشروع — مطلوب لترويسة `Authorization` عند استدعاء الدالة).
      لا يوجد مفتاح مكتوب في الكود بعد v2.11؛ إن لم يُضبط يسجّل `push_delivery_log` الحالة `SKIPPED` ولا يُرسل شيء.
-  3. `supabase functions deploy send-push --no-verify-jwt` (أو اعتمد `supabase/config.toml`) وضبط `SEND_PUSH_SECRET` و `FIREBASE_SERVICE_ACCOUNT` كأسرار للدالة.
+  3. `supabase functions deploy send-push --no-verify-jwt` (أو اعتمد `supabase/config.toml`) وضبط `SEND_PUSH_SECRET` و `PUSH_GATEWAY_URL`/`PUSH_GATEWAY_SECRET` (بوابة Cloudflare Worker — v2.12) كأسرار للدالة.
   4. من التطبيق: **🔔 إرسال إشعار تجريبي** ثم أغلق التطبيق — يجب أن يصل. إن لم يصل راجع `select * from push_delivery_log order by id desc`.
 - اختبارات دخانية: `cd tests && npm i jsdom && node smoke.mjs user|admin|super`.
 
 ## الإصدار v2.2 — تشخيص الإشعارات + حذف المستخدم الشامل
 - زر **🔔 إرسال إشعار تجريبي** يعرض الآن تقريراً خطوة بخطوة (HTTPS، الإذن، Service Worker، إشعار محلي فوري، توكن FCM، pg_net/Vault/Triggers عبر `push_diagnostics()`, ثم الإرسال الفعلي عبر `send-push`).
 - **سبب عدم وصول الإشعارات حالياً**: دالة `send-push` غير منشورة على المشروع (تعيد 404). الحل:
-  `supabase functions deploy send-push --no-verify-jwt` + ضبط الأسرار `FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY / SEND_PUSH_SECRET`، ثم Vault: `SEND_PUSH_URL`, `SEND_PUSH_SECRET`، ثم تنفيذ migrations v2.1 و v2.2.
+  `supabase functions deploy send-push --no-verify-jwt` + ضبط الأسرار `PUSH_GATEWAY_URL / PUSH_GATEWAY_SECRET / SEND_PUSH_SECRET` (أسرار Firebase انتقلت إلى الـ Worker — v2.12)، ثم Vault: `SEND_PUSH_URL`, `SEND_PUSH_SECRET`، ثم تنفيذ migrations v2.1 و v2.2.
 - إشعار مرئي محلي عند وصول رسالة Realtime والتطبيق مفتوح في محادثة/تبويب آخر (لا يعتمد على FCM).
 - `admin_delete_user`: متاح لكل مشرف (`is_admin` أو `is_super_admin`)، يحذف: التخزين (مرفقات/أفاتار/خلفيات)، التفاعلات، الرسائل، الكتابة، المكالمات وسجلاتها، المحادثات، توكنات FCM، الملف الشخصي، وحساب `auth.users`؛ ويعيد إحصاءات ما حُذف. `reply_to_id` أصبح `on delete set null` حتى لا يعيق الحذف.
 - إجراءات الرسالة مخفية لكل الأدوار حتى النقر على الفقاعة.
@@ -456,3 +478,31 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **الاعتمادات**: `eslint` و`jsdom` صارا devDependencies، و`@electric-sql/pglite` صار devDependency مثبّتاً
   فتعمل اختبارات PostgreSQL فعلياً في `npm ci` (كانت تتخطّى صامتةً).
 - **الاختبار**: `npm run test:rls` (تدقيق العزل والصلاحيات على PostgreSQL حقيقي) ضمن `npm test`.
+
+## الإصدار v2.12 — بوابة الإرسال عبر Cloudflare Worker (فصل الأمان عن التنفيذ)
+
+الهجرة: `sql/migrations/2026-10-15_v2_12_push_gateway_worker.sql` (مطابقة لما في `sql/schema.sql` §18).
+النشر: `supabase functions deploy send-push` بعد ضبط أسرار البوابة (انظر قسم النشر أعلاه).
+
+- **التعديل المعماري**: الاتصال المباشر بـ FCM وتوليد توكنات Google OAuth2/JWT
+  (`getFirebaseAccessToken` و `sendToFcm` واعتماد `jose` وحساب الخدمة) أُزيلت من
+  `send-push` وانتقلت إلى Cloudflare Worker:
+  `https://nameless-dew-aac1.aabntlal680.workers.dev/`.
+- **`send-push` = Business Logic & Security Guard**: كل قواعد v2.9/v2.10 كما هي
+  (عزل المستلم عبر صف المحادثة، مصدر الحقيقة `call_rooms`، حارس «ringing» ونافذة
+  الدقيقتين، إشعار المشرفين `new_user`، تعدد الأجهزة، حذف التوكنات الميتة، تعليم
+  `delivered`).
+- **الـ Worker = Gateway/Proxy**: يستقبل لكل جهاز POST بالشكل
+  `{ token, title, body, data }` (+ تلميحا `priority`/`ttlSeconds`) مع
+  `Authorization: Bearer <PUSH_GATEWAY_SECRET>` و`x-send-push-secret`.
+- **إعادة المحاولة** (429/5xx/شبكة) كما هي، وحذف التوكن الميت أصارم: 410 أو نص
+  رفض FCM صريح — لم نعد نعتبر 404 وحدها دليلاً (404 من مسار خاطئ في الـ Worker
+  لا يجوز أن يحذف كل التوكنات).
+- **⛔ حارس الحلقة**: رابط بوابة يحوي `/functions/v1/` يُرفض عند الإقلاع — حماية
+  من توجيه الدالة إلى نفسها (إشعارات لا نهائية).
+- **`push_gateway_check()`**: دالة تشخيص جديدة تعيد أعلام الإعداد وتحذّر صراحة
+  إن وُجّه Vault `SEND_PUSH_URL` إلى `workers.dev` (تجاوز طبقة الأمان).
+- **الاختبار**: `npm run test:gateway` (فحوص ثابتة + تنفيذ الهجرة على PGlite) ضمن `npm test`.
+- **اختبار تشغيلي فعلي** (اختياري، يتطلب Deno): `npm run test:gateway:runtime` يشغّل
+  ملف `send-push/index.ts` الحقيقي ضد محاكي Worker وعميل Supabase وهمي ويتحقق من عقد
+  الطلب `{token,title,body,data}` والترويستين وحراس العزل وحذف التوكن الميت وحارس الحلقة.
