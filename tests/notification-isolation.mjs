@@ -181,12 +181,12 @@ for (const policy of [
 check("سياسات المشرف العام مقيّدة بـ is_super_admin_user (قراءة فقط)",
   /for select using \(public\.is_super_admin_user\(\)\)/.test(MIGRATION));
 // v2.11: المشرف العام مراقب للقراءة فقط — لا سياسة كتابة ALL له
-check("لا سياسة ALL للمشرف العام (v2.11: قراءة فقط)",
+check("هجرة v2.9 بلا سياسة ALL للمشرف العام (الكتابة أُضيفت لاحقاً في v2.13)",
   !/for all using \(public\.is_super_admin_user\(\)\)/.test(MIGRATION));
 
 // ⑧ send-push: نفس قواعد العزل من جهة الدالة
 check("send-push يعزل مستلم الرسالة عبر conversationCounterpart",
-  SEND_PUSH.includes("function conversationCounterpart") && SEND_PUSH.includes("conversationCounterpart(conversation, senderId)"));
+  SEND_PUSH.includes("function conversationCounterpart") && SEND_PUSH.includes("conversationCounterpart(conversation, senderId, senderIsSuperAdmin)"));
 check("send-push يرفض المرسل غير الطرف (sender is not a conversation party)",
   SEND_PUSH.includes('refuse("sender is not a conversation party")'));
 check("send-push يقرأ غرفة المكالمة من قاعدة البيانات (مصدر الحقيقة)",

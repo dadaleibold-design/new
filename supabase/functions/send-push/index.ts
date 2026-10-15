@@ -314,10 +314,14 @@ async function loadAdminIds(): Promise<string[]> {
 function conversationCounterpart(
   conversation: { user_id?: string | null; admin_id?: string | null } | null | undefined,
   senderId: string,
+  senderIsSuperAdmin = false,
 ): string | null {
   if (!conversation || !senderId) return null;
   if (conversation.user_id === senderId) return conversation.admin_id || null;
   if (conversation.admin_id === senderId) return conversation.user_id || null;
+  // v2.13: المرسل مشرف عام وليس طرفاً في المحادثة ⇒ المستلم = المستخدم صاحب
+  // المحادثة (العميل المنتظر للجواب) — مطابق لبوابة قاعدة البيانات.
+  if (senderIsSuperAdmin) return conversation.user_id || null;
   return null;
 }
 
@@ -617,17 +621,23 @@ Deno.serve(async (req) => {
     if (!conversation) return json({ error: "Conversation not found" }, 404);
 
     // 🔒 عزل المستلم: الطرف الآخر في نفس المحادثة حصراً (user_id ⇄ admin_id).
-    // المرسل ليس طرفاً في المحادثة ⇒ لا إشعار لأي جهة (وضع المراقبة/المشاهدة).
-    const recipientId = conversationCounterpart(conversation, senderId);
+    // v2.13: المرسل مشرف عام يردّ في محادثة ليست طرفاً فيها ⇒ المستلم =
+    // المستخدم صاحب المحادثة (مطابق لبوابة قاعدة البيانات). أي مرسل آخر
+    // ليس طرفاً ⇒ لا إشعار لأي جهة (وضع المراقبة/الانتحال).
+    // نقرأ is_super_admin من الملف الشخصي (مصدر الحقيقة) لا من الحمولة.
+    const { data: sender } = await supabase
+      .from("profiles")
+      .select("display_name, is_super_admin")
+      .eq("id", senderId)
+      .maybeSingle();
+    const senderIsSuperAdmin = Boolean(sender?.is_super_admin);
+    const recipientId = conversationCounterpart(conversation, senderId, senderIsSuperAdmin);
     if (!recipientId || recipientId === senderId) return refuse("sender is not a conversation party");
     // تصريح قاعدة البيانات بالمستلم (v2.9) — أي تباين يعني طلباً مُلفَّقاً ⇒ رفض
     const declaredRecipient = String(input.recipient_id || "");
     if (declaredRecipient && declaredRecipient !== recipientId) return refuse("recipient mismatch", 409);
 
-    const [{ data: sender }, tokens] = await Promise.all([
-      supabase.from("profiles").select("display_name").eq("id", senderId).maybeSingle(),
-      loadDeviceTokens(recipientId),
-    ]);
+    const tokens = await loadDeviceTokens(recipientId);
     if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
     const title = sender?.display_name || "رسالة جديدة";

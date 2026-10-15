@@ -123,7 +123,12 @@ const state = {
   inboxChannel: null,
   globalMsgChannel: null,
 
-  typingTimeout: null,
+  // ⌨️ حالة الكتابة (v2.13 — Debounce): طلب واحد عند بدء الكتابة + طلب واحد
+  // بعد سكون > 3 ثوانٍ — لا طلب مع كل حرف (كان سبب إغراق الشبكة وأخطاء الكونسول).
+  typingStopTimeout: null,
+  typingActive: false,
+  typingLastSentAt: 0,
+  typingHideTimer: null,
   onlineMap: {},
   heartbeatInterval: null,
   contactsRefreshInterval: null,
@@ -523,6 +528,7 @@ function closeChatView() {
 
   // مغادرة المحادثة = إغلاق قنواتها (مستمعو الرسائل/الكتابة/التفاعلات).
   // قائمة المحادثات تبقى مشتركة عبر globalMsgChannel وinboxChannel.
+  cancelTypingTimers();
   teardownChannel("msgChannel");
   teardownChannel("typingChannel");
   teardownChannel("reactionsChannel");
@@ -5213,6 +5219,8 @@ async function sendMessage({
     );
   }
 
+  // أُرسلت الرسالة ⇒ ألغِ مؤقتات الكتابة المعلّقة وأخفِ الحالة فوراً
+  cancelTypingTimers();
   await setTyping(false);
 }
 
@@ -5739,6 +5747,7 @@ function teardownAllRealtime() {
     "reactionsChannel",
   ].forEach(teardownChannel);
   state.subscribedConversationId = null;
+  cancelTypingTimers();
   clearTimeout(presenceReloadTimer);
   presenceReloadTimer = null;
   try {
@@ -5858,6 +5867,9 @@ function subscribeToConversation(
     return;
   }
 
+  // تبديل المحادثة: ألغِ مؤقتات كتابة المحادثة القديمة أولاً —
+  // فلا يطلق مؤقت متأخر كتابةً في محادثة جديدة.
+  cancelTypingTimers();
   teardownChannel("msgChannel");
   teardownChannel("typingChannel");
   teardownChannel("reactionsChannel");
@@ -5997,6 +6009,16 @@ function subscribeToConversation(
           const row = payload.new;
           if (row && row.user_id !== state.me.id && isActive()) {
             $("#typing-indicator")?.classList.toggle("hidden", !row.is_typing);
+            // حارس الالتصاق (v2.13): إن توقف المرسل دون إرسال «توقفت»
+            // (إغلاق تبويب/انقطاع شبكة) يُخفى المؤشر تلقائياً بعد 12 ثانية
+            // بلا أي تحديث — لا «يكتب الآن» عالقاً للأبد.
+            clearTimeout(state.typingHideTimer);
+            if (row.is_typing) {
+              state.typingHideTimer = setTimeout(() => {
+                state.typingHideTimer = null;
+                $("#typing-indicator")?.classList.add("hidden");
+              }, TYPING_STALE_HIDE_MS);
+            }
           }
         },
       },
@@ -6250,19 +6272,67 @@ async function flushPendingReads() {
   return done;
 }
 
+/* ============================================================
+ * ⌨️ حالة الكتابة (Typing Indicator) — v2.13
+ * ------------------------------------------------------------
+ * المشكلة السابقة: كل حرف كان يُطلق طلب upsert فوري إلى typing_status
+ * (+ مؤقت توقيف 2 ثانية) — إغراق شبكي يُظهر أخطاء [safety] setTyping
+ * في الكونسول ويستنزف الموارد (وقد يظهر 4xx تحت ضغط الطلبات).
+ *
+ * الحل (Debounce دقيق):
+ *   • «يكتب الآن» (true): مرة واحدة عند بدء التدفق فقط + تجديد مقيّد
+ *     (بحد أقصى كل 8 ثوانٍ) للجلسات الطويلة حتى لا يعلق المؤشر لدى الطرف الآخر.
+ *   • «توقفت» (false): مؤقت واحد يُلغى ويُعاد مع كل حرف (clearTimeout) —
+ *     لا يُرسَل إلا بعد توقف المستخدم عن الكتابة أكثر من 3 ثوانٍ متواصلة.
+ *   • cancelTypingTimers() تُلغي كل المؤقتات المعلّقة عند الإرسال أو تبديل
+ *     المحادثة أو الإغلاق — فلا يكتب timer قديم في محادثة خاطئة.
+ * ============================================================ */
+
+/** مدة السكون المطلوبة قبل إرسال «توقفت عن الكتابة» (Debounce) */
+const TYPING_STOP_DEBOUNCE_MS = 3000;
+/** أقصى فاصل بين تجديدات «يكتب الآن» أثناء الكتابة المستمرة (Throttle) */
+const TYPING_REFRESH_MS = 8000;
+/** حارس الالتصاق لدى المستقبِل: إخفاء المؤشر إن انقطعت تحديثات المرسل */
+const TYPING_STALE_HIDE_MS = 12000;
+
+function resetTypingLocalState() {
+  state.typingActive = false;
+  state.typingLastSentAt = 0;
+}
+
+/** إلغاء كل مؤقتات الكتابة المعلّقة (إرسال/تبديل محادثة/إغلاق) */
+function cancelTypingTimers() {
+  clearTimeout(state.typingStopTimeout);
+  state.typingStopTimeout = null;
+  clearTimeout(state.typingHideTimer);
+  state.typingHideTimer = null;
+  resetTypingLocalState();
+}
+
 function handleTypingInput() {
-  setTyping(true);
+  if (!state.activeConversation || !state.me || !state.isOnline) return;
 
-  clearTimeout(
-    state.typingTimeout
-  );
+  const now = Date.now();
 
-  state.typingTimeout =
-    setTimeout(
-      () =>
-        setTyping(false),
-      2000
-    );
+  // (1) طلب واحد عند بدء التدفق — وليس مع كل حرف.
+  if (!state.typingActive) {
+    state.typingActive = true;
+    state.typingLastSentAt = now;
+    setTyping(true);
+  } else if (now - state.typingLastSentAt >= TYPING_REFRESH_MS) {
+    // (2) تجديد مقيّد أثناء الكتابة المستمرة (حد أقصى طلب كل 8 ثوانٍ).
+    state.typingLastSentAt = now;
+    setTyping(true);
+  }
+
+  // (3) مؤقت التوقيف: يُلغى ويُعاد مع كل حرف — لا يُرسل «توقفت»
+  //     إلا بعد سكون يتجاوز 3 ثوانٍ متواصلة (Debounce الحقيقي).
+  clearTimeout(state.typingStopTimeout);
+  state.typingStopTimeout = setTimeout(() => {
+    state.typingStopTimeout = null;
+    resetTypingLocalState();
+    setTyping(false);
+  }, TYPING_STOP_DEBOUNCE_MS);
 }
 
 async function setTyping(

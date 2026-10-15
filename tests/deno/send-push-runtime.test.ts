@@ -38,15 +38,19 @@ const DB: Record<string, any[]> = {
     { id: "tok-2", token: "TOKEN_DEAD", user_id: "u-1111", platform: "web", device_id: "dev-2" },
     { id: "tok-3", token: "TOKEN_ADMIN", user_id: "a-2222", platform: "web", device_id: "dev-3" },
     { id: "tok-4", token: "TOKEN_SUPER", user_id: "s-3333", platform: "web", device_id: "dev-4" },
+    { id: "tok-5", token: "TOKEN_CUSTOMER", user_id: "u-4444", platform: "web", device_id: "dev-5" },
   ],
   conversations: [
     { id: "c-1", user_id: "u-1111", admin_id: "a-2222" },
     { id: "c-2", user_id: "x-0000", admin_id: "y-0000" },
+    { id: "c-3", user_id: "u-4444", admin_id: "a-2222" }, // محادثة مستخدم مع مشرف عادي — المشرف العام سيردّ فيها
   ],
   profiles: [
     { id: "u-1111", display_name: "سارة", is_admin: false, is_super_admin: false, is_blocked: false },
     { id: "a-2222", display_name: "المشرف", is_admin: true, is_super_admin: false, is_blocked: false },
     { id: "s-3333", display_name: "السوبر", is_admin: false, is_super_admin: true, is_blocked: false },
+    { id: "sup-4444", display_name: "السوبر المجيب", is_admin: true, is_super_admin: true, is_blocked: false },
+    { id: "u-4444", display_name: "عميل المحادثة", is_admin: false, is_super_admin: false, is_blocked: false },
   ],
 };
 const USERS: Record<string, any> = { "user-jwt": { id: "u-1111" } };
@@ -248,6 +252,29 @@ GW_LOG.length = 0;
 }
 
 /* ============================================================
+ * السيناريو 6b: ردّ المشرف العام في محادثة ليست طرفاً فيها (v2.13)
+ * المستلم = المستخدم صاحب المحادثة حصراً (وليس المشرف المالك ولا غيره)
+ * ============================================================ */
+GW_LOG.length = 0;
+resetStubCalls();
+{
+  const { status, json } = await post(
+    { message_id: "m-9", conversation_id: "c-3", sender_id: "sup-4444", content: "رد المشرف العام", recipient_id: "u-4444" },
+    { "x-send-push-secret": "trigger-secret" },
+  );
+  check("super reply: ردّ المشرف العام مقبول (بلا 403/رفض عزل)", status === 200 && json?.sent === 1, JSON.stringify(json));
+  check("super reply: الإشعار ذهب للمستخدم صاحب المحادثة (TOKEN_CUSTOMER)", GW_LOG[0]?.body?.token === "TOKEN_CUSTOMER", GW_LOG[0]?.body?.token);
+  check(
+    "super reply: العنوان من اسم المشرف العام والمحتوى من ردّه",
+    GW_LOG[0]?.body?.title === "السوبر المجيب" && GW_LOG[0]?.body?.body === "رد المشرف العام",
+  );
+  check(
+    "super reply: data تحمل معرّفات المحادثة والمرسل",
+    GW_LOG[0]?.body?.data?.conversationId === "c-3" && GW_LOG[0]?.body?.data?.senderId === "sup-4444",
+  );
+}
+
+/* ============================================================
  * السيناريو 7: new_user — إشعار جماعي لكل المشرفين النشطين
  * ============================================================ */
 GW_LOG.length = 0;
@@ -257,9 +284,9 @@ resetStubCalls();
     { type: "new_user", user_id: "u-1111", display_name: "سارة", email: "sara@example.test", created_at: "2026-10-15T00:00:00Z" },
     { "x-send-push-secret": "trigger-secret" },
   );
-  check("new_user: أُشعر مشرفان (admin + super)", status === 200 && json?.admins === 2 && json?.sent === 2, JSON.stringify(json));
+  check("new_user: أُشعر كل المشرفين النشطين الثلاثة (لثلاثة توكنات فقط)", status === 200 && json?.admins === 3 && json?.sent === 2, JSON.stringify(json));
   const tokens = GW_LOG.map((r) => r.body?.token).sort();
-  check("new_user: توكن كل مشرف على حدة", JSON.stringify(tokens) === JSON.stringify(["TOKEN_ADMIN", "TOKEN_SUPER"].sort()));
+  check("new_user: توكن كل مشرف يملك جهازاً على حدة", JSON.stringify(tokens) === JSON.stringify(["TOKEN_ADMIN", "TOKEN_SUPER"].sort()));
   check(
     "new_user: العنوان يحمل الاسم ومفتاح التوجيه userId",
     GW_LOG[0]?.body?.data?.type === "new_user" &&
