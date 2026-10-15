@@ -268,7 +268,7 @@ const pushPayload = ({ type = "new_message", messageId, conversationId, title = 
   notification: {
     title,
     body,
-    tag: conversationId ? `conversation-${conversationId}` : "whatsapp-message",
+    tag: conversationId ? `chat-${conversationId}` : "whatsapp-message",
     renotify: true,
     silent: false,
     requireInteraction: false,
@@ -348,6 +348,13 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   await env.push(dataOnly("d-2", "الثانية"));
   await wait(700);
   const bodies = env.notifications.map((n) => n.options.body);
+  check("بطاقة واحدة تعرض آخر رسالة فقط", env.notifications.length === 1 && bodies[0] === "الثانية");
+  const latest = env.notifications[0];
+  check("وسم المحادثة موحد مع إعادة تنبيه وصوت النظام",
+    latest.tag === "chat-c-20" && latest.options.renotify === true && latest.options.silent === false);
+  check("الاهتزاز محفوظ والنقرة تشير لآخر رسالة",
+    latest.options.vibrate.length > 0 && latest.data.messageId === "d-2");
+
   check(
     "دفعة data-only ثانية بنفس المحادثة تُعرض (لا تُسقط)",
     bodies.includes("الثانية"),
@@ -404,7 +411,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const tags = env.notifications.map((n) => n.tag);
   check(
     "المكالمة الفائتة لها tag خاص ولا تستبدل رسالة المحادثة",
-    tags.includes("conversation-c-5") && tags.includes("missed-r-1"),
+    tags.includes("chat-c-5") && tags.includes("missed-r-1"),
     `tags=${JSON.stringify(tags)}`
   );
 }
@@ -455,7 +462,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 {
   const env = createSwEnv();
   await env.push({
-    notification: { body: "مرحبا", tag: "conversation-c-30" }, // بلا title ⇒ نسخة SDK ناقصة
+    notification: { body: "مرحبا", tag: "chat-c-30" }, // بلا title ⇒ نسخة SDK ناقصة
     data: { type: "new_message", messageId: "m-30", conversationId: "c-30", title: "أحمد", body: "مرحبا", senderId: "u-2" },
   });
   await wait(900);
@@ -471,7 +478,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 {
   const env = createSwEnv({ sdkDelayMs: 300 });
   await env.push({
-    notification: { body: "مرحبا", tag: "conversation-c-31" },
+    notification: { body: "مرحبا", tag: "chat-c-31" },
     data: { type: "new_message", messageId: "m-31", conversationId: "c-31", title: "سارة", body: "مرحبا", senderId: "u-3" },
   });
   await wait(150);

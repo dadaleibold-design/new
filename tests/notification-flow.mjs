@@ -147,7 +147,7 @@ function createEnv({ url = "http://localhost/index.html", storage = {}, superAdm
     active: true,
     scope: "http://localhost/firebase-cloud-messaging-push-scope/",
     showNotification: async (title, options = {}) => {
-      shownNotifications.push({ title: String(title || ""), tag: String(options?.tag || "") });
+      shownNotifications.push({ ...options, title: String(title || ""), tag: String(options?.tag || "") });
     },
     getNotifications: async () => [],
     update: async () => {},
@@ -390,9 +390,24 @@ if (requested === "monitor") {
   check("صوت الإشعار يعمل في محادثة هو طرف فيها", env.plays.includes("notification-sound"), JSON.stringify(env.plays));
   check(
     "إشعار النظام يظهر في محادثة هو طرف فيها",
-    env.shownNotifications.some((n) => n.tag === "conversation-c1"),
+    env.shownNotifications.some((n) => n.tag === "chat-c1"),
     JSON.stringify(env.shownNotifications)
   );
+
+  check("إشعار المقدمة صامت نظامياً", env.shownNotifications.every((n) => n.silent === true));
+
+  env.plays.length = 0;
+  env.shownNotifications.length = 0;
+  Object.defineProperty(doc, "visibilityState", { configurable: true, value: "hidden" });
+  insertHandler.cb({ new: {
+    id: "mM-background", conversation_id: "c1", sender_id: "a1",
+    content: "رسالة بالخلفية", message_type: "text", created_at: new Date().toISOString(),
+  } });
+  await wait(250);
+  check("الخلفية لا تشغّل النغمة المحلية", !env.plays.includes("notification-sound"));
+  check("الخلفية تسمح بصوت النظام مع الوسم الموحد", env.shownNotifications.some(
+    (n) => n.tag === "chat-c1" && n.silent === false && n.renotify === true));
+  Object.defineProperty(doc, "visibilityState", { configurable: true, value: "visible" });
 
   // (ج) بطاقة مكالمة لا تُنتج إشعار رسالة (لمسار المكالمات إشعاره الخاص)
   env.plays.length = 0;

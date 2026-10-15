@@ -242,12 +242,7 @@ export function listenForForegroundMessages({
       const activeId = typeof getActiveConversationId === "function" ? getActiveConversationId() : null;
       const viewingThread = Boolean(isVisible && conversationId && activeId === conversationId);
 
-      // قرار العرض:
-      //   • التطبيق في المقدمة ويفتح نفس المحادثة → لا إشعار (التجربة أفضل داخل الواجهة)
-      //   • أي حالة أخرى (تبويب في الخلفية، نافذة مغطاة، محادثة أخرى) → إشعار فوري
-      // كانت النسخة السابقة تُسقط الإشعار كاملاً متى ما كان التبويب غير مرئي
-      // (visibilityState !== "visible") — وهو سبب رئيسي لتوقّف الإشعارات حين
-      // يبقى التطبيق في الخلفية. الآن الأصل هو العرض، والاستثناء ضيّق جداً.
+      // Suppress the open thread only; hidden pages use system audio, never Audio API.
       let suppress = false;
       if (typeof shouldSuppress === "function") {
         try {
@@ -260,21 +255,23 @@ export function listenForForegroundMessages({
       }
 
       if (!suppress) {
-        try {
-          const audio = new Audio(soundUrl);
+        if (document.visibilityState === "visible") {
+          try {
+            const audio = new Audio(soundUrl);
 
-          audio.volume = 1;
+            audio.volume = 1;
 
-          await audio.play().catch(() => {
+            void audio.play().catch(() => {
+              console.warn(
+                "[FCM] تشغيل الصوت التلقائي محظور من المتصفح."
+              );
+            });
+          } catch (error) {
             console.warn(
-              "[FCM] تشغيل الصوت التلقائي محظور من المتصفح."
+              "[FCM] Audio error:",
+              error
             );
-          });
-        } catch (error) {
-          console.warn(
-            "[FCM] Audio error:",
-            error
-          );
+          }
         }
 
         if (Notification.permission === "granted") {
@@ -283,23 +280,25 @@ export function listenForForegroundMessages({
             // الأخير قد يعيد الـ App Shell worker المسجّل على النطاق الرئيسي.
             const registration = await getMessagingServiceWorkerRegistration();
 
+            // Recheck after async registration lookup: the page may now be hidden.
+            const silent = document.visibilityState === "visible";
             await registration.showNotification(title, {
               body,
               icon: data.icon || new URL("./icons/icon.png", window.location.origin).href,
               badge: new URL("./icons/icon.png", window.location.origin).href,
               tag: conversationId
-                ? `conversation-${conversationId}`
+                ? `chat-${conversationId}`
                 : "whatsapp-web-message",
               renotify: true,
               // الصوت داخل التطبيق مسؤولية الواجهة، لكن إن كان التبويب في
               // الخلفية فلا يمكن تشغيل الصوت دائماً → نُبقي صوت النظام.
-              silent: isVisible,
+              silent,
               data: {
                 ...data,
                 conversationId,
                 messageId: data.messageId || data.message_id || "",
               },
-              vibrate: [100, 50, 100],
+              ...(silent ? {} : { vibrate: [100, 50, 100] }),
             });
           } catch (error) {
             console.warn(

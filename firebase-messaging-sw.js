@@ -2,7 +2,7 @@
  * firebase-messaging-sw.js
  * Service Worker لإشعارات Firebase Cloud Messaging (Web Push).
  *
- * المبدأ الحاكم (SW_BUILD 2026-10-15.1):
+ * المبدأ الحاكم (SW_BUILD 2026-10-15.2):
  *   «مصدر واحد يعرض الإشعار، والبقية تسجّل فقط».
  *
  *  1) الخادم (send-push) يرسل دفعة data-only للويب (بلا webpush.notification).
@@ -21,7 +21,7 @@
  *     أصلاً إلى الجهاز، ومن قرّر العرض أو التخطّي ولماذا.
  * ============================================================ */
 
-const SW_BUILD = "2026-10-15.1";
+const SW_BUILD = "2026-10-15.2";
 const LOG = "[push-sw]";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
 
@@ -235,7 +235,7 @@ function notificationTag(payload) {
   if (payload.isCallEnded) return `missed-${payload.roomId || Date.now()}`;
   // مستخدم جديد: إشعار مستقل لكل مستخدم (لا يستبدل إشعاراً آخر)
   if (payload.data?.userId || payload.data?.user_id) return `new-user-${payload.data.userId || payload.data.user_id}`;
-  if (payload.conversationId) return `conversation-${payload.conversationId}`;
+  if (payload.conversationId) return `chat-${payload.conversationId}`;
   if (payload.messageId) return `message-${payload.messageId}`;
   return `whatsapp-message-${Date.now()}`;
 }
@@ -251,6 +251,7 @@ function buildNotificationOptions(payload) {
     // renotify: إعادة التنبيه (صوت/اهتزاز) حتى مع وجود إشعار بنفس الـ tag
     renotify: true,
     requireInteraction: isCall,
+    // Background audio belongs exclusively to the OS. Never play local audio in SW.
     silent: false,
     timestamp: Date.now(),
     data: {

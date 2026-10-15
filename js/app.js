@@ -6788,10 +6788,10 @@ async function showLocalMessageNotification(msg) {
       (await navigator.serviceWorker.ready);
 
     // فرصة أخيرة قبل العرض: قد يكون إشعار FCM وصل في نفس اللحظة وبنفس الـ tag
-    const tag = `conversation-${msg.conversation_id}`;
+    const tag = `chat-${msg.conversation_id}`;
     try {
       const existing = await reg.getNotifications({ tag });
-      if (existing?.length) return;
+      if (existing?.some((n) => (n.data?.messageId || n.data?.message_id) === msg.id)) return;
     } catch {
       /* getNotifications غير مدعومة في بعض المتصفحات */
     }
@@ -6822,7 +6822,7 @@ async function closeConversationNotifications(conversationId) {
     if (!("serviceWorker" in navigator)) return;
     const regs = await navigator.serviceWorker.getRegistrations();
     for (const reg of regs) {
-      const list = await reg.getNotifications({ tag: `conversation-${conversationId}` });
+      const list = await reg.getNotifications({ tag: `chat-${conversationId}` });
       list.forEach((n) => n.close());
     }
   } catch {
@@ -6831,6 +6831,9 @@ async function closeConversationNotifications(conversationId) {
 }
 
 function playNotificationSound() {
+  // Hidden/locked pages must leave audio to the system notification.
+  if (document.visibilityState !== "visible") return;
+
   const audio =
     $("#notification-sound");
 
