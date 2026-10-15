@@ -1304,7 +1304,7 @@ function wireChrome() {
       } catch (err) {
         log(false, "فشل المسبار: " + (err?.message || err));
       }
-      log(null, "أغلق التطبيق الآن — يجب أن يصلك إشعاران تجريبيان.");
+      log(null, "اختبر الآن والتطبيق في الخلفية. نجاح FCM يثبت قبول الطلب فقط؛ إن لم يظهر الإشعار، افحص سجل [push-sw] وإعدادات الإذن/النظام.");
     } catch (err) {
       const m = err?.message || String(err);
       if (/404|not found/i.test(m)) {

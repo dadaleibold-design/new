@@ -55,7 +55,7 @@ class FakeEventTarget {
 }
 
 /** بيئة SW وهمية كاملة */
-function createSwEnv({ visibleClient = false, sdkDelayMs = 0 } = {}) {
+function createSwEnv({ visibleClient = false, clientUrl = "https://app.test/index.html", sdkDelayMs = 0 } = {}) {
   const self = new FakeEventTarget();
   const notifications = [];
   const openedWindows = [];
@@ -101,7 +101,7 @@ function createSwEnv({ visibleClient = false, sdkDelayMs = 0 } = {}) {
     },
   };
   const client = {
-    url: "https://app.test/index.html",
+    url: clientUrl,
     visibilityState: visibleClient ? "visible" : "hidden",
     focus: () => Promise.resolve(),
     postMessage: (msg) => posted.push(msg),
@@ -370,6 +370,26 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   await env.push(pushPayload({ messageId: "m-9", conversationId: "c-4" }));
   await wait(700);
   check("نافذة ظاهرة ⇒ لا إشعار خلفي مكرر", env.notifications.length === 0, `count=${env.notifications.length}`);
+}
+
+/* 5b) نافذة أخرى ظاهرة من الأصل نفسه لا تُسقط إشعار التطبيق ---------------- */
+{
+  const env = createSwEnv({ visibleClient: true, clientUrl: "https://app.test/help" });
+  await env.push({
+    data: {
+      type: "new_message",
+      messageId: "m-visible-other-page",
+      conversationId: "c-visible-other-page",
+      title: "سارة",
+      body: "يجب ألا يُسقط هذا الإشعار",
+    },
+  });
+  await wait(700);
+  check(
+    "نافذة ظاهرة خارج مسار التطبيق لا تمنع عرض إشعار الخلفية",
+    env.notifications.some((n) => n.options.body === "يجب ألا يُسقط هذا الإشعار"),
+    `count=${env.notifications.length}`
+  );
 }
 
 /* 6) مكالمة فائتة لا تستبدل إشعار المحادثة (tag منفصل) ---------------------- */

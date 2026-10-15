@@ -136,7 +136,28 @@ const writeCount = async (who, sql, params) => {
   return r.ok ? r.affected : `ERR:${r.error}`;
 };
 
-// ---------- 1) الزائر (anon) ----------
+// ---------- 1) RLS لتسجيل توكنات FCM (جلسة المستخدم فقط) ----------
+const ownTokenInsert = await as(
+  { uid: U1 },
+  `insert into public.fcm_tokens (user_id, token, platform) values ('${U1}', 'rls-own-token', 'web')`,
+);
+check("RLS: المستخدم يستطيع تسجيل توكنه الخاص", ownTokenInsert.ok, ownTokenInsert.error ?? "");
+const crossTokenInsert = await as(
+  { uid: U1 },
+  `insert into public.fcm_tokens (user_id, token, platform) values ('${U2}', 'rls-other-token', 'web')`,
+);
+check("RLS: المستخدم لا يستطيع تسجيل توكن تحت حساب آخر", !crossTokenInsert.ok && /row-level security|policy/i.test(crossTokenInsert.error), crossTokenInsert.error ?? "");
+const tokenRpc = await as(
+  { uid: U1 },
+  `select public.register_fcm_token('rls-rpc-token', 'web', 'device-u1', '{}'::jsonb) as result`,
+);
+check(
+  "RLS: register_fcm_token يسجّل للجلسة الحالية عبر RPC المصرّح بها",
+  tokenRpc.ok && tokenRpc.rows[0]?.result?.action === "inserted",
+  tokenRpc.error ?? JSON.stringify(tokenRpc.rows?.[0]?.result ?? null),
+);
+
+// ---------- 2) الزائر (anon) ----------
 check("زائر: لا يرى أي ملف شخصي", (await count({ role: "anon" }, "select id from public.profiles")) === 0);
 check("زائر: لا يرى أي رسالة", (await count({ role: "anon" }, "select id from public.messages")) === 0);
 check("زائر: لا يرى توكنات FCM", (await count({ role: "anon" }, "select id from public.fcm_tokens")) === 0);

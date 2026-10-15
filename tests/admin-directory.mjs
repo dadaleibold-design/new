@@ -107,7 +107,7 @@ if (requested === "static") {
   check("send-push موثّق للأنواع المدعومة", /new_user\s+— من trigger على profiles/.test(sendPush));
 
   // --- Service Worker ---
-  check("SW version مُحدَّث", /SW_BUILD = "2026-10-14\.1"/.test(sw));
+  check("SW version مُحدَّث", /SW_BUILD = "2026-10-15\.1"/.test(sw));
   check("SW يميّز حدث المستخدم الجديد (identityKey)", /return `user:\$\{data\.userId \|\| data\.user_id\}`;/.test(sw));
   check("SW يعطي إشعار كل مستخدم جديد tag خاصاً", /new-user-\$\{payload\.data\.userId \|\| payload\.data\.user_id\}/.test(sw));
   check("SW يضيف ?user=<id> إلى رابط الفتح", /payload\.data\?\.userId \|\| payload\.data\?\.user_id\s*\?\s*\{ user: payload\.data\.userId \|\| payload\.data\.user_id \}/.test(sw));

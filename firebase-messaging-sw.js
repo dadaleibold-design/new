@@ -2,7 +2,7 @@
  * firebase-messaging-sw.js
  * Service Worker لإشعارات Firebase Cloud Messaging (Web Push).
  *
- * المبدأ الحاكم (SW_BUILD 2026-10-14.1):
+ * المبدأ الحاكم (SW_BUILD 2026-10-15.1):
  *   «مصدر واحد يعرض الإشعار، والبقية تسجّل فقط».
  *
  *  1) الخادم (send-push) يرسل دفعة data-only للويب (بلا webpush.notification).
@@ -21,7 +21,7 @@
  *     أصلاً إلى الجهاز، ومن قرّر العرض أو التخطّي ولماذا.
  * ============================================================ */
 
-const SW_BUILD = "2026-10-14.1";
+const SW_BUILD = "2026-10-15.1";
 const LOG = "[push-sw]";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
 
@@ -130,6 +130,21 @@ function appUrl(conversationId = "", messageId = "", extra = {}) {
     if (value) url.searchParams.set(key, value);
   });
   return url.href;
+}
+
+/** لا نعدّ أي نافذة من الأصل نفسه نافذةً للتطبيق؛ قد تكون صفحة أخرى ظاهرة. */
+function isAppClient(client) {
+  try {
+    const base = new URL(appBaseUrl());
+    const url = new URL(client.url);
+    if (url.origin !== base.origin) return false;
+
+    const basePath = base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`;
+    const appIndexPath = `${basePath}index.html`;
+    return url.pathname === basePath || url.pathname === basePath.slice(0, -1) || url.pathname === appIndexPath;
+  } catch {
+    return false;
+  }
 }
 
 function iconUrl(hint) {
@@ -447,15 +462,9 @@ async function forwardCallPushToVisibleClients(payload) {
   } catch {
     return 0;
   }
-  const base = appBaseUrl();
-  const targets = clientList.filter((client) => {
-    if (client.visibilityState !== "visible") return false;
-    try {
-      return new URL(client.url).href.startsWith(base);
-    } catch {
-      return false;
-    }
-  });
+  const targets = clientList.filter((client) =>
+    client.visibilityState === "visible" && isAppClient(client)
+  );
   let delivered = 0;
   for (const client of targets) {
     try {
@@ -472,10 +481,10 @@ async function forwardCallPushToVisibleClients(payload) {
   return delivered;
 }
 
-async function hasVisibleClient() {
+async function hasVisibleAppClient() {
   try {
     const clientList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    return clientList.some((client) => client.visibilityState === "visible");
+    return clientList.some((client) => client.visibilityState === "visible" && isAppClient(client));
   } catch {
     return false;
   }
@@ -593,7 +602,7 @@ async function handlePush(raw, received) {
   }
 
   // نافذة ظاهرة (غير المكالمات): الصفحة تتولّى العرض عبر onMessage (لا إشعار مزدوج)
-  if (!isCallPayload && (await hasVisibleClient())) {
+  if (!isCallPayload && (await hasVisibleAppClient())) {
     swLog("decision: app window visible → page renders via onMessage", {
       type: payload?.type || "",
       messageId: payload?.messageId || "",
@@ -654,7 +663,6 @@ async function focusOrOpenClient(payload, event) {
           : {}
   );
 
-  const base = appBaseUrl();
   // 📞 نقرة الجسم (بلا زر) على إشعار مكالمة = «رد» كما في زر الرد.
   //    الرفض يأتي فقط من الزر صراحةً. بقية الإشعارات تبقى كما هي.
   const action = payload.isCall
@@ -680,14 +688,8 @@ async function focusOrOpenClient(payload, event) {
     clientList = [];
   }
 
-  // نافذة التطبيق نفسها (نفس الأصل والمسار) — سواء كانت ظاهرة أو مُجمّدة
-  const appClients = clientList.filter((client) => {
-    try {
-      return new URL(client.url).href.startsWith(base);
-    } catch {
-      return false;
-    }
-  });
+  // نافذة التطبيق نفسها (نفس الأصل ومسار index.html) — ظاهرة أو مُجمّدة
+  const appClients = clientList.filter(isAppClient);
 
   const target = appClients.find((client) => client.visibilityState === "visible") || appClients[0];
 

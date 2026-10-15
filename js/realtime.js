@@ -20,18 +20,37 @@
  *   5) نبضة يقظة مع تراجع أُسّي (exponential backoff) لعمليات الإحياء.
  * ============================================================ */
 
-/** حالة اتصال الـ WebSocket الأساسي: connected | connecting | disconnected | unknown */
+/**
+ * حالة WebSocket الخام كما تعيدها Supabase Realtime، مثلاً:
+ * open | connecting | closing | closed. نُبقي القيمة الخام للتشخيص.
+ */
 export function realtimeConnectionState(supabase) {
   try {
     const value = supabase?.realtime?.connectionState?.();
-    return typeof value === "string" && value ? value : "unknown";
+    if (typeof value === "string" && value) return value.toLowerCase();
+    // بعض adapters قد تعيد WebSocket.readyState مباشرة (OPEN === 1).
+    if (value === 1) return "open";
+    return "unknown";
   } catch {
     return "unknown";
   }
 }
 
+/**
+ * RealtimeClient.isConnected() هو المصدر الأدق في Supabase v2.
+ * connectionState() يعيد `open` لا `connected` في Phoenix/Supabase؛ إبقاء
+ * fallback للحالة النصية يدعم adapters القديمة ومحاكيات الاختبار.
+ */
 export function isRealtimeConnected(supabase) {
-  return realtimeConnectionState(supabase) === "connected";
+  try {
+    const isConnected = supabase?.realtime?.isConnected?.();
+    if (typeof isConnected === "boolean") return isConnected;
+  } catch {
+    // استخدم حالة socket أدناه إن لم يتوفر isConnected أو تعذّر استدعاؤه.
+  }
+
+  const state = realtimeConnectionState(supabase);
+  return state === "open" || state === "connected";
 }
 
 /** حالة قناة واحدة: joined | joining | leaving | closed | errored | unknown */
@@ -340,17 +359,21 @@ export function startRealtimeWatchdog(options = {}) {
   } = options;
 
   let timer = null;
+  let tickPromise = null;
   let stopped = false;
   let misses = 0;
   let lastReviveAt = 0;
   let reviveFailures = 0;
 
   function schedule() {
-    if (stopped) return;
+    if (stopped || timer) return;
     const delay = (typeof document !== "undefined" && document.hidden)
       ? hiddenIntervalMs
       : visibleIntervalMs;
-    timer = setTimeout(tick, delay);
+    timer = setTimeout(() => {
+      timer = null;
+      void tick();
+    }, delay);
   }
 
   async function revive(reason) {
@@ -367,43 +390,57 @@ export function startRealtimeWatchdog(options = {}) {
     }
   }
 
-  async function tick() {
-    if (stopped) return;
-    timer = null;
+  function tick() {
+    if (stopped) return Promise.resolve();
 
-    try {
-      const online = typeof navigator === "undefined" ? true : navigator.onLine !== false;
+    // ping() قد يُستدعى عند pageshow/online بينما المؤقت الدوري موجود؛ لا
+    // ننشئ ساعتين متوازيتين ولا نضاعف فحوص الإحياء.
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (tickPromise) return tickPromise;
 
-      if (isEnabled() && online) {
-        if (!isRealtimeConnected(supabase)) {
-          misses += 1;
-          ensureRealtimeConnected(supabase);
+    // بدء العمل في microtask يضمن تعيين tickPromise قبل دخول try/finally.
+    tickPromise = Promise.resolve()
+      .then(async () => {
+        const online = typeof navigator === "undefined" ? true : navigator.onLine !== false;
 
-          if (misses >= lostThreshold) {
-            misses = 0;
-            try {
-              onConnectionLost?.(diagnoseRealtime(supabase));
-            } catch {
-              /* تجاهل */
+        if (isEnabled() && online) {
+          if (!isRealtimeConnected(supabase)) {
+            misses += 1;
+            ensureRealtimeConnected(supabase);
+
+            if (misses >= lostThreshold) {
+              misses = 0;
+              try {
+                onConnectionLost?.(diagnoseRealtime(supabase));
+              } catch {
+                /* تجاهل */
+              }
+              await revive("connection-lost");
             }
-            await revive("connection-lost");
-          }
-        } else {
-          misses = 0;
-          const report = diagnoseRealtime(supabase);
-          if (report.unhealthy.length) {
-            await revive("channel-unhealthy");
           } else {
-            // كل شيء سليم ⇒ صفّر تراجع الإحياء
-            reviveFailures = 0;
+            misses = 0;
+            const report = diagnoseRealtime(supabase);
+            if (report.unhealthy.length) {
+              await revive("channel-unhealthy");
+            } else {
+              // كل شيء سليم ⇒ صفّر تراجع الإحياء
+              reviveFailures = 0;
+            }
           }
         }
-      }
-    } catch (error) {
-      console.warn("[realtime:watchdog] خطأ في النبضة:", error);
-    }
+      })
+      .catch((error) => {
+        console.warn("[realtime:watchdog] خطأ في النبضة:", error);
+      })
+      .finally(() => {
+        tickPromise = null;
+        schedule();
+      });
 
-    schedule();
+    return tickPromise;
   }
 
   schedule();

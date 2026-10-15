@@ -39,6 +39,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { importPKCS8, SignJWT } from "https://esm.sh/jose@5.10.0";
+import { fitFcmData } from "./payload.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -201,7 +202,9 @@ async function sendToFcm(
 
   const body: Record<string, unknown> = {
     token,
-    data,
+    // لا تجعل رسالة دردشة طويلة تتجاوز حد FCM وتفشل الدفعة كاملة.
+    // البيانات تظل data-only؛ الـ Service Worker هو المسؤول الوحيد عن العرض.
+    data: fitFcmData(data),
     android: {
       priority: urgent ? "high" : "normal",
       ttl: opts.highPriority ? "60s" : "86400s",

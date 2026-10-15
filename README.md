@@ -91,10 +91,10 @@ python3 -m http.server 8080
 - **قائمة انتظار الإرسال (Outbox)**: أي رسالة تُكتب أثناء انقطاع الاتصال تُخزَّن محلياً وتُرسل تلقائياً بمجرد عودة الشبكة (`online` event)
 - **PWA** قابل للتثبيت + Service Worker لتخزين الواجهة (App Shell)
 - **FCM Web Push Notifications حقيقية** تصل حتى مع إغلاق المتصفح، عبر Firebase Service Worker وEdge Function (تفاصيل الإعداد أدناه)
-- **موثوقية الخلفية (إصدار 2026-09-21)**: طبقة `js/realtime.js` تُعيد الاشتراكات تلقائياً
-  (backoff) + نبضة يقظة watchdog تكتشف موت WebSocket في الخلفية وتُحييه، ومزامنة «ما فات»
-  عند عودة التطبيق، وإشعارات بأولوية عالية (`Urgency: high`) لا يؤجّلها Doze، ومزامنة دورية
-  لتوكن FCM (كل 30 دقيقة) فلا تتوقف الإشعارات عند تدوير التوكن.
+- **التعافي من الخلفية**: طبقة `js/realtime.js` تعيد الاشتراكات مع backoff عندما يعمل
+  JavaScript، ومزامنة «ما فات» تُنفَّذ عند عودة الصفحة. قد يجمّد المتصفح الصفحة ويخنق المؤقتات
+  والـ WebSocket؛ لذلك لا يُعتمد على الـ watchdog أثناء الإغلاق/التجميد. FCM بأولوية عالية
+  ومزامنة التوكن عند التشغيل/الاستئناف تقللان الانقطاع، لكن التسليم يظل خاضعاً للمتصفح والنظام.
 - **نقرة الإشعار تفتح المحادثة الصحيحة دائماً**: موجّه مركزي `js/notification-router.js`
   يلتقط النقرة حتى لو وصلت أثناء إقلاع التطبيق (تخزين مؤقت 30 دقيقة)، ويمرّر الشاشة إلى
   الرسالة نفسها ويميّزها تمييزاً مؤقتاً.
@@ -124,21 +124,46 @@ npm run check       # صياغة app.js + العلامات الأساسية + li
 npm run env:check   # التأكد من وجود كل متغيرات البيئة المطلوبة
 ```
 
-## 7. إعداد الإشعارات الحقيقية (Firebase Cloud Messaging) — تم التحويل من Web Push/VAPID
-⚠️ **تغيير معماري مهم:** المشروع لم يعد يستخدم Web Push (VAPID) + Supabase Edge Function
-(`supabase/functions/send-push` وجدول `push_subscriptions` أصبحا **قديمين/غير مُستخدَمين**،
-تُركا في المشروع للمرجعية فقط). الإشعارات الآن بالكامل عبر **Firebase Cloud Messaging (FCM)**.
+## 7. إعداد الإشعارات الحقيقية (Firebase Cloud Messaging)
+الإشعارات الحالية تستخدم **FCM Web Push** مع Supabase Edge Function `send-push`؛ أما جدول
+`push_subscriptions` فهو بقايا مسار Web Push القديم ولا يدخل في مسار FCM الحالي.
 
 ### آلية العمل الحالية
-- `js/push.js`: يهيّئ Firebase (SDK نسخة 10.8.0 المعيارية)، يطلب إذن الإشعارات، ويسجّل
-  `firebase-messaging-sw.js` في نطاق (scope) مخصص `./firebase-cloud-messaging-push-scope`
-  **منفصل تماماً** عن `sw.js` الرئيسي لتفادي أي تعارض بين Service Workerين.
-- `firebase-messaging-sw.js` (في جذر المشروع): يستقبل رسائل FCM في الخلفية (تطبيق مغلق/مصغّر)
-  عبر `messaging.onBackgroundMessage()` ويعرضها بـ `registration.showNotification()`.
-- عند فتح التطبيق (foreground)، `listenForForegroundMessages()` في `push.js` تُستدعى من
-  `enterApp()` في `app.js`، وتعرض الإشعار أيضاً عبر `registration.showNotification()` —
-  **وليس** `new Notification()` التي تُسبّب خطأ "Illegal constructor" على متصفحات الأندرويد.
-- توكن كل جهاز يُحفظ في جدول `fcm_tokens` (قسم 8 في `sql/schema.sql`).
+- `js/push.js`: يهيّئ Firebase SDK، يطلب إذن الإشعارات، ويسجّل
+  `firebase-messaging-sw.js` في نطاق مخصص `./firebase-cloud-messaging-push-scope`، منفصل عن
+  `sw.js` الخاص بكاش App Shell.
+- `supabase/functions/send-push/index.ts`: يرسل **Data-only payload** إلى FCM HTTP v1، بلا
+  `notification` أو `webpush.notification`، ويقصّ النص عند الحاجة إلى حد آمن (3500 بايت UTF-8)
+  كي لا ترفض FCM حمولة رسالة طويلة. نجاح `sent=1/1` يعني أن FCM قبل الإرسال، وليس تأكيداً
+  بأن الجهاز عرض الإشعار أو أن نظام التشغيل سمح بصوته.
+- `firebase-messaging-sw.js`: مستمع `push` الخام هو المسؤول الوحيد عن الإشعار في الخلفية؛
+  يقرأ `data` ويعرضه عبر `registration.showNotification()`. معالج Firebase
+  `onBackgroundMessage()` للتشخيص فقط، لمنع إشعار تلقائي ثانٍ بحمولة مختلفة.
+- عند بقاء صفحة التطبيق ظاهرة، `listenForForegroundMessages()` في `push.js` يتولى إشعار
+  المقدمة والصوت داخل الصفحة. لا يُستخدم `new Notification()`.
+- كل جهاز/متصفح له صف FCM مستقل في `fcm_tokens`. يسجَّل التوكن من الصفحة بعد تسجيل الدخول
+  عبر RPC آمنة، وتقرأ الدالة/تحذف التوكنات الميتة عبر `service_role`.
+
+### حدود المنصة (لا يمكن ضمان «100%» من جهة JavaScript)
+- بعد إغلاق الصفحة لا تعمل مؤقتات التطبيق أو WebSocket؛ الذي يمكن إيقاظه هو Service Worker
+  عند وصول Push. المتصفح ونظام التشغيل قد يؤخران أو يمنعان التسليم بسبب حظر الإذن، وضع توفير
+  الطاقة، DND، اتصال الجهاز أو سياسات النظام. `Urgency: high` وFCM `priority: high` يقللان
+  التأخير ولا يلغيان هذه القيود.
+- Service Worker لا يستطيع تشغيل ملف `notify.mp3` أو إبقاء صوت مستمر موثوقاً بالخلفية.
+  `silent: false` يطلب صوت الإشعار الافتراضي من المتصفح/النظام، ويظل خاضعاً لإعدادات الجهاز.
+  الملف الصوتي مخصص للمقدمة فقط، وتشغيله فيها قد يمنعه autoplay policy.
+- على iOS يلزم دعم Web Push في إصدار النظام، وإضافة التطبيق إلى الشاشة الرئيسية (PWA)؛
+  الإشعارات ليست مدعومة في كل سياقات Safari/المتصفحات المضمّنة.
+
+### تشخيص «الاختبار ينجح لكن إشعار الرسالة لا يصل»
+1. زر الاختبار المباشر يختبر **الجلسة → Edge Function → FCM** فقط؛ لا يختبر Trigger قاعدة البيانات.
+2. استخدم `push_probe()`/`push_probe_result()` أو `push_diagnostics()`، ثم راجع
+   `push_delivery_log` للتأكد من أن Trigger الرسائل و`pg_net` وصلا إلى `send-push`.
+3. افحص سجل Service Worker `[push-sw]`: `push received` يعني أن دفعة وصلت إلى المتصفح؛
+   `decision: background → render notification` ثم `notification shown` يعني أن العرض طُلب.
+   إن لم يظهر `push received` فالمشكلة قبل معالج العرض (توكن/مشروع Firebase/إذن/متصفح/نظام).
+4. عند تسجيل `sent=1/1` مع غياب `push received`، لا تعتبر FCM ACK دليلاً على وصول الجهاز؛
+   أعد تسجيل FCM token، وتأكد أن التطبيق وEdge Function يستخدمان مشروع Firebase وVAPID نفسيهما.
 
 ### خطوات الإعداد
 1. **مشروع Firebase**: أنشئ مشروعاً على [console.firebase.google.com](https://console.firebase.google.com)،
