@@ -657,6 +657,20 @@ export function unsubscribeFromIncomingCalls() {
 async function persistCallRoom(room) {
   const supabase = callState.ctx?.supabase;
   if (!supabase) return false;
+
+  // انتهى الرنين بعد دقيقتين، والجلسة النشطة الأقدم من 24 ساعة تعتبر
+  // متروكة كحاجز أمان. التنظيف بساعة قاعدة البيانات يسبق فحص القيد الفريد.
+  const cleanup = await safeQuery("calls:cleanup-stale-ringing", () =>
+    supabase.rpc("expire_stale_ringing_calls_for_conversation", {
+      p_conversation: room.conversationId,
+    })
+  );
+  if (!cleanup.ok) {
+    console.warn("[calls] تعذّر تنظيف غرف الرنين القديمة:", cleanup.error);
+    notify("تعذّر تحديث حالة المكالمات القديمة. أعد تطبيق ترحيل v2.12 ثم حاول مجدداً.");
+    return false;
+  }
+
   const activeRoom = await supabase
     .from("call_rooms")
     .select("id,status")
@@ -1146,9 +1160,14 @@ export async function startCall(callType = "audio") {
     calleeId: peer.id,
   });
   if (!roomCreated) {
+    // لا تترك واجهة/حالة محلية معلّقة إذا فشل الحفظ أو وُجدت مكالمة فعلية.
+    stopRingtone();
     callState.current = null;
     callState.joining = false;
     setOverlayVisible(false);
+    setCallStatus("");
+    setCallPhase("idle");
+    setAudioSessionType("auto");
     return;
   }
 

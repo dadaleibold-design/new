@@ -277,10 +277,20 @@ const APP_WINDOW = (visibilityState) => ({ visibilityState, url: "https://app.te
   check("رسالة ⇒ action يبقى open (لا تغيير للسلوك القديم)", msgOpen?.msg.action === "open", msgOpen?.msg.action);
 }
 
-/* ---------- (أ-8) بناء SW ---------- */
+/* ---------- (أ-8) الحمولة العامة type=call تُعامل كدعوة واردة ---------- */
 {
   const env = createSwEnv({ clientsSpec: [] });
-  check("SW_BUILD = 2026-10-15.2", env.self.__WA_MESSAGING_SW_BUILD === "2026-10-15.2", env.self.__WA_MESSAGING_SW_BUILD);
+  await env.push({ data: { type: "call", room_id: "room-alias", title: "مكالمة", body: "اضغط للرد" } });
+  const note = env.notifications[0];
+  check("type=call + room_id ⇒ إشعار مكالمة لا رسالة", note?.tag === "call-room-alias");
+  await env.click(note, "");
+  check("type=call ⇒ نقرة الجسم توجه للرد", env.openedWindows.some((url) => /answer_call=room-alias/.test(url)));
+}
+
+/* ---------- (أ-9) بناء SW ---------- */
+{
+  const env = createSwEnv({ clientsSpec: [] });
+  check("SW_BUILD = 2026-10-18.1", env.self.__WA_MESSAGING_SW_BUILD === "2026-10-18.1", env.self.__WA_MESSAGING_SW_BUILD);
 }
 
 /* ---------- (ب) فحص المصادر ---------- */

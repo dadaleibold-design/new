@@ -3687,3 +3687,36 @@ end;
 $$;
 revoke all on function public.push_gateway_check() from public;
 grant execute on function public.push_gateway_check() to authenticated;
+
+-- ============================================================
+-- v2.12 (2026-10-18): تنظيف الرنين القديم عند بدء مكالمة جديدة
+-- (مطابق لـ sql/migrations/2026-10-18_v2_12_call_state_cleanup.sql)
+-- ============================================================
+create or replace function public.expire_stale_ringing_calls_for_conversation(
+  p_conversation uuid
+)
+returns integer
+language plpgsql
+security invoker
+set search_path = public
+as $$
+declare
+  v_count integer;
+begin
+  update public.call_rooms
+  set status = case when status = 'ringing' then 'missed' else 'network_lost' end,
+      ended_at = now()
+  where conversation_id = p_conversation
+    and (
+      (status = 'ringing' and started_at < now() - interval '2 minutes')
+      or (status = 'active' and answered_at < now() - interval '24 hours')
+    )
+    and (caller_id = auth.uid() or callee_id = auth.uid());
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+revoke all on function public.expire_stale_ringing_calls_for_conversation(uuid) from public;
+grant execute on function public.expire_stale_ringing_calls_for_conversation(uuid) to authenticated;

@@ -1,4 +1,4 @@
-const CACHE_NAME = "wa-clone-shell-v20";
+const CACHE_NAME = "wa-clone-shell-v21";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -142,6 +142,9 @@ self.addEventListener("notificationclick", (event) => {
   const data = nested ? { ...nested.data, ...raw } : raw;
   const conversationId = data.conversationId || data.conversation_id || "";
   const messageId = data.messageId || data.message_id || "";
+  const roomId = data.roomId || data.room_id || "";
+  const type = String(data.type || "").toLowerCase();
+  const isCall = Boolean(roomId) && ["call", "incoming_call"].includes(type);
 
   const scope = (self.registration.scope || "/").replace(/firebase-cloud-messaging-push-scope\/?$/, "");
   let url;
@@ -150,8 +153,15 @@ self.addEventListener("notificationclick", (event) => {
   } catch {
     url = new URL("/index.html", self.location.origin);
   }
-  if (conversationId) url.searchParams.set("conversation", conversationId);
-  if (messageId) url.searchParams.set("message", messageId);
+  // مسار المكالمة يفتح تدفق الرد الوارد (ويتحقق التطبيق من صلاحية الغرفة)،
+  // ولا يكتفي بفتح المحادثة العامة.
+  if (isCall) {
+    url.searchParams.set("room_id", roomId);
+    if (conversationId) url.searchParams.set("conversation", conversationId);
+  } else {
+    if (conversationId) url.searchParams.set("conversation", conversationId);
+    if (messageId) url.searchParams.set("message", messageId);
+  }
 
   event.waitUntil(
     clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
@@ -166,11 +176,14 @@ self.addEventListener("notificationclick", (event) => {
       const target = appClients.find((client) => client.visibilityState === "visible") || appClients[0];
 
       if (target) {
-        if (conversationId) {
+        if (isCall || conversationId) {
           target.postMessage({
             type: "OPEN_CONVERSATION",
             conversationId,
             messageId,
+            roomId: isCall ? roomId : "",
+            notificationType: isCall ? type : "message",
+            action: isCall ? "answer" : "open",
             url: url.href,
           });
         }
