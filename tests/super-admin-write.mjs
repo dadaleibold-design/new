@@ -32,7 +32,12 @@ const SEND_PUSH = read("supabase/functions/send-push/index.ts");
 /* ---------- 1) الهجرة موجودة ومطابقة لقسم 19 في schema.sql ---------- */
 check("هجرة v2.13 موجودة (2026-10-15)", MIGRATION.includes("Migration v2.13 (2026-10-15)"));
 
-const section19 = SCHEMA.slice(SCHEMA.indexOf("19. الإصدار v2.13"));
+const section19Start = SCHEMA.indexOf("19. الإصدار v2.13");
+const section20Start = SCHEMA.indexOf("20. الإصدار v2.14", section19Start);
+const section20Separator = section20Start >= 0
+  ? SCHEMA.lastIndexOf("-- ============================================================", section20Start)
+  : -1;
+const section19 = SCHEMA.slice(section19Start, section20Separator >= 0 ? section20Separator : undefined);
 const marker = "-- ------------------------------------------------------------\n-- ① ";
 const migBody = MIGRATION.slice(MIGRATION.indexOf(marker)).trimEnd();
 const schemaBody = section19.slice(section19.indexOf(marker)).trimEnd();

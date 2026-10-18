@@ -1,35 +1,64 @@
 /*
- * send-push-runtime.test.ts — اختبار تشغيلي فعلي لدالة send-push (v2.12)
- * -------------------------------------------------------------
- * يشغّل ملف `supabase/functions/send-push/index.ts` الحقيقي على Deno:
- *   • محاكي Cloudflare Worker على 127.0.0.1:8999 يسجّل كل طلب ويصادر الحالة.
- *   • عميل supabase-js وهمي عبر import-map (بديل محلي بلا شبكة).
- * ويتحقق من:
- *   1) عقد الطلب لكل جهاز: POST {token,title,body,data(,priority,ttlSeconds)}
- *      إلى رابط البوابة الواحد مع ترويستي المصادقة (Authorization + x-send-push-secret).
- *   2) بقاء قواعد الأمان: عزل المستلم (الطرف الآخر فقط)، رفض المرسل غير الطرف،
- *      رفض تعارض المستلم المصرَّح به، رفض السرّ الخاطئ 401.
- *   3) حذف التوكن الميّت (410) فقط، وتعليم delivered بعد النجاح.
- *   4) المسبار (probe) والإشعار الجماعي (new_user) وإعادة المحاولة بعد 429.
- *   5) ⛔ حارس الحلقة عبر عملية فرعية (loop-guard-check.ts).
- *
- * التشغيل:
- *   deno run --allow-all --import-map tests/deno/import-map.json \
- *     tests/deno/send-push-runtime.test.ts
+ * send-push-runtime.test.ts — اختبار تشغيلي فعلي لدالة send-push (FCM المباشر).
+ * يستخدم حساب خدمة RSA مولداً للاختبار، ويحاكي OAuth2 وFCM HTTP v1 دون شبكة.
  */
-
 /* eslint-disable @typescript-eslint/no-explicit-any */
-const GATEWAY_PORT = 8999;
-const FUNCTION_PORT = 8000; // Deno.serve الافتراضي في CLI
-const GATEWAY_URL = `http://127.0.0.1:${GATEWAY_PORT}/`;
+const FUNCTION_PORT = 8000;
 const FUNCTION_URL = `http://127.0.0.1:${FUNCTION_PORT}/`;
 
-/* ---------- بيئة الدالة (قبل الاستيراد) ---------- */
+const generated = await crypto.subtle.generateKey(
+  { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+  true,
+  ["sign", "verify"],
+);
+const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", generated.privateKey));
+let pemBody = "";
+for (let i = 0; i < pkcs8.length; i++) pemBody += String.fromCharCode(pkcs8[i]);
+const pemEncoded = btoa(pemBody).match(/.{1,64}/g)?.join("\n") || "";
 Deno.env.set("SUPABASE_URL", "http://stub.supabase.co");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "stub-service-key");
 Deno.env.set("SEND_PUSH_SECRET", "trigger-secret");
-Deno.env.set("PUSH_GATEWAY_URL", GATEWAY_URL);
-Deno.env.set("PUSH_GATEWAY_SECRET", "gw-secret");
+Deno.env.set("FIREBASE_SERVICE_ACCOUNT", JSON.stringify({
+  project_id: "demo-project",
+  client_email: "push-test@demo-project.iam.gserviceaccount.com",
+  private_key: `-----BEGIN PRIVATE KEY-----\n${pemEncoded}\n-----END PRIVATE KEY-----\n`,
+}));
+
+/* ---------- محاكاة OAuth2 + FCM HTTP v1 ---------- */
+type FcmRequest = { url: string; method: string; headers: Record<string, string>; body: any };
+const FCM_LOG: FcmRequest[] = [];
+(globalThis as any).__FCM_STATUS__ = (_body: any) => 200;
+const originalFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = String(input);
+  if (url === "https://oauth2.googleapis.com/token") {
+    const form = new URLSearchParams(String(init?.body || ""));
+    const assertion = form.get("assertion") || "";
+    const claimsPart = assertion.split(".")[1] || "";
+    const claims = JSON.parse(atob(claimsPart.replace(/-/g, "+").replace(/_/g, "/")));
+    (globalThis as any).__OAUTH_CLAIMS__ = claims;
+    return new Response(JSON.stringify({ access_token: "fcm-access-token", expires_in: 3600 }), { status: 200 });
+  }
+  if (url.includes("fcm.googleapis.com/v1/projects/demo-project/messages:send")) {
+    const body = JSON.parse(String(init?.body || "{}"));
+    FCM_LOG.push({
+      url,
+      method: String(init?.method || "GET"),
+      headers: {
+        authorization: new Headers(init?.headers).get("authorization") || "",
+        "content-type": new Headers(init?.headers).get("content-type") || "",
+      },
+      body,
+    });
+    const status = (globalThis as any).__FCM_STATUS__(body);
+    if (status >= 400) {
+      const errorCode = status === 404 ? "UNREGISTERED" : "INVALID_ARGUMENT";
+      return new Response(JSON.stringify({ error: { code: status, message: "mock FCM error", details: [{ errorCode }] } }), { status });
+    }
+    return new Response(JSON.stringify({ name: "projects/demo-project/messages/1" }), { status });
+  }
+  return originalFetch(input, init);
+}) as typeof fetch;
 
 /* ---------- قاعدة بيانات وهمية ---------- */
 const DB: Record<string, any[]> = {
@@ -59,29 +88,6 @@ const USERS: Record<string, any> = { "user-jwt": { id: "u-1111" } };
 (globalThis as any).__STUB_CALLS__ = [];
 (globalThis as any).__STUB_USERS__ = USERS;
 const STUB_CALLS: any[] = (globalThis as any).__STUB_CALLS__;
-
-/* ---------- محاكي بوابة الـ Worker ---------- */
-type GatewayRequest = { url: string; method: string; headers: Record<string, string>; body: any };
-const GW_LOG: GatewayRequest[] = [];
-// مصدر الحالة: دالة تُقرأ في كل طلب (يضبطها الاختبار بين السيناريوهات)
-(globalThis as any).__GW_STATUS__ = (_body: any) => 200;
-
-Deno.serve({ port: GATEWAY_PORT }, async (req) => {
-  const body = await req.json().catch(() => null);
-  GW_LOG.push({
-    url: req.url,
-    method: req.method,
-    headers: {
-      authorization: req.headers.get("authorization") || "",
-      "x-send-push-secret": req.headers.get("x-send-push-secret") || "",
-      "content-type": req.headers.get("content-type") || "",
-    },
-    body,
-  });
-  const status = (globalThis as any).__GW_STATUS__(body);
-  if (status >= 400) return new Response(JSON.stringify({ error: "gateway stub error" }), { status });
-  return new Response(JSON.stringify({ name: "projects/demo/messages/1" }), { status });
-});
 
 /* ---------- استيراد الدالة الحقيقية ---------- */
 await import(new URL("../../supabase/functions/send-push/index.ts", import.meta.url).href);
@@ -122,41 +128,41 @@ const resetStubCalls = () => { STUB_CALLS.length = 0; };
 /* ============================================================
  * السيناريو 1: إشعار تجريبي (JWT مستخدم) — عقد الطلب لكل جهاز
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 {
   const { status, json } = await post({ type: "test" }, { Authorization: "Bearer user-jwt" });
   check("test: استجابة 200 وأُرسل لجهازين", status === 200 && json?.sent === 2 && json?.total === 2, JSON.stringify(json?.error || ""));
-  check("test: طلبي POST إلى رابط البوابة الواحد", GW_LOG.length === 2 && GW_LOG.every((r) => r.url === GATEWAY_URL && r.method === "POST"));
+  check("test: طلبي POST إلى عنوان FCM HTTP v1 المباشر", FCM_LOG.length === 2 && FCM_LOG.every((r) => r.url === "https://fcm.googleapis.com/v1/projects/demo-project/messages:send" && r.method === "POST"));
 
-  const tokens = GW_LOG.map((r) => r.body?.token).sort();
+  const tokens = FCM_LOG.map((r) => r.body?.message?.token).sort();
   check("test: كل جهاز استلم توكنه الخاص", JSON.stringify(tokens) === JSON.stringify(["TOKEN_A", "TOKEN_DEAD"].sort()), tokens.join(","));
 
-  const req = GW_LOG[0];
+  const req = FCM_LOG[0];
   check(
-    "test: ترويستا المصادقة للبوابة (Authorization Bearer + x-send-push-secret)",
-    req.headers.authorization === "Bearer gw-secret" && req.headers["x-send-push-secret"] === "gw-secret",
+    "test: مصادقة FCM (Google OAuth Bearer، بلا سر Worker)",
+    req.headers.authorization === "Bearer fcm-access-token",
   );
   check("test: Content-Type: application/json", req.headers["content-type"].includes("application/json"));
   check(
     "test: جسم الطلب {token,title,body,data} — data مرآة للعرض (data-only)",
-    typeof req.body?.token === "string" &&
-      req.body?.title === "✅ الإشعارات تعمل" &&
-      typeof req.body?.body === "string" &&
-      req.body?.data?.title === req.body.title &&
-      req.body?.data?.type === "test" &&
-      Object.values(req.body?.data || {}).every((v) => typeof v === "string"),
+    typeof req.body?.message?.token === "string" &&
+      req.body?.message?.data?.title === "✅ الإشعارات تعمل" &&
+      typeof req.body?.message?.data?.body === "string" &&
+      req.body?.message?.data?.title === "✅ الإشعارات تعمل" &&
+      req.body?.message?.data?.type === "test" &&
+      Object.values(req.body?.message?.data || {}).every((v) => typeof v === "string"),
   );
   check(
     "test: تلميحا الأولوية (high) والصلاحية (60s) لأولوية عالية",
-    req.body?.priority === "high" && req.body?.ttlSeconds === 60,
-    `priority=${req.body?.priority} ttl=${req.body?.ttlSeconds}`,
+    req.body?.message?.android?.priority === "HIGH" && req.body?.message?.android?.ttl === "60s",
+    `priority=${req.body?.message?.android?.priority} ttl=${req.body?.message?.android?.ttl}`,
   );
 }
 
 /* ============================================================
  * السيناريو 2: رسالة جديدة — العزل والتسليم (delivered)
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 resetStubCalls();
 {
   const { status, json } = await post(
@@ -164,22 +170,22 @@ resetStubCalls();
     { "x-send-push-secret": "trigger-secret" },
   );
   check("new_message: أُرسل لمستلمٍ واحد (الطرف الآخر)", status === 200 && json?.sent === 1 && json?.total === 1);
-  check("new_message: وصل التوكن الخاص بالمشرف (a-2222)", GW_LOG[0]?.body?.token === "TOKEN_ADMIN");
+  check("new_message: وصل التوكن الخاص بالمشرف (a-2222)", FCM_LOG[0]?.body?.message?.token === "TOKEN_ADMIN");
   check(
     "new_message: أولوية رسالة الدردشة high بصلاحية يوم",
-    GW_LOG[0]?.body?.priority === "high" && GW_LOG[0]?.body?.ttlSeconds === 86400,
+    FCM_LOG[0]?.body?.message?.android?.priority === "HIGH" && FCM_LOG[0]?.body?.message?.android?.ttl === "86400s",
   );
   check(
     "new_message: data تحمل مفاتيح التوجيه",
-    GW_LOG[0]?.body?.data?.type === "new_message" &&
-      GW_LOG[0]?.body?.data?.messageId === "m-1" &&
-      GW_LOG[0]?.body?.data?.conversationId === "c-1" &&
-      GW_LOG[0]?.body?.data?.senderId === "u-1111",
+    FCM_LOG[0]?.body?.message?.data?.type === "new_message" &&
+      FCM_LOG[0]?.body?.message?.data?.messageId === "m-1" &&
+      FCM_LOG[0]?.body?.message?.data?.conversationId === "c-1" &&
+      FCM_LOG[0]?.body?.message?.data?.senderId === "u-1111",
   );
   check(
     "new_message: العنوان من اسم المرسل والمحتوى من الرسالة",
-    GW_LOG[0]?.body?.title === "سارة" && GW_LOG[0]?.body?.body === "مرحبا" &&
-      GW_LOG[0]?.body?.data?.title === "سارة",
+    FCM_LOG[0]?.body?.message?.data?.title === "سارة" && FCM_LOG[0]?.body?.message?.data?.body === "مرحبا" &&
+      FCM_LOG[0]?.body?.message?.data?.title === "سارة",
   );
   check("new_message: عُلّمت الرسالة delivered بعد النجاح", json?.delivered === true);
   const update = STUB_CALLS.find((c) => c.kind === "update" && c.table === "messages");
@@ -195,7 +201,7 @@ resetStubCalls();
 /* ============================================================
  * السيناريو 3+4: حراس العزل (بلا أي طلب شبكة)
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 {
   const a = await post(
     { message_id: "m-2", conversation_id: "c-2", sender_id: "u-1111" },
@@ -203,7 +209,7 @@ GW_LOG.length = 0;
   );
   check(
     "العزل: المرسل غير طرف في المحادثة ⇒ رفض مكتوم بلا إرسال",
-    a.status === 200 && a.json?.skipped === "sender is not a conversation party" && GW_LOG.length === 0,
+    a.status === 200 && a.json?.skipped === "sender is not a conversation party" && FCM_LOG.length === 0,
   );
 
   const b = await post(
@@ -212,19 +218,19 @@ GW_LOG.length = 0;
   );
   check(
     "العزل: تعارض المستلم المصرَّح به ⇒ رفض 409 بلا إرسال",
-    b.status === 409 && b.json?.skipped === "recipient mismatch" && GW_LOG.length === 0,
+    b.status === 409 && b.json?.skipped === "recipient mismatch" && FCM_LOG.length === 0,
   );
 
   const c = await post({ message_id: "m-4", conversation_id: "c-1", sender_id: "u-1111" }, { "x-send-push-secret": "WRONG" });
-  check("الأمان: سرّ خاطئ ⇒ 401 بلا إرسال", c.status === 401 && GW_LOG.length === 0);
+  check("الأمان: سرّ خاطئ ⇒ 401 بلا إرسال", c.status === 401 && FCM_LOG.length === 0);
 }
 
 /* ============================================================
- * السيناريو 5: حذف التوكن الميّت فقط (410 من البوابة)
+ * السيناريو 5: حذف التوكن الميّت فقط (404 UNREGISTERED من FCM)
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 resetStubCalls();
-(globalThis as any).__GW_STATUS__ = (body: any) => (body?.token === "TOKEN_DEAD" ? 410 : 200);
+(globalThis as any).__FCM_STATUS__ = (body: any) => (body?.message?.token === "TOKEN_DEAD" ? 404 : 200);
 {
   const { json } = await post({ type: "test" }, { Authorization: "Bearer user-jwt" });
   check(
@@ -236,18 +242,18 @@ resetStubCalls();
   const filters = JSON.stringify(del?.filters || []);
   check("توكن ميت: حُذف صف التوكن الميت حصراً (tok-2)", Boolean(del) && filters.includes("tok-2"), filters);
 }
-(globalThis as any).__GW_STATUS__ = (_body: any) => 200;
+(globalThis as any).__FCM_STATUS__ = (_body: any) => 200;
 
 /* ============================================================
  * السيناريو 6: المسبار من قاعدة البيانات (probe)
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 {
   const { status, json } = await post({ type: "probe", user_id: "a-2222" }, { "x-send-push-secret": "trigger-secret" });
   check("probe: أُرسل إشعار المسار الخلفي للمشرف", status === 200 && json?.sent === 1);
   check(
-    "probe: نفس مسار البوابة (عقد الطلب نفسه)",
-    GW_LOG.length === 1 && GW_LOG[0].body?.data?.type === "test" && GW_LOG[0].body?.ttlSeconds === 60,
+    "probe: نفس مسار FCM المباشر بعقد data-only وTTL قصير",
+    FCM_LOG.length === 1 && FCM_LOG[0].body?.message?.data?.type === "test" && FCM_LOG[0].body?.message?.android?.ttl === "60s",
   );
 }
 
@@ -255,7 +261,7 @@ GW_LOG.length = 0;
  * السيناريو 6b: ردّ المشرف العام في محادثة ليست طرفاً فيها (v2.13)
  * المستلم = المستخدم صاحب المحادثة حصراً (وليس المشرف المالك ولا غيره)
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 resetStubCalls();
 {
   const { status, json } = await post(
@@ -263,21 +269,21 @@ resetStubCalls();
     { "x-send-push-secret": "trigger-secret" },
   );
   check("super reply: ردّ المشرف العام مقبول (بلا 403/رفض عزل)", status === 200 && json?.sent === 1, JSON.stringify(json));
-  check("super reply: الإشعار ذهب للمستخدم صاحب المحادثة (TOKEN_CUSTOMER)", GW_LOG[0]?.body?.token === "TOKEN_CUSTOMER", GW_LOG[0]?.body?.token);
+  check("super reply: الإشعار ذهب للمستخدم صاحب المحادثة (TOKEN_CUSTOMER)", FCM_LOG[0]?.body?.message?.token === "TOKEN_CUSTOMER", FCM_LOG[0]?.body?.message?.token);
   check(
     "super reply: العنوان من اسم المشرف العام والمحتوى من ردّه",
-    GW_LOG[0]?.body?.title === "السوبر المجيب" && GW_LOG[0]?.body?.body === "رد المشرف العام",
+    FCM_LOG[0]?.body?.message?.data?.title === "السوبر المجيب" && FCM_LOG[0]?.body?.message?.data?.body === "رد المشرف العام",
   );
   check(
     "super reply: data تحمل معرّفات المحادثة والمرسل",
-    GW_LOG[0]?.body?.data?.conversationId === "c-3" && GW_LOG[0]?.body?.data?.senderId === "sup-4444",
+    FCM_LOG[0]?.body?.message?.data?.conversationId === "c-3" && FCM_LOG[0]?.body?.message?.data?.senderId === "sup-4444",
   );
 }
 
 /* ============================================================
  * السيناريو 7: new_user — إشعار جماعي لكل المشرفين النشطين
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 resetStubCalls();
 {
   const { status, json } = await post(
@@ -285,45 +291,45 @@ resetStubCalls();
     { "x-send-push-secret": "trigger-secret" },
   );
   check("new_user: أُشعر كل المشرفين النشطين الثلاثة (لثلاثة توكنات فقط)", status === 200 && json?.admins === 3 && json?.sent === 2, JSON.stringify(json));
-  const tokens = GW_LOG.map((r) => r.body?.token).sort();
+  const tokens = FCM_LOG.map((r) => r.body?.message?.token).sort();
   check("new_user: توكن كل مشرف يملك جهازاً على حدة", JSON.stringify(tokens) === JSON.stringify(["TOKEN_ADMIN", "TOKEN_SUPER"].sort()));
   check(
     "new_user: العنوان يحمل الاسم ومفتاح التوجيه userId",
-    GW_LOG[0]?.body?.data?.type === "new_user" &&
-      GW_LOG[0]?.body?.data?.userId === "u-1111" &&
-      String(GW_LOG[0]?.body?.title).includes("سارة"),
+    FCM_LOG[0]?.body?.message?.data?.type === "new_user" &&
+      FCM_LOG[0]?.body?.message?.data?.userId === "u-1111" &&
+      String(FCM_LOG[0]?.body?.message?.data?.title).includes("سارة"),
   );
 }
 
 /* ============================================================
  * السيناريو 8: إعادة المحاولة بعد 429 ثم نجاح
  * ============================================================ */
-GW_LOG.length = 0;
+FCM_LOG.length = 0;
 let attempts = 0;
-(globalThis as any).__GW_STATUS__ = (_body: any) => (++attempts === 1 ? 429 : 200);
+(globalThis as any).__FCM_STATUS__ = (_body: any) => (++attempts === 1 ? 429 : 200);
 {
   const { json } = await post({ type: "probe", user_id: "s-3333" }, { "x-send-push-secret": "trigger-secret" });
-  check("إعادة المحاولة: 429 ثم نجاح ⇒ sent=1 بمحاولتين", json?.sent === 1 && GW_LOG.length === 2, `attempts=${attempts}`);
+  check("إعادة المحاولة: 429 ثم نجاح ⇒ sent=1 بمحاولتين", json?.sent === 1 && FCM_LOG.length === 2, `attempts=${attempts}`);
 }
-(globalThis as any).__GW_STATUS__ = (_body: any) => 200;
+(globalThis as any).__FCM_STATUS__ = (_body: any) => 200;
 
 /* ============================================================
- * السيناريو 9: ⛔ حارس الحلقة (عملية فرعية)
+ * السيناريو 9: OAuth service-account claims صحيحة ومباشرة
  * ============================================================ */
 {
-  const deno = new Deno.Command(Deno.execPath(), {
-    args: [
-      "run",
-      "--allow-all",
-      "--import-map",
-      new URL("./import-map.json", import.meta.url).pathname,
-      new URL("./loop-guard-check.ts", import.meta.url).pathname,
-    ],
-    stdout: "piped",
-    stderr: "piped",
-  });
-  const { code, stdout } = await deno.output();
-  check("⛔ حارس الحلقة: رفض بوابة تشير إلى دالة Supabase نفسها", code === 0, new TextDecoder().decode(stdout).trim());
+  const claims = (globalThis as any).__OAUTH_CLAIMS__;
+  check(
+    "JWT حساب الخدمة يحمل scope/audience الصحيحين لإرسال FCM",
+    claims?.iss === "push-test@demo-project.iam.gserviceaccount.com" &&
+      claims?.scope === "https://www.googleapis.com/auth/firebase.messaging" &&
+      claims?.aud === "https://oauth2.googleapis.com/token" &&
+      claims?.exp > claims?.iat,
+  );
+  check(
+    "FCM يقبل طلباً مباشراً مع bearer OAuth وdata-only",
+    FCM_LOG.every((r) => r.url.includes("fcm.googleapis.com/v1/projects/demo-project/messages:send") &&
+      r.headers.authorization === "Bearer fcm-access-token"),
+  );
 }
 
 console.log(fails ? `\n❌ SEND-PUSH RUNTIME TESTS FAILED: ${fails}` : "\nSEND-PUSH RUNTIME TESTS PASSED");

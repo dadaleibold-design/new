@@ -180,67 +180,45 @@ npm run env:check   # التأكد من وجود كل متغيرات البيئ�
 5. **نفّذ قسم 8 و 9 من `sql/schema.sql`** في SQL Editor (جدول `fcm_tokens` + صلاحيات).
 6. من داخل التطبيق: **الإعدادات ⚙️ → تفعيل إشعارات الجهاز**.
 
-### نشر Edge Function للإشعارات + بوابة الـ Worker (v2.12)
+### نشر Edge Function للإشعارات (الإرسال المباشر إلى FCM)
 
-> **البنية بعد v2.12 (2026-10-15)**: دالة `send-push` هي **طبقة الأمان والتحقق فقط**
-> (عزل المستلمين، التحقق من المحادثة وغرفة المكالمة وقواعد المشرفين) ولا تتصل بـ FCM
-> مباشرة ولا تولّد توكنات Google OAuth2/JWT. الإرسال النهائي عبر **Cloudflare Worker**:
->
-> ```
-> Database Trigger ➔ Edge Function send-push (أمان/عزل) ➔ Cloudflare Worker ➔ FCM ➔ firebase-messaging-sw.js
-> ```
->
-> لكل جهاز مستلم يرسل `send-push` POST واحداً إلى الـ Worker بالشكل:
-> `{ "token": "...", "title": "...", "body": "...", "data": { ... } }`.
+المسار الحالي مبسّط: `Database Trigger → pg_net → send-push (تحقق وعزل) → FCM HTTP v1 → Service Worker`.
+لا يوجد Worker وسيط. بذلك تُرجع الدالة أكواد وأخطاء FCM الأصلية، وتضبط `priority: high` وTTL
+مباشرةً لكل رسالة. ما زالت قواعد التحقق وعزل المستلمين وتعدد الأجهزة كما هي.
 
 ```bash
 supabase functions deploy send-push
 
-# أسرار الدالة (Edge Function Secrets) — لا أسرار Firebase هنا بعد الآن:
+# أسرار Supabase Edge Function (أسرار سيرفرية فقط):
 supabase secrets set \
   SEND_PUSH_SECRET="ضع-سراً-عشوائياً-طويلاً" \
-  PUSH_GATEWAY_URL="https://nameless-dew-aac1.aabntlal680.workers.dev/" \
-  PUSH_GATEWAY_SECRET="سر-مصادقة-الـWorker"
-# ملاحظات:
-#  • SEND_PUSH_URL مقبول بديلاً عن PUSH_GATEWAY_URL داخل أسرار الدالة.
-#  • إن لم يُضبَط PUSH_GATEWAY_SECRET يُستخدم SEND_PUSH_SECRET بديلاً.
-#  ⛔ حارس الحلقة: أي رابط بوابة يحوي /functions/v1/ يُرفض عند الإقلاع.
+  FIREBASE_SERVICE_ACCOUNT="$(cat /مسار-آمن/service-account.json)"
 ```
 
-أما **أسرار Firebase** (`FIREBASE_SERVICE_ACCOUNT` أو
-`FIREBASE_PROJECT_ID` + `FIREBASE_CLIENT_EMAIL` + `FIREBASE_PRIVATE_KEY`)
-فأصبحت ملكاً للـ Worker — هو الطرف الذي يوقّع طلبات FCM الآن:
+بدلاً من JSON كامل، يمكن ضبط `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`,
+`FIREBASE_PRIVATE_KEY` كلٌّ على حدة. أنشئ حساب خدمة من Firebase/Google Cloud يملك صلاحية إرسال
+FCM (Firebase Cloud Messaging API)، واحفظ الملف/المفتاح الخاص في أسرار Edge Function فقط،
+ولا تضعه في Git أو في متغيرات الواجهة `VITE_*`. يُخزّن OAuth access token مؤقتاً في الذاكرة
+ويُجدّد قرب انتهاء صلاحيته. `PUSH_NORMAL_URGENCY=1` اختياري لتخفيض أولوية الرسائل؛ الافتراضي
+`high`، ومكالمات/اختبارات الإشعار تستخدم TTL قصيراً (60 ثانية) بينما الرسائل تستخدم 24 ساعة.
 
-```bash
-# داخل مجلد الـ Cloudflare Worker:
-wrangler secret put FIREBASE_SERVICE_ACCOUNT   # أو الحقول الثلاثة منفصلة
-```
-
-وبعد ذلك خزّن رابط **الدالة** (لا الـ Worker) والسر نفسه في Supabase Vault
-للـ Triggers، ثم طبّق Trigger الرسائل من `sql/schema.sql`:
+في Supabase Vault للـ Triggers، خزّن رابط Edge Function نفسه و`SEND_PUSH_SECRET`، إضافة إلى
+مفتاح API الخاص بالمشروع. يقبل المسار مفتاح JWT القديم، أو `sb_publishable_*` الحديث:
+المفتاح الحديث يُرسل في `apikey` فقط (لا يوضع خطأً كـ `Authorization: Bearer`، لأنه ليس JWT).
+يظل `x-send-push-secret` هو التحقق الداخلي الحاسم، و`verify_jwt = false` مطلوب لاستدعاءات
+`pg_net` غير المرتبطة بجلسة مستخدم.
 
 ```sql
 select vault.create_secret(
   'https://YOUR-PROJECT-REF.supabase.co/functions/v1/send-push',
-  'SEND_PUSH_URL',
-  'رابط دالة إرسال الإشعارات'
+  'SEND_PUSH_URL', 'رابط دالة الإشعارات'
 );
-select vault.create_secret(
-  'ضع-سراً-عشوائياً-طويلاً',
-  'SEND_PUSH_SECRET',
-  'سر استدعاء دالة الإشعارات'
-);
+select vault.create_secret('ضع-سراً-عشوائياً-طويلاً', 'SEND_PUSH_SECRET', 'سر الإشعارات');
+select vault.create_secret('sb_publishable_...', 'SUPABASE_ANON_KEY', 'مفتاح API العام');
 ```
 
-> ⚠️ **انتبه إلى التمييز**: قيمة Vault باسم `SEND_PUSH_URL` تبقى **رابط دالة
-> send-push** لأنها ما تستدعيه التريگرات (تجاوزها بالتوجيه إلى `workers.dev`
-> يعني تجاوز كل قواعد الأمان والعزل — دالة `push_gateway_check()` (v2.12) ترصد
-> ذلك وتحذّر منه). أما رابط الـ Worker فيوضع في **أسرار الدالة**
-> (`PUSH_GATEWAY_URL` أو `SEND_PUSH_URL`). متجرّان مختلفان بقيمتين مختلفتين.
-
-لا تضع `FIREBASE_PRIVATE_KEY` أو `SEND_PUSH_SECRET` في JavaScript أو في مستودع Git.
-كل أسرار الدالة تُقرأ من `Deno.env.get()` فقط، ولا توجد قيمة واحدة مكتوبة داخل الكود
-(اختبارا `tests/env-config.mjs` و`tests/push-gateway.mjs` يتحققان من ذلك في كل تشغيل).
+طبّق `sql/migrations/2026-10-18_v2_14_push_auth_key_compat.sql` على قواعد البيانات القائمة؛
+`sql/schema.sql` يتضمن التعديل للتثبيت الجديد. لا تحتاج إلى أي أسرار أو إعدادات Cloudflare Worker.
 
 > ملاحظة: iOS Safari لا يدعم FCM Web Push إلا عندما يكون التطبيق **مثبّتاً كـ PWA** على
 > الشاشة الرئيسية (iOS 16.4+)، تماماً كحال Web Push العادي.
@@ -426,16 +404,15 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **الإشعارات في الخلفية** — قائمة التحقق بعد النشر:
   1. نفّذ `sql/migrations/2026-09-21_v2_1_unread_push.sql` (Triggers لا تكسر الإدراج + جدول `push_delivery_log` للتشخيص).
   2. في Vault: `SEND_PUSH_URL` = `https://<project>.supabase.co/functions/v1/send-push` و `SEND_PUSH_SECRET`،
-     و**`SUPABASE_ANON_KEY`** (المفتاح العام للمشروع — مطلوب لترويسة `Authorization` عند استدعاء الدالة).
-     لا يوجد مفتاح مكتوب في الكود بعد v2.11؛ إن لم يُضبط يسجّل `push_delivery_log` الحالة `SKIPPED` ولا يُرسل شيء.
-  3. `supabase functions deploy send-push --no-verify-jwt` (أو اعتمد `supabase/config.toml`) وضبط `SEND_PUSH_SECRET` و `PUSH_GATEWAY_URL`/`PUSH_GATEWAY_SECRET` (بوابة Cloudflare Worker — v2.12) كأسرار للدالة.
+     و`SUPABASE_ANON_KEY` في Vault (JWT قديم أو `sb_publishable_*` حديث؛ طبّق migration v2.14 لتجاوز حالة SKIPPED للمفتاح الجديد).
+  3. انشر `send-push` مع `verify_jwt = false`، واضبط `SEND_PUSH_SECRET` وحساب خدمة Firebase كأسرار للدالة. الإرسال الحالي مباشر من الدالة إلى FCM HTTP v1؛ لا Worker مطلوب.
   4. من التطبيق: **🔔 إرسال إشعار تجريبي** ثم أغلق التطبيق — يجب أن يصل. إن لم يصل راجع `select * from push_delivery_log order by id desc`.
 - اختبارات دخانية: `cd tests && npm i jsdom && node smoke.mjs user|admin|super`.
 
 ## الإصدار v2.2 — تشخيص الإشعارات + حذف المستخدم الشامل
 - زر **🔔 إرسال إشعار تجريبي** يعرض الآن تقريراً خطوة بخطوة (HTTPS، الإذن، Service Worker، إشعار محلي فوري، توكن FCM، pg_net/Vault/Triggers عبر `push_diagnostics()`, ثم الإرسال الفعلي عبر `send-push`).
 - **سبب عدم وصول الإشعارات حالياً**: دالة `send-push` غير منشورة على المشروع (تعيد 404). الحل:
-  `supabase functions deploy send-push --no-verify-jwt` + ضبط الأسرار `PUSH_GATEWAY_URL / PUSH_GATEWAY_SECRET / SEND_PUSH_SECRET` (أسرار Firebase انتقلت إلى الـ Worker — v2.12)، ثم Vault: `SEND_PUSH_URL`, `SEND_PUSH_SECRET`، ثم تنفيذ migrations v2.1 و v2.2.
+  `supabase functions deploy send-push --no-verify-jwt` + ضبط الأسرار `SEND_PUSH_SECRET` وبيانات حساب خدمة Firebase (FCM مباشر)، ثم Vault: `SEND_PUSH_URL`, `SEND_PUSH_SECRET`، ثم تنفيذ migrations v2.1 و v2.2.
 - إشعار مرئي محلي عند وصول رسالة Realtime والتطبيق مفتوح في محادثة/تبويب آخر (لا يعتمد على FCM).
 - `admin_delete_user`: متاح لكل مشرف (`is_admin` أو `is_super_admin`)، يحذف: التخزين (مرفقات/أفاتار/خلفيات)، التفاعلات، الرسائل، الكتابة، المكالمات وسجلاتها، المحادثات، توكنات FCM، الملف الشخصي، وحساب `auth.users`؛ ويعيد إحصاءات ما حُذف. `reply_to_id` أصبح `on delete set null` حتى لا يعيق الحذف.
 - إجراءات الرسالة مخفية لكل الأدوار حتى النقر على الفقاعة.
@@ -490,7 +467,10 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   فتعمل اختبارات PostgreSQL فعلياً في `npm ci` (كانت تتخطّى صامتةً).
 - **الاختبار**: `npm run test:rls` (تدقيق العزل والصلاحيات على PostgreSQL حقيقي) ضمن `npm test`.
 
-## الإصدار v2.12 — بوابة الإرسال عبر Cloudflare Worker (فصل الأمان عن التنفيذ)
+## الإصدار v2.12 — (تاريخي) بوابة الإرسال عبر Cloudflare Worker
+
+> **تنبيه:** هذا القسم يوثّق إصداراً سابقاً فقط؛ تم إلغاء وسيط Worker في v2.14. البنية الحالية وخطوات النشر الصحيحة أعلاه: `send-push → FCM HTTP v1` مباشرة.
+
 
 الهجرة: `sql/migrations/2026-10-15_v2_12_push_gateway_worker.sql` (مطابقة لما في `sql/schema.sql` §18).
 النشر: `supabase functions deploy send-push` بعد ضبط أسرار البوابة (انظر قسم النشر أعلاه).
@@ -517,6 +497,14 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **اختبار تشغيلي فعلي** (اختياري، يتطلب Deno): `npm run test:gateway:runtime` يشغّل
   ملف `send-push/index.ts` الحقيقي ضد محاكي Worker وعميل Supabase وهمي ويتحقق من عقد
   الطلب `{token,title,body,data}` والترويستين وحراس العزل وحذف التوكن الميت وحارس الحلقة.
+
+## الإصدار v2.14 — FCM مباشر + دعم مفاتيح Supabase الجديدة
+
+الهجرة: `sql/migrations/2026-10-18_v2_14_push_auth_key_compat.sql`.
+- أزيل اعتماد الإرسال الفعلي على Cloudflare Worker؛ Edge Function تنشئ OAuth2 access token بحساب الخدمة وترسل FCM HTTP v1 مباشرة.
+- تضبط `android.priority`, `android.ttl`, و`webpush.headers.Urgency/TTL` في نفس الطلب؛ تُحفظ أخطاء FCM الأصلية بدلاً من أي رد 200 وسيط.
+- `push_call_edge` يقبل JWT القديم أو `sb_publishable_*`/`sb_secret_*`: المفاتيح الجديدة تذهب في `apikey` فقط، ولا تُرسل كـ Bearer غير صالح. يبقى `x-send-push-secret` التحقق الداخلي.
+- `firebase-messaging-sw.js` في المشروع الحالي يعالج push الخام data-only حتى عند غياب `env.js` أو فشل تحميل Firebase SDK؛ لا حاجة لاستبداله بالنسخة المرفقة الأقدم.
 
 ## الإصدار v2.13 — كتابة كاملة للمشرف العام + إصلاح إغراق حالة الكتابة
 
