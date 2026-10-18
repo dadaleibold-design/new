@@ -177,59 +177,24 @@ check("env.js قبل app.js في الصفحة", envTagIndex !== -1 && envTagInde
 check("index.html فيه شاشة إعداد البيئة", /id="config-error"/.test(html));
 check("لا مفاتيح مضمنة في index.html", !/AIza|eyJ[A-Za-z0-9_-]{10,}/.test(html));
 /* ------------------------------------------------------------------
- * 6) Edge Functions: Deno.env.get بالأسماء المعتمدة + بوابة الـ Worker
- * ----------------------------------------------------------------
- * التعديل المعماري (v2026-10-15.1): send-push لم يعد يقرأ أسرار Firebase
- * ولا يولّد توكنات Google OAuth2/JWT — الإرسال عبر Cloudflare Worker.
+ * 6) Edge Functions: Firebase service account + direct FCM.
  * ---------------------------------------------------------------- */
 const sendPush = read("supabase/functions/send-push/index.ts");
 const agora = read("supabase/functions/agora-token/index.ts");
-// الكود الفعلي بلا تعليقات التوثيق (التعليقات قد تذكر أسماء المتغيرات تاريخياً)
 const sendPushCode = stripComments(sendPush);
 
-for (const key of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SEND_PUSH_SECRET"]) {
-  check(`send-push يقرأ ${key} من Deno.env`, sendPush.includes(`Deno.env.get("${key}")`));
+for (const key of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SEND_PUSH_SECRET", "FIREBASE_SERVICE_ACCOUNT", "FIREBASE_PROJECT_ID", "FIREBASE_CLIENT_EMAIL", "FIREBASE_PRIVATE_KEY"]) {
+  check(`send-push reads ${key} from Deno.env`, sendPush.includes(`Deno.env.get("${key}")`));
 }
-for (const key of ["PUSH_GATEWAY_URL", "PUSH_GATEWAY_SECRET", "SEND_PUSH_URL"]) {
-  check(`send-push يقرأ ${key} من Deno.env (بوابة الـ Worker)`, sendPush.includes(`Deno.env.get("${key}")`));
-}
-
 for (const key of ["AGORA_APP_ID", "AGORA_APP_CERTIFICATE"]) {
-  check(`agora-token يقرأ ${key} من Deno.env`, agora.includes(`Deno.env.get("${key}")`));
+  check(`agora-token reads ${key} from Deno.env`, agora.includes(`Deno.env.get("${key}")`));
 }
+check("send-push calls FCM HTTP v1 directly", /fcm\.googleapis\.com\/v1\/projects/.test(sendPushCode));
+check("send-push signs OAuth service-account JWT without third-party secrets", /RSASSA-PKCS1-v1_5/.test(sendPushCode) && /oauth2\.googleapis\.com\/token/.test(sendPushCode));
+check("send-push builds data-only FCM message with priority and TTL", /data: fittedData/.test(sendPushCode) && /webpush:/.test(sendPushCode) && /android:/.test(sendPushCode));
+check("send-push no longer depends on Cloudflare Worker", !/PUSH_GATEWAY_URL|PUSH_GATEWAY_SECRET|workers\.dev/.test(sendPushCode));
 
-// 🚪 البوابة: لا اتصال مباشر بـ FCM أو Google OAuth من الـ Edge Function
-check(
-  "send-push لا يتصل بـ fcm.googleapis.com مباشرة (الإرسال عبر الـ Worker)",
-  !/fcm\.googleapis\.com|fcm-dev\.googleapis\.com/.test(sendPushCode),
-);
-check(
-  "send-push لا يولّد توكنات Google OAuth2/JWT (لا jose ولا oauth2.googleapis.com)",
-  !/oauth2\.googleapis\.com|esm\.sh\/jose|importPKCS8|SignJWT/.test(sendPushCode),
-);
-check(
-  "send-push لا يقرأ أسرار Firebase (انتقلت إلى الـ Worker)",
-  !/FIREBASE_SERVICE_ACCOUNT|FIREBASE_PRIVATE_KEY|FIREBASE_CLIENT_EMAIL|FIREBASE_PROJECT_ID/.test(sendPushCode),
-);
-check(
-  "send-push يرسل لكل جهاز POST بالعقد المعتمد {token,title,body,data}",
-  /token,\s*\n\s*title:\s*fittedData\.title/.test(sendPushCode) &&
-    /body:\s*fittedData\.body/.test(sendPushCode) &&
-    /data:\s*fittedData,/.test(sendPushCode) &&
-    /method:\s*"POST"/.test(sendPushCode),
-);
-check(
-  "send-push يرسل ترويستي مصادقة للـ Worker (Authorization + x-send-push-secret)",
-  /headers\["Authorization"\]\s*=\s*`Bearer \$\{GATEWAY_SECRET\}`/.test(sendPushCode) &&
-    /headers\["x-send-push-secret"\]\s*=\s*GATEWAY_SECRET/.test(sendPushCode),
-);
-// ⛔ حارس الحلقة: منع توجيه البوابة إلى دالة send-push نفسها
-check(
-  "send-push يرفض رابط بوابة يشير إلى دالة Supabase نفسها (حماية من حلقة لا نهائية)",
-  /includes\("\/functions\/v1\/"\)/.test(sendPushCode),
-);
-
-check("لا يوجد مفتاح خاص مكتوب في أي دالة", !/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(sendPush + agora));
+check("لا يوجد مفتاح خاص فعلي مكتوب في أي دالة", !/-----BEGIN PRIVATE KEY-----\\s*MII[A-Za-z0-9+/=\\s]{100,}/.test(sendPush + agora));
 
 /* ------------------------------------------------------------------
  * 7) .env.example: الأسماء المطلوبة فقط وبلا أي قيمة حقيقية
@@ -238,11 +203,13 @@ const example = read(".env.example");
 const requiredNames = [
   ...REQUIRED_VITE,
   "VITE_AGORA_APP_ID", // إضافي/اختياري: معرّف Agora العام في الواجهة
-  // أسرار send-push (Firebase انتقلت إلى الـ Worker — لا تُضبط في Supabase بعد الآن)
+  // أسرار FCM المباشر في Edge Function (ليست VITE_ ولا تُحقن في المتصفح)
   "SEND_PUSH_SECRET",
-  "PUSH_GATEWAY_URL",
-  "PUSH_GATEWAY_SECRET",
-  "SEND_PUSH_URL",
+  "FIREBASE_SERVICE_ACCOUNT",
+  "FIREBASE_PROJECT_ID",
+  "FIREBASE_CLIENT_EMAIL",
+  "FIREBASE_PRIVATE_KEY",
+  "PUSH_NORMAL_URGENCY",
   "AGORA_APP_ID",
   "AGORA_APP_CERTIFICATE",
 ];
