@@ -19,7 +19,7 @@
 const PENDING_KEY = "wa_pending_route";
 const PENDING_TS_KEY = "wa_pending_route_at";
 const ROUTE_TTL_MS = 30 * 60 * 1000;
-const URL_KEYS = ["conversation", "message", "answer_call", "decline_call", "user"];
+const URL_KEYS = ["conversation", "message", "room_id", "answer_call", "decline_call", "user"];
 
 let handler = null;
 let initialized = false;
@@ -69,19 +69,21 @@ export function routeFromUrl(href = (typeof location !== "undefined" ? location.
     const url = new URL(href);
     const conversationId = url.searchParams.get("conversation");
     const messageId = url.searchParams.get("message");
+    const roomId = url.searchParams.get("room_id");
     const answerCall = url.searchParams.get("answer_call");
     const declineCall = url.searchParams.get("decline_call");
     const userId = url.searchParams.get("user");
+    const incomingRoomId = roomId || answerCall;
 
-    if (!conversationId && !answerCall && !declineCall && !userId) return null;
+    if (!conversationId && !incomingRoomId && !declineCall && !userId) return null;
 
     return {
       conversationId: conversationId || null,
       messageId: messageId || null,
-      roomId: answerCall || declineCall || null,
+      roomId: incomingRoomId || declineCall || null,
       userId: userId || null,
-      type: answerCall ? "incoming_call" : declineCall ? "call_decline" : userId ? "new_user" : "message",
-      action: answerCall ? "answer" : declineCall ? "decline" : "open",
+      type: incomingRoomId ? "incoming_call" : declineCall ? "call_decline" : userId ? "new_user" : "message",
+      action: incomingRoomId ? "answer" : declineCall ? "decline" : "open",
       at: Date.now(),
       source: "url",
     };

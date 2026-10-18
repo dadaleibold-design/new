@@ -21,7 +21,7 @@
  *     أصلاً إلى الجهاز، ومن قرّر العرض أو التخطّي ولماذا.
  * ============================================================ */
 
-const SW_BUILD = "2026-10-15.2";
+const SW_BUILD = "2026-10-18.1";
 const LOG = "[push-sw]";
 self.__WA_MESSAGING_SW_BUILD = SW_BUILD;
 
@@ -206,7 +206,7 @@ function buildPayload({ data, title, body, icon }) {
     messageId,
     type,
     roomId,
-    isCall: type === "incoming_call",
+    isCall: type === "incoming_call" || type === "call",
     isCallEnded: type === "call_ended",
   };
 }
