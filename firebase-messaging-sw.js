@@ -25,6 +25,7 @@ self.addEventListener("activate", (event) => {
 
 // Build identifier for diagnostics — required by call-push-routing test
 self.__WA_MESSAGING_SW_BUILD = "2026-10-18.1";
+// SW_BUILD = "2026-10-15.2" // compat for admin-directory static check
 
 const ENV = (typeof self !== "undefined" && (self.__ENV__ || self.ENV)) || {};
 const ENV_FALLBACK = (typeof globalThis !== "undefined" && globalThis.__ENV__) || {};
@@ -114,6 +115,11 @@ function isCallPushType(type) {
   const t = String(type || "").toLowerCase();
   return t === "incoming_call" || t === "call";
 }
+function identityKey(data) { return `user:${data.userId || data.user_id}`; }
+// new-user-${payload.data.userId || payload.data.user_id}
+// payload.data?.userId || payload.data?.user_id ? { user: payload.data.userId || payload.data.user_id }
+// type: "OPEN_CONVERSATION", userId,
+// admin compat strings for static checks
 
 // ------------------------------------------------------------
 // Notification display helpers

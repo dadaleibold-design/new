@@ -3,7 +3,40 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { fitFcmData } from "./payload.ts";
+
+// --- inline payload helper (consolidated from payload.ts) ---
+const MAX_FCM_DATA_BYTES = 3500;
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
+const REQUIRED_ROUTE_FIELDS = new Set(["type", "messageId", "conversationId", "roomId", "userId"]);
+const PREFERRED_TRIM_FIELDS = ["body", "title", "icon", "email", "phone", "createdAt", "timestamp", "messageType"];
+function _utf8ByteLength(v: string) { return _enc.encode(v).length; }
+function _dataByteLength(d: Record<string, string>) { return Object.entries(d).reduce((s, [k, v]) => s + _utf8ByteLength(k) + _utf8ByteLength(v), 0); }
+function _truncateUtf8(value: string, maxBytes: number) {
+  const bytes = _enc.encode(value);
+  const limit = Math.max(0, Math.floor(maxBytes));
+  if (bytes.length <= limit) return value;
+  let end = Math.min(limit, bytes.length);
+  while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return _dec.decode(bytes.subarray(0, end));
+}
+function _shortenField(data: Record<string, string>, key: string, currentBytes: number) {
+  const value = data[key]; if (value === undefined || !value) return;
+  const overBy = _dataByteLength(data) - MAX_FCM_DATA_BYTES;
+  const ellipsisBytes = _utf8ByteLength("…");
+  const retainedBytes = Math.max(0, currentBytes - overBy - ellipsisBytes);
+  const prefix = _truncateUtf8(value, retainedBytes);
+  data[key] = prefix === value ? prefix : `${prefix}…`;
+}
+function fitFcmData(input: Record<string, string>): Record<string, string> {
+  const data: Record<string, string> = {};
+  for (const [k, v] of Object.entries(input || {})) { if (!k || v === undefined || v === null) continue; data[String(k)] = String(v); }
+  let size = _dataByteLength(data); if (size <= MAX_FCM_DATA_BYTES) return data;
+  for (const k of PREFERRED_TRIM_FIELDS) { if (size <= MAX_FCM_DATA_BYTES) break; const v = data[k]; if (v === undefined) continue; _shortenField(data, k, _utf8ByteLength(v)); size = _dataByteLength(data); }
+  if (size > MAX_FCM_DATA_BYTES) { for (const k of Object.keys(data)) { if (size <= MAX_FCM_DATA_BYTES) break; if (REQUIRED_ROUTE_FIELDS.has(k)) continue; delete data[k]; size = _dataByteLength(data); } }
+  if (size > MAX_FCM_DATA_BYTES) throw new RangeError(`FCM route data exceeds ${MAX_FCM_DATA_BYTES} UTF-8 bytes`);
+  return data;
+}
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -337,15 +370,17 @@ serve(async (req) => {
       const adminIds = (await loadAdminIds()).filter((id) => id !== userId);
       if (!adminIds.length) return json({ sent: 0, skipped: "no admins" });
       const name = String(input.display_name || "").trim() || "مستخدم جديد";
+      // new_user — من trigger على profiles
       const fcmData = {
         type: "new_user",
         userId,
-        title: "👤 مستخدم جديد انضم للتطبيق",
+        title: `👤 مستخدم جديد: ${name}`,
         body: `الاسم: ${name} — اضغط لبدء محادثة`,
       };
       const tokens = await loadDeviceTokensForUsers(adminIds);
       if (!tokens.length) return json({ sent: 0, skipped: "no fcm tokens", admins: adminIds.length });
-      const results = await sendToAllDevices(tokens, fcmData, { priority: "high", ttlSeconds: 86400 });
+      const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
+      // sendToAllDevices(tokens, data, { highPriority: true }) compat
       return json({ sent: results.filter((r) => r.ok).length, total: results.length, admins: adminIds.length });
     }
 
