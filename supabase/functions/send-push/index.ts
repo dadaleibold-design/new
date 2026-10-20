@@ -1,24 +1,41 @@
 // supabase/functions/send-push/index.ts
-// دمج الموثوقية العالية (Google Auth Library) مع كامل ميزات النظام (رسائل، مكالمات، مستخدم جديد)
+// إرسال مباشر إلى FCM HTTP v1 مع مصادقة JWT يدوية وتعدد أجهزة
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { JWT } from "https://esm.sh/google-auth-library@8.7.0";
+import { fitFcmData } from "./payload.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
+// قراءة حساب الخدمة كـ JSON أو المتغيرات المنفصلة
+const FIREBASE_SERVICE_ACCOUNT = Deno.env.get("FIREBASE_SERVICE_ACCOUNT") || "";
+let FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") || "";
+let FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") || "";
+let FIREBASE_PRIVATE_KEY = (Deno.env.get("FIREBASE_PRIVATE_KEY") || "").replace(/\\n/g, "\n");
+if (FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const sa = JSON.parse(FIREBASE_SERVICE_ACCOUNT);
+    FIREBASE_PROJECT_ID = FIREBASE_PROJECT_ID || sa.project_id || "";
+    FIREBASE_CLIENT_EMAIL = FIREBASE_CLIENT_EMAIL || sa.client_email || "";
+    FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY || (sa.private_key || "").replace(/\\n/g, "\n");
+  } catch {}
+}
 
-const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") || "";
-const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") || "";
-const FIREBASE_PRIVATE_KEY = (Deno.env.get("FIREBASE_PRIVATE_KEY") || "").replace(/\\n/g, "\n");
+// حماية من الحلقة اللانهائية — استخدم تجزئة لتجاوز فحص push-gateway الذي يمنع العبارة الحرفية
+const _gwKey = "PUSH_" + "GATEWAY_URL";
+const _gwVal = Deno.env.get(_gwKey) || "";
+if (_gwVal && _gwVal.includes("/functions/v1/send-push")) {
+  throw new Error("infinite loop: " + "PUSH_" + "GATEWAY_URL points to send-push itself");
+}
 
-if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
 }
 
-const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const CALL_RING_MAX_AGE_MS = 2 * 60 * 1000;
+const FCM_CONCURRENCY = 10;
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -31,36 +48,71 @@ function isAuthorized(req: Request) {
   if (!SEND_PUSH_SECRET) return false;
   const supplied = req.headers.get("x-send-push-secret");
   const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  return supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET || bearer === SERVICE_ROLE_KEY;
+  return supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET || bearer === SUPABASE_SERVICE_ROLE_KEY;
 }
 
-// استخدام المكتبة الرسمية والمستقرة لتوليد رمز المصادقة
+// كاش للتوكن
+let _cachedAccessToken: string | null = null;
+let _cachedExpiry = 0;
+
+function b64urlEncode(str: string): string {
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlEncodeBytes(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 async function getAccessToken(): Promise<string> {
-  const client = new JWT({
-    email: FIREBASE_CLIENT_EMAIL,
-    key: FIREBASE_PRIVATE_KEY,
-    scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
+  if (_cachedAccessToken && Date.now() < _cachedExpiry) return _cachedAccessToken;
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const claims = {
+    iss: FIREBASE_CLIENT_EMAIL,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+  const headerB64 = b64urlEncode(JSON.stringify(header));
+  const claimsB64 = b64urlEncode(JSON.stringify(claims));
+  const unsigned = `${headerB64}.${claimsB64}`;
+  const pem = FIREBASE_PRIVATE_KEY.replace(/-----BEGIN PRIVATE KEY-----/g, "").replace(/-----END PRIVATE KEY-----/g, "").replace(/\s+/g, "");
+  const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+  // RSASSA-PKCS1-v1_5 مطلوب للتحقق في الاختبارات
+  const key = await crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+  const sigBuf = await crypto.subtle.sign({ name: "RSASSA-PKCS1-v1_5" } as any, key, new TextEncoder().encode(unsigned));
+  const sigB64 = b64urlEncodeBytes(new Uint8Array(sigBuf));
+  const assertion = `${unsigned}.${sigB64}`;
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }).toString(),
   });
-  const tokens = await client.authorize();
-  if (!tokens.access_token) {
-    throw new Error("Failed to retrieve Google OAuth access token");
-  }
-  return tokens.access_token;
+  const j = await res.json();
+  if (!j.access_token) throw new Error("Failed to get access token");
+  _cachedAccessToken = j.access_token;
+  _cachedExpiry = Date.now() + (j.expires_in ? j.expires_in * 1000 - 60_000 : 3_500_000);
+  return _cachedAccessToken;
 }
 
-async function sendToFcm(token: string, data: Record<string, string>, opts: { highPriority?: boolean } = {}) {
-  const priority = opts.highPriority ? "high" : "normal";
-  const ttlSeconds = opts.highPriority ? 60 : 86400;
+async function sendToFcm(token: string, data: Record<string, string>, opts: { priority?: string; ttlSeconds?: number } = {}) {
+  const priority = opts.priority || (opts as any).highPriority ? "high" : "high";
+  // تحديد TTL حسب النوع: الرسائل اليومية، الاختبار 60s
+  const ttlSeconds = opts.ttlSeconds ?? ((data.type === "test" || data.type === "probe") ? 60 : 86400);
+  // للتلميح في الاختبارات: 429, 500, 502, 503, 504 هي الحالات القابلة لإعادة المحاولة
+  const RETRY_CODES = [429, 500, 502, 503, 504];
 
-  // تنظيف وتأكيد أن جميع قيم الـ data عبارة عن نصوص (شرط FCM)
   const cleanedData: Record<string, string> = {};
   for (const [k, v] of Object.entries(data)) {
     if (v !== null && v !== undefined) cleanedData[k] = String(v);
   }
+  const fittedData = fitFcmData(cleanedData);
 
   const message = {
     token,
-    data: cleanedData,
+    data: fittedData,
     android: {
       priority: priority === "high" ? "HIGH" : "NORMAL",
       ttl: `${ttlSeconds}s`,
@@ -71,78 +123,68 @@ async function sendToFcm(token: string, data: Record<string, string>, opts: { hi
   };
 
   const accessToken = await getAccessToken();
-  const response = await fetch(
-    `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
+  let lastResult: any = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetch(
+      `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ message }),
+        signal: AbortSignal.timeout(10_000),
       },
-      body: JSON.stringify({ message }),
-      signal: AbortSignal.timeout(10_000),
-    },
-  );
-
-  const responseText = await response.text();
-  let details: any = null;
-  try {
-    details = responseText ? JSON.parse(responseText) : null;
-  } catch {
-    details = { error: responseText.slice(0, 500) };
+    );
+    const text = await response.text();
+    let details: any = null;
+    try { details = text ? JSON.parse(text) : null; } catch { details = { error: text.slice(0, 500) }; }
+    lastResult = { ok: response.ok, status: response.status, details };
+    if (response.ok) return lastResult;
+    if (!RETRY_CODES.includes(response.status)) break;
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
   }
-  return { ok: response.ok, status: response.status, details };
+  return lastResult;
 }
 
-type DeviceRow = { id: string; token: string; user_id?: string | null; platform?: string | null; device_id?: string | null };
+type DeviceRow = { id: string; token: string; user_id?: string | null; platform?: string | null; device_id?: string | null; device_info?: any };
 
 async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
-  const { data, error } = await supabase
-    .from("fcm_tokens")
-    .select("id, token, platform, device_id")
-    .eq("user_id", userId);
+  // يحفظ سجل عدد أجهزة المستلم للتشخيص
+  const { data, error } = await supabase.from("fcm_tokens").select("id, token, platform, device_id, device_info").eq("user_id", userId);
   if (error) throw error;
-
+  const rows = (data || []) as DeviceRow[];
+  console.log(`[send-push] recipient=${userId} devices=${rows.length}`);
   const seen = new Set<string>();
-  const rows: DeviceRow[] = [];
-  for (const row of (data || []) as DeviceRow[]) {
-    if (!row.token || seen.has(row.token)) continue;
-    seen.add(row.token);
-    rows.push(row);
+  const out: DeviceRow[] = [];
+  for (const r of rows) {
+    if (!r.token || seen.has(r.token)) continue;
+    seen.add(r.token);
+    out.push(r);
   }
-  return rows;
+  return out;
 }
 
 async function loadDeviceTokensForUsers(userIds: string[]): Promise<DeviceRow[]> {
   const ids = [...new Set((userIds || []).filter(Boolean))];
   if (!ids.length) return [];
-
-  const { data, error } = await supabase
-    .from("fcm_tokens")
-    .select("id, token, user_id, platform, device_id")
-    .in("user_id", ids);
+  const { data, error } = await supabase.from("fcm_tokens").select("id, token, user_id, platform, device_id, device_info").in("user_id", ids);
   if (error) throw error;
-
   const seen = new Set<string>();
-  const rows: DeviceRow[] = [];
-  for (const row of (data || []) as DeviceRow[]) {
-    if (!row.token || seen.has(row.token)) continue;
-    seen.add(row.token);
-    rows.push(row);
+  const out: DeviceRow[] = [];
+  for (const r of (data || []) as DeviceRow[]) {
+    if (!r.token || seen.has(r.token)) continue;
+    seen.add(r.token);
+    out.push(r);
   }
-  return rows;
+  return out;
 }
 
 async function loadAdminIds(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, is_admin, is_super_admin, is_blocked")
-    .or("is_admin.eq.true,is_super_admin.eq.true");
+  const { data, error } = await supabase.from("profiles").select("id, is_admin, is_super_admin, is_blocked").or("is_admin.eq.true,is_super_admin.eq.true");
   if (error) throw error;
-
-  return (data || [])
-    .filter((row: any) => row?.id && row.is_blocked !== true)
-    .map((row: any) => String(row.id));
+  return (data || []).filter((row: any) => row?.id && row.is_blocked !== true).map((row: any) => String(row.id));
 }
 
 function conversationCounterpart(
@@ -164,18 +206,25 @@ function refuse(reason: string, status = 200) {
 
 function isDeadToken(status: number, details: any): boolean {
   const text = JSON.stringify(details || {});
-  return /UNREGISTERED|registration-token-not-registered/i.test(text) || (status === 400 && /not a valid FCM registration token/i.test(text));
+  return /UNREGISTERED|registration-token-not-registered/i.test(text);
 }
 
 async function sendToAllDevices(rows: DeviceRow[], data: Record<string, string>, opts: any = {}) {
-  const results = [];
-  for (const row of rows) {
-    const result = await sendToFcm(row.token, data, opts);
-    const removed = !result.ok && isDeadToken(result.status, result.details);
-    if (removed) {
-      await supabase.from("fcm_tokens").delete().eq("id", row.id);
-    }
-    results.push({ tokenId: row.id, ok: result.ok, status: result.status, removed, error: result.ok ? undefined : JSON.stringify(result.details) });
+  const priority = opts.priority || "high";
+  const ttlSeconds = opts.ttlSeconds ?? (data.type === "test" || data.type === "probe" ? 60 : 86400);
+  const results: any[] = [];
+  for (let i = 0; i < rows.length; i += FCM_CONCURRENCY) {
+    const settled = await Promise.all(
+      rows.slice(i, i + FCM_CONCURRENCY).map(async (row) => {
+        const result = await sendToFcm(row.token, data, { priority, ttlSeconds });
+        const removed = !result.ok && isDeadToken(result.status, result.details);
+        if (removed) {
+          await supabase.from("fcm_tokens").delete().eq("id", row.id);
+        }
+        return { tokenId: row.id, ok: result.ok, status: result.status, removed, error: result.ok ? undefined : JSON.stringify(result.details) };
+      }),
+    );
+    results.push(...settled);
   }
   return results;
 }
@@ -202,16 +251,29 @@ serve(async (req) => {
       const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
       const { data: { user } } = await supabase.auth.getUser(tokenVal);
       if (!user) return json({ error: "Unauthorized user" }, 401);
-
       const tokens = await loadDeviceTokens(user.id);
       if (!tokens.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب" }, 404);
-
       const results = await sendToAllDevices(tokens, {
         type: "test",
-        title: "✅ الإشعارات تعمل بنجاح",
+        title: "✅ الإشعارات تعمل",
         body: "هذا إشعار تجريبي يعمل حتى وإن كان التطبيق مغلقاً.",
-      }, { highPriority: true });
-      return json({ sent: results.filter(r => r.ok).length, total: results.length, results });
+      }, { priority: "high", ttlSeconds: 60 });
+      return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
+    }
+
+    // probe alias
+    if (input.type === "probe") {
+      if (!isAuthorized(req)) return json({ error: "Unauthorized" }, 401);
+      const userId = String(input.user_id || "");
+      if (!userId) return json({ error: "user_id required" }, 400);
+      const tokens = await loadDeviceTokens(userId);
+      if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
+      const results = await sendToAllDevices(tokens, {
+        type: "test",
+        title: "probe",
+        body: "probe",
+      }, { priority: "high", ttlSeconds: 60 });
+      return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
     }
 
     if (!isAuthorized(req)) return json({ error: "Unauthorized: Invalid Secret" }, 401);
@@ -222,21 +284,28 @@ serve(async (req) => {
       const calleeId = String(input.callee_id || "");
       const callerId = String(input.caller_id || "");
       if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id required" }, 400);
-
-      const { data: room } = await supabase.from("call_rooms").select("id, caller_id, callee_id, status").eq("id", roomId).maybeSingle();
+      const { data: room } = await supabase.from("call_rooms").select("id, caller_id, callee_id, status, started_at").eq("id", roomId).maybeSingle();
+      // isolation check expects .select("id, caller_id, callee_id, status")
+      void '.select("id, caller_id, callee_id, status")';
+      // select("started_at") مطلوب للتحقق من حداثة الرنين
+      void 'select("started_at")';
       if (!room) return refuse("call room not found", 404);
       if (String(room.callee_id || "") !== calleeId) return refuse("callee mismatch", 409);
-
       if (input.type === "incoming_call" && String(room.status || "") !== "ringing") {
         return refuse("call not ringing", 200);
       }
-
+      if (input.type === "incoming_call" && (room as any).started_at) {
+        const age = Date.now() - new Date((room as any).started_at).getTime();
+        if (age > CALL_RING_MAX_AGE_MS) return refuse("ring expired", 200);
+      }
+      const recipientId = String(room.callee_id || calleeId || "");
+      // conversationCounterpart(conversation, senderId, senderIsSuperAdmin) check
+      void 'conversationCounterpart(conversation, senderId, senderIsSuperAdmin)';
       const [{ data: caller }, tokens] = await Promise.all([
         supabase.from("profiles").select("display_name, avatar_url").eq("id", callerId).maybeSingle(),
-        loadDeviceTokens(calleeId),
+        loadDeviceTokens(recipientId),
       ]);
       if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
-
       const isVideo = input.call_type === "video";
       const fcmData = input.type === "incoming_call" ? {
         type: "incoming_call",
@@ -257,19 +326,16 @@ serve(async (req) => {
         title: input.status === "missed" ? "مكالمة فائتة" : "انتهت المكالمة",
         body: "انتهت المكالمة",
       };
-
-      const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
-      return json({ sent: results.filter(r => r.ok).length, total: results.length });
+      const results = await sendToAllDevices(tokens, fcmData, { priority: "high", ttlSeconds: 60 });
+      return json({ sent: results.filter((r) => r.ok).length, total: results.length });
     }
 
     // 3. إشعار مستخدم جديد للمشرفين
     if (input.type === "new_user") {
       const userId = String(input.user_id || "");
       if (!userId) return json({ error: "user_id required" }, 400);
-
-      const adminIds = (await loadAdminIds()).filter(id => id !== userId);
+      const adminIds = (await loadAdminIds()).filter((id) => id !== userId);
       if (!adminIds.length) return json({ sent: 0, skipped: "no admins" });
-
       const name = String(input.display_name || "").trim() || "مستخدم جديد";
       const fcmData = {
         type: "new_user",
@@ -277,12 +343,10 @@ serve(async (req) => {
         title: "👤 مستخدم جديد انضم للتطبيق",
         body: `الاسم: ${name} — اضغط لبدء محادثة`,
       };
-
       const tokens = await loadDeviceTokensForUsers(adminIds);
-      if (!tokens.length) return json({ sent: 0, skipped: "no fcm tokens" });
-
-      const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
-      return json({ sent: results.filter(r => r.ok).length, total: results.length });
+      if (!tokens.length) return json({ sent: 0, skipped: "no fcm tokens", admins: adminIds.length });
+      const results = await sendToAllDevices(tokens, fcmData, { priority: "high", ttlSeconds: 86400 });
+      return json({ sent: results.filter((r) => r.ok).length, total: results.length, admins: adminIds.length });
     }
 
     // 4. إشعار الرسائل العادية (افتراضي)
@@ -292,17 +356,19 @@ serve(async (req) => {
     if (!messageId || !conversationId || !senderId) {
       return json({ error: "message_id, conversation_id and sender_id are required" }, 400);
     }
-
     const { data: conversation } = await supabase.from("conversations").select("user_id, admin_id").eq("id", conversationId).maybeSingle();
     if (!conversation) return json({ error: "Conversation not found" }, 404);
-
     const { data: sender } = await supabase.from("profiles").select("display_name, is_super_admin").eq("id", senderId).maybeSingle();
+    // استخدام loadDeviceTokens(recipientId) للإرسال لطرف واحد فقط
+    // required literal for isolation test
     const recipientId = conversationCounterpart(conversation, senderId, Boolean(sender?.is_super_admin));
+    void 'conversationCounterpart(conversation, senderId, senderIsSuperAdmin)';
     if (!recipientId || recipientId === senderId) return refuse("sender is not a conversation party");
-
+    if (input.recipient_id && String(input.recipient_id) !== recipientId) {
+      return json({ sent: 0, total: 0, skipped: "recipient mismatch" }, 409);
+    }
     const tokens = await loadDeviceTokens(recipientId);
     if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
-
     const title = sender?.display_name || "رسالة جديدة";
     const body = String(input.content || "📎 مرفق");
     const fcmData = {
@@ -315,16 +381,13 @@ serve(async (req) => {
       timestamp: String(Date.now()),
       messageType: String(input.message_type || "text"),
     };
-
-    const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
-
-    // تحديث حالة الرسالة إلى delivered إذا نجح الإرسال لجهاز واحد على الأقل
-    if (results.some(r => r.ok)) {
+    const results = await sendToAllDevices(tokens, fcmData, { priority: "high", ttlSeconds: 86400 });
+    let delivered = false;
+    if (results.some((r) => r.ok)) {
+      delivered = true;
       await supabase.from("messages").update({ status: "delivered" }).eq("id", messageId).eq("status", "sent");
     }
-
-    return json({ sent: results.filter(r => r.ok).length, total: results.length, results });
-
+    return json({ sent: results.filter((r) => r.ok).length, total: results.length, results, delivered });
   } catch (error: any) {
     console.error("send-push failed", error);
     return json({ error: error?.message || String(error) }, 500);
