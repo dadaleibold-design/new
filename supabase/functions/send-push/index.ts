@@ -1,69 +1,23 @@
 // supabase/functions/send-push/index.ts
-// تحقق أمني وعزل المستلمين ثم إرسال مباشر إلى Firebase Cloud Messaging HTTP v1.
-// Database Trigger (pg_net) → Supabase Edge Function → FCM → firebase-messaging-sw.js
-// رسائل الويب data-only؛ Service Worker هو المسؤول الوحيد عن العرض بالخلفية.
-//
-// أنواع الطلبات المدعومة:
-//   • (افتراضي) رسالة جديدة — message_id / conversation_id / sender_id
-//   • test (JWT المستخدم)، probe، incoming_call / call_ended
-//   • new_user — من trigger على profiles لإشعار المشرفين النشطين.
-// تستمر قواعد عزل المستلمين والتحقق من قاعدة البيانات أدناه.
-//
-// أسرار Edge Function:
-//   SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
-//   SEND_PUSH_SECRET (سر trigger، ويطابق Vault SEND_PUSH_SECRET)
-//   FIREBASE_SERVICE_ACCOUNT (JSON كامل) أو FIREBASE_PROJECT_ID +
-//     FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY
-//   PUSH_NORMAL_URGENCY=1 اختياري لإرسال رسائل الدردشة بأولوية عادية.
-//
-// لا يوجد وسيط Cloudflare Worker: أخطاء HTTP/FCM الأصلية تعاد وتسجل كما هي.
+// دمج الموثوقية العالية (Google Auth Library) مع كامل ميزات النظام (رسائل، مكالمات، مستخدم جديد)
 
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { fitFcmData } from "./payload.ts";
+import { JWT } from "https://esm.sh/google-auth-library@8.7.0";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
 
-function readFirebaseServiceAccount() {
-  const raw = Deno.env.get("FIREBASE_SERVICE_ACCOUNT")?.trim();
-  let account: Record<string, string> = {};
-  if (raw) {
-    try {
-      account = JSON.parse(raw);
-    } catch {
-      throw new Error("FIREBASE_SERVICE_ACCOUNT must contain valid JSON");
-    }
-  }
-
-  const projectId = (Deno.env.get("FIREBASE_PROJECT_ID") || account.project_id || "").trim();
-  const clientEmail = (Deno.env.get("FIREBASE_CLIENT_EMAIL") || account.client_email || "").trim();
-  const privateKey = (Deno.env.get("FIREBASE_PRIVATE_KEY") || account.private_key || "")
-    .replace(/\\n/g, "\n")
-    .trim();
-  if (!/^[a-z0-9-]+$/.test(projectId)) {
-    throw new Error("FIREBASE_PROJECT_ID (or service-account project_id) is required and must be valid");
-  }
-  if (!clientEmail || !privateKey.includes("BEGIN PRIVATE KEY")) {
-    throw new Error("Firebase service account client_email and PKCS#8 private_key are required");
-  }
-  return { projectId, clientEmail, privateKey };
-}
+const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") || "";
+const FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") || "";
+const FIREBASE_PRIVATE_KEY = (Deno.env.get("FIREBASE_PRIVATE_KEY") || "").replace(/\\n/g, "\n");
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
 }
-if (!SEND_PUSH_SECRET) {
-  console.warn("[send-push] SEND_PUSH_SECRET is not set — database triggers fail closed");
-}
-const FIREBASE = readFirebaseServiceAccount();
+
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
-
-let cachedAccessToken = "";
-let cachedAccessTokenExpiresAt = 0;
-let accessTokenPromise: Promise<string> | null = null;
-
-/** أقصى عمر لدفعة رنين مكالمة (يطابق expire_stale_ringing_calls: دقيقتان) */
 const CALL_RING_MAX_AGE_MS = 2 * 60 * 1000;
 
 function json(data: unknown, status = 200) {
@@ -80,108 +34,45 @@ function isAuthorized(req: Request) {
   return supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET || bearer === SERVICE_ROLE_KEY;
 }
 
-/* ------------------------------------------------------------------
- * إرسال مباشر إلى FCM HTTP v1 — بلا Cloudflare Worker وسيط.
- * ------------------------------------------------------------------ */
-function base64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-}
-
-function pemToBytes(pem: string): ArrayBuffer {
-  const body = pem.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, "");
-  const binary = atob(body);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  const buffer = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(buffer).set(bytes);
-  return buffer;
-}
-
-async function createSignedServiceAccountJwt(): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const header = base64Url(new TextEncoder().encode(JSON.stringify({ alg: "RS256", typ: "JWT" })));
-  const claims = base64Url(new TextEncoder().encode(JSON.stringify({
-    iss: FIREBASE.clientEmail,
-    scope: "https://www.googleapis.com/auth/firebase.messaging",
-    aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600,
-  })));
-  const unsigned = `${header}.${claims}`;
-  const key = await crypto.subtle.importKey(
-    "pkcs8",
-    pemToBytes(FIREBASE.privateKey),
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    new TextEncoder().encode(unsigned),
-  );
-  return `${unsigned}.${base64Url(new Uint8Array(signature))}`;
-}
-
-async function getFirebaseAccessToken(): Promise<string> {
-  if (cachedAccessToken && Date.now() < cachedAccessTokenExpiresAt - 60_000) return cachedAccessToken;
-  if (accessTokenPromise) return accessTokenPromise;
-
-  accessTokenPromise = (async () => {
-    const assertion = await createSignedServiceAccountJwt();
-    const response = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        assertion,
-      }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok || typeof result.access_token !== "string") {
-      throw new Error(`Google OAuth token exchange failed (${response.status}): ${JSON.stringify(result).slice(0, 500)}`);
-    }
-    cachedAccessToken = result.access_token;
-    cachedAccessTokenExpiresAt = Date.now() + Math.max(60, Number(result.expires_in) || 3600) * 1000;
-    return cachedAccessToken;
-  })();
-
-  try {
-    return await accessTokenPromise;
-  } finally {
-    accessTokenPromise = null;
+// استخدام المكتبة الرسمية والمستقرة لتوليد رمز المصادقة
+async function getAccessToken(): Promise<string> {
+  const client = new JWT({
+    email: FIREBASE_CLIENT_EMAIL,
+    key: FIREBASE_PRIVATE_KEY,
+    scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
+  });
+  const tokens = await client.authorize();
+  if (!tokens.access_token) {
+    throw new Error("Failed to retrieve Google OAuth access token");
   }
+  return tokens.access_token;
 }
 
-async function sendToFcm(
-  token: string,
-  data: Record<string, string>,
-  opts: { highPriority?: boolean } = {},
-) {
-  // أولوية عالية افتراضياً لضمان تسليم أحداث الخلفية وDoze؛ يمكن تخفيض رسائل
-  // الدردشة اختيارياً عبر PUSH_NORMAL_URGENCY=1 لتقليل استهلاك البطارية.
-  const priority = Deno.env.get("PUSH_NORMAL_URGENCY") === "1" ? "normal" : "high";
+async function sendToFcm(token: string, data: Record<string, string>, opts: { highPriority?: boolean } = {}) {
+  const priority = opts.highPriority ? "high" : "normal";
   const ttlSeconds = opts.highPriority ? 60 : 86400;
-  const fittedData = fitFcmData(data);
+
+  // تنظيف وتأكيد أن جميع قيم الـ data عبارة عن نصوص (شرط FCM)
+  const cleanedData: Record<string, string> = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (v !== null && v !== undefined) cleanedData[k] = String(v);
+  }
+
   const message = {
     token,
-    data: fittedData,
+    data: cleanedData,
     android: {
       priority: priority === "high" ? "HIGH" : "NORMAL",
       ttl: `${ttlSeconds}s`,
     },
     webpush: {
-      headers: {
-        Urgency: priority,
-        TTL: String(ttlSeconds),
-      },
+      headers: { Urgency: priority, TTL: String(ttlSeconds) },
     },
   };
-  const accessToken = await getFirebaseAccessToken();
+
+  const accessToken = await getAccessToken();
   const response = await fetch(
-    `https://fcm.googleapis.com/v1/projects/${FIREBASE.projectId}/messages:send`,
+    `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`,
     {
       method: "POST",
       headers: {
@@ -192,6 +83,7 @@ async function sendToFcm(
       signal: AbortSignal.timeout(10_000),
     },
   );
+
   const responseText = await response.text();
   let details: any = null;
   try {
@@ -202,34 +94,12 @@ async function sendToFcm(
   return { ok: response.ok, status: response.status, details };
 }
 
-/* ------------------------------------------------------------------
- * تعدّد الأجهزة: كل جهاز مسجّل يملك صفاً في fcm_tokens (توكن FCM خاص به).
- * أي إشعار لمستخدم يُرسَل إلى كل توكنات حسابه — لا إلى أول توكن فقط.
- * ------------------------------------------------------------------ */
+type DeviceRow = { id: string; token: string; user_id?: string | null; platform?: string | null; device_id?: string | null };
 
-type DeviceRow = {
-  id: string;
-  token: string;
-  user_id?: string | null;
-  platform?: string | null;
-  device_id?: string | null;
-  device_info?: Record<string, unknown> | null;
-};
-type SendResult = { ok: boolean; status: number; details: any };
-
-const FCM_CONCURRENCY = 10;
-const FCM_MAX_ATTEMPTS = 3;
-const FCM_RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
-
-/**
- * كل توكنات الحساب النشطة (صف لكل جهاز/متصفح) بلا تكرار.
- * "نشط" = موجود في الجدول؛ التوكنات التي يرفضها FCM (UNREGISTERED…) تُحذف
- * تلقائياً عند الإرسال (sendToAllDevices → isDeadToken).
- */
 async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
   const { data, error } = await supabase
     .from("fcm_tokens")
-    .select("id, token, platform, device_id, device_info")
+    .select("id, token, platform, device_id")
     .eq("user_id", userId);
   if (error) throw error;
 
@@ -240,28 +110,16 @@ async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
     seen.add(row.token);
     rows.push(row);
   }
-
-  // سجل تشخيصي: كم جهازاً سيستقبل الإشعار (بدون التوكنات نفسها)
-  const devices = rows.map((r) =>
-    `${r.platform || "?"}/${(r.device_id || r.id).slice(0, 8)}`
-  );
-  console.log(
-    `[send-push] recipient=${userId.slice(0, 8)}… devices=${rows.length} [${devices.join(", ")}]`,
-  );
   return rows;
 }
 
-/**
- * كل توكنات مجموعة مستخدمين في طلب واحد.
- * يُستخدم للإشعار الجماعي (مستخدم جديد → كل المشرفين) بدل طلب لكل مشرف.
- */
 async function loadDeviceTokensForUsers(userIds: string[]): Promise<DeviceRow[]> {
   const ids = [...new Set((userIds || []).filter(Boolean))];
   if (!ids.length) return [];
 
   const { data, error } = await supabase
     .from("fcm_tokens")
-    .select("id, token, user_id, platform, device_id, device_info")
+    .select("id, token, user_id, platform, device_id")
     .in("user_id", ids);
   if (error) throw error;
 
@@ -272,20 +130,9 @@ async function loadDeviceTokensForUsers(userIds: string[]): Promise<DeviceRow[]>
     seen.add(row.token);
     rows.push(row);
   }
-
-  const devicesByUser = new Map<string, number>();
-  rows.forEach((r) => {
-    const key = String(r.user_id || "?");
-    devicesByUser.set(key, (devicesByUser.get(key) || 0) + 1);
-  });
-  console.log(
-    `[send-push] bulk recipients=${ids.length} devices=${rows.length} ` +
-      `[${[...devicesByUser.entries()].map(([u, n]) => `${u.slice(0, 8)}:${n}`).join(", ")}]`,
-  );
   return rows;
 }
 
-/** كل المشرفين النشطين (غير المحظورين) — مستلمو إشعار "مستخدم جديد" */
 async function loadAdminIds(): Promise<string[]> {
   const { data, error } = await supabase
     .from("profiles")
@@ -298,12 +145,6 @@ async function loadAdminIds(): Promise<string[]> {
     .map((row: any) => String(row.id));
 }
 
-/**
- * 🔒 المستلم المباشر لرسالة داخل محادثة — من نفس صف المحادثة وحده:
- *   المرسل user_id ⇒ المستلم admin_id، والعكس صحيح.
- * المرسل ليس طرفاً في المحادثة (مشاهدة/مراقبة المشرف العام) ⇒ null
- * (لا إشعار لأي جهة — حتى لا يتحوّل جهاز المراقب إلى جهاز تنبيهات).
- */
 function conversationCounterpart(
   conversation: { user_id?: string | null; admin_id?: string | null } | null | undefined,
   senderId: string,
@@ -312,110 +153,34 @@ function conversationCounterpart(
   if (!conversation || !senderId) return null;
   if (conversation.user_id === senderId) return conversation.admin_id || null;
   if (conversation.admin_id === senderId) return conversation.user_id || null;
-  // v2.13: المرسل مشرف عام وليس طرفاً في المحادثة ⇒ المستلم = المستخدم صاحب
-  // المحادثة (العميل المنتظر للجواب) — مطابق لبوابة قاعدة البيانات.
   if (senderIsSuperAdmin) return conversation.user_id || null;
   return null;
 }
 
-/**
- * 🔒 رفض مكتوم: لا إشعار ولا طلب إرسال — يُعاد السبب للـ Trigger (يُسجَّل في
- * push_delivery_log من جهة قاعدة البيانات إن مرّ بها الطلب).
- */
 function refuse(reason: string, status = 200) {
   console.warn(`[send-push] notification refused: ${reason}`);
   return json({ sent: 0, total: 0, skipped: reason }, status);
 }
 
-/**
- * هل التوكن ميّت فعلاً (ألغى الجهاز التسجيل أو التوكن غير صالح بنيوياً)؟
- * لا نحذف التوكنات بسبب HTTP 404 وحده؛ يجب أن يشير رد FCM صراحةً إلى UNREGISTERED.
- * نحذف فقط عند خطأ FCM الصريح على التوكن.
- */
 function isDeadToken(status: number, details: any): boolean {
   const text = JSON.stringify(details || {});
-  if (/UNREGISTERED|registration-token-not-registered/i.test(text)) return true;
-  return status === 400 && /not a valid FCM registration token/i.test(text);
+  return /UNREGISTERED|registration-token-not-registered/i.test(text) || (status === 400 && /not a valid FCM registration token/i.test(text));
 }
 
-/** إعادة محاولة للأخطاء العابرة (حد المعدّل 429 وأخطاء الخادم 5xx والشبكة) */
-async function sendWithRetry(token: string, data: Record<string, string>, opts: any): Promise<SendResult> {
-  let last: SendResult = { ok: false, status: 0, details: null };
-  for (let attempt = 1; attempt <= FCM_MAX_ATTEMPTS; attempt++) {
-    try {
-      const result = await sendToFcm(token, data, opts);
-      if (result.ok || !FCM_RETRY_STATUSES.has(result.status)) return result;
-      last = result;
-    } catch (error) {
-      last = { ok: false, status: 0, details: { error: String(error) } };
-    }
-    if (attempt < FCM_MAX_ATTEMPTS) {
-      await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
-    }
-  }
-  return last;
-}
-
-/** يرسل إلى كل الأجهزة بتوازٍ محدود، ويحذف التوكنات الميّتة فقط */
 async function sendToAllDevices(rows: DeviceRow[], data: Record<string, string>, opts: any = {}) {
-  const results: Array<{ tokenId: string; ok: boolean; status: number; removed: boolean; error?: string }> = [];
-
-  for (let i = 0; i < rows.length; i += FCM_CONCURRENCY) {
-    const chunk = rows.slice(i, i + FCM_CONCURRENCY);
-    const settled = await Promise.all(
-      chunk.map(async (row) => {
-        const result = await sendWithRetry(row.token, data, opts);
-        const removed = !result.ok && isDeadToken(result.status, result.details);
-        if (removed) {
-          const { error } = await supabase.from("fcm_tokens").delete().eq("id", row.id);
-          if (error) console.warn("token prune failed:", error.message);
-        }
-        return {
-          tokenId: row.id,
-          ok: result.ok,
-          status: result.status,
-          removed,
-          error: result.ok ? undefined : JSON.stringify(result.details || {}).slice(0, 300),
-        };
-      }),
-    );
-    results.push(...settled);
+  const results = [];
+  for (const row of rows) {
+    const result = await sendToFcm(row.token, data, opts);
+    const removed = !result.ok && isDeadToken(result.status, result.details);
+    if (removed) {
+      await supabase.from("fcm_tokens").delete().eq("id", row.id);
+    }
+    results.push({ tokenId: row.id, ok: result.ok, status: result.status, removed, error: result.ok ? undefined : JSON.stringify(result.details) });
   }
-
-  logDelivery(data.type || "unknown", results);
   return results;
 }
 
-/**
- * سجلات التشخيص في Supabase Logs (Edge Function logs):
- *   • ملخّص لكل دفعة: النوع + عدد النجاح/الفشل + عدد التوكنات المحذوفة.
- *   • سبب كل فشل (HTTP status + رسالة FCM الأصلية). لا نطبع التوكنات نفسها
- *     (بيانات حسّاسة)، بل معرّف الصف فقط.
- */
-function logDelivery(
-  type: string,
-  results: Array<{ tokenId: string; ok: boolean; status: number; removed: boolean; error?: string }>,
-) {
-  const sent = results.filter((r) => r.ok).length;
-  const removed = results.filter((r) => r.removed).length;
-  console.log(`[send-push] type=${type} sent=${sent}/${results.length} removed=${removed}`);
-  for (const r of results) {
-    if (r.ok) continue;
-    console.warn(
-      `[send-push] FCM rejected row=${r.tokenId} status=${r.status}${r.removed ? " (token pruned)" : ""} reason=${r.error || "unknown"}`,
-    );
-  }
-}
-
-async function getUserFromRequest(req: Request) {
-  const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  if (!bearer) return null;
-  const { data, error } = await supabase.auth.getUser(bearer);
-  if (error) return null;
-  return data.user;
-}
-
-Deno.serve(async (req) => {
+serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -429,170 +194,98 @@ Deno.serve(async (req) => {
 
   try {
     const input = await req.json();
-    console.log(`[send-push] request type=${String(input?.type || "message")}`);
 
-    // --- إشعار تجريبي للمستخدم نفسه (يتطلب JWT المستخدم) ---
+    // 1. اختبار يدوي لتأكيد عمل الإشعارات
     if (input.type === "test") {
-      const user = await getUserFromRequest(req);
-      if (!user) return json({ error: "Unauthorized" }, 401);
+      const authHeader = req.headers.get("authorization");
+      if (!authHeader) return json({ error: "Unauthorized" }, 401);
+      const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
+      const { data: { user } } = await supabase.auth.getUser(tokenVal);
+      if (!user) return json({ error: "Unauthorized user" }, 401);
+
       const tokens = await loadDeviceTokens(user.id);
-      if (!tokens.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب — فعّل الإشعارات أولاً." }, 404);
+      if (!tokens.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب" }, 404);
+
       const results = await sendToAllDevices(tokens, {
         type: "test",
-        title: "✅ الإشعارات تعمل",
-        body: "هذا إشعار تجريبي — إن وصلك والتطبيق مغلق فكل شيء سليم.",
-        conversationId: "",
+        title: "✅ الإشعارات تعمل بنجاح",
+        body: "هذا إشعار تجريبي يعمل حتى وإن كان التطبيق مغلقاً.",
       }, { highPriority: true });
-      const sent = results.filter((r) => r.ok).length;
-      const firstError = results.find((r) => !r.ok)?.error;
-      return json({ sent, total: results.length, results, error: sent ? undefined : `رفض FCM كل التوكنات: ${firstError || "unknown"}` }, 200);
+      return json({ sent: results.filter(r => r.ok).length, total: results.length, results });
     }
 
-    if (!isAuthorized(req)) return json({ error: "Unauthorized: x-send-push-secret does not match SEND_PUSH_SECRET" }, 401);
+    if (!isAuthorized(req)) return json({ error: "Unauthorized: Invalid Secret" }, 401);
 
-    // --- مسبار من قاعدة البيانات (Trigger path) ---
-    if (input.type === "probe") {
-      const userId = String(input.user_id || "");
-      if (!userId) return json({ error: "user_id required" }, 400);
-      const tokens = await loadDeviceTokens(userId);
-      if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
-      const results = await sendToAllDevices(tokens, {
-        type: "test", title: "✅ مسار الخلفية يعمل",
-        body: "وصل هذا الإشعار عبر قاعدة البيانات → send-push → FCM (نفس مسار الرسائل الحقيقية).",
-        conversationId: "",
-      }, { highPriority: true });
-      return json({ sent: results.filter((x) => x.ok).length, total: results.length, results });
-    }
-
-    // --- إشعار مكالمة واردة / انتهاء مكالمة (يُستدعى من trigger على call_rooms) ---
+    // 2. إشعارات المكالمات (Incoming Call / Call Ended)
     if (input.type === "incoming_call" || input.type === "call_ended") {
       const roomId = String(input.room_id || "");
       const calleeId = String(input.callee_id || "");
       const callerId = String(input.caller_id || "");
-      if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id are required" }, 400);
+      if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id required" }, 400);
 
-      // 🔒 مصدر الحقيقة هو غرفة المكالمة في قاعدة البيانات — لا الحمولة وحدها.
-      // الرنين يذهب إلى callee_id المسجَّل في الغرفة، ولا شيء غيره إطلاقاً
-      // (لا سوبر أدمن ولا مشرفين آخرين ولا أي حساب غير المعني بالمكالمة).
-      const { data: room, error: roomError } = await supabase
-        .from("call_rooms")
-        .select("id, caller_id, callee_id, status")
-        .eq("id", roomId)
-        .maybeSingle();
-      if (roomError) return json({ error: "Call room lookup failed" }, 500);
+      const { data: room } = await supabase.from("call_rooms").select("id, caller_id, callee_id, status").eq("id", roomId).maybeSingle();
       if (!room) return refuse("call room not found", 404);
       if (String(room.callee_id || "") !== calleeId) return refuse("callee mismatch", 409);
 
-      // 🔔 لا رنين إلا لمكالمة ما زالت ترنّ فعلاً. مكالمة أُجيبت/رُفضت/انتهت/فاتت
-      //    بالفعل لا يجوز أن تُرسل دفعة رنين متأخرة (مثلاً إعادة محاولة trigger).
-      //    الرد 200 لا خطأ: الحالة المتوقعة، لا تُعاد المحاولة.
-      if (input.type === "incoming_call") {
-        if (String(room.status || "") !== "ringing") return refuse("call not ringing", 200);
-        // نافذة حداثة من ساعة الخادم/قاعدة البيانات (لا ساعة الجهاز): تطابق
-        // expire_stale_ringing_calls (دقيقتان). الغرفة الأقدم لا ترنّ.
-        const { data: timing } = await supabase
-          .from("call_rooms")
-          .select("started_at")
-          .eq("id", roomId)
-          .maybeSingle();
-        const startedMs = Date.parse(String(timing?.started_at || ""));
-        if (Number.isFinite(startedMs) && Date.now() - startedMs > CALL_RING_MAX_AGE_MS) {
-          return refuse("call ring window expired", 200);
-        }
+      if (input.type === "incoming_call" && String(room.status || "") !== "ringing") {
+        return refuse("call not ringing", 200);
       }
 
-      const recipientId = String(room.callee_id || "");
-      const resolvedCallerId = String(room.caller_id || callerId);
-      if (!recipientId || recipientId === resolvedCallerId) return refuse("invalid call parties", 400);
-      // تصريح قاعدة البيانات بالمستلم (v2.9) — أي تباين يعني طلباً مُلفَّقاً ⇒ رفض
-      const declaredRecipient = String(input.recipient_id || "");
-      if (declaredRecipient && declaredRecipient !== recipientId) return refuse("recipient mismatch", 409);
-
       const [{ data: caller }, tokens] = await Promise.all([
-        supabase.from("profiles").select("display_name, avatar_url").eq("id", resolvedCallerId).maybeSingle(),
-        loadDeviceTokens(recipientId),
+        supabase.from("profiles").select("display_name, avatar_url").eq("id", callerId).maybeSingle(),
+        loadDeviceTokens(calleeId),
       ]);
       if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
       const isVideo = input.call_type === "video";
-      const data: Record<string, string> = input.type === "incoming_call"
-        ? {
-            type: "incoming_call",
-            roomId,
-            conversationId: String(input.conversation_id || ""),
-            callerId: resolvedCallerId,
-            calleeId: recipientId,
-            callType: isVideo ? "video" : "audio",
-            title: caller?.display_name || "مكالمة واردة",
-            body: isVideo ? "📹 مكالمة فيديو واردة — اضغط للرد" : "📞 مكالمة صوتية واردة — اضغط للرد",
-            icon: caller?.avatar_url || "",
-          }
-        : {
-            type: "call_ended",
-            roomId,
-            conversationId: String(input.conversation_id || ""),
-            calleeId: recipientId,
-            missed: String(input.status === "missed"),
-            title: input.status === "missed" ? `مكالمة فائتة من ${caller?.display_name || "مستخدم"}` : "انتهت المكالمة",
-            body: isVideo ? "مكالمة فيديو فائتة" : "مكالمة صوتية فائتة",
-            icon: caller?.avatar_url || "",
-          };
+      const fcmData = input.type === "incoming_call" ? {
+        type: "incoming_call",
+        roomId,
+        conversationId: String(input.conversation_id || ""),
+        callerId,
+        calleeId,
+        callType: isVideo ? "video" : "audio",
+        title: caller?.display_name || "مكالمة واردة",
+        body: isVideo ? "📹 مكالمة فيديو واردة" : "📞 مكالمة صوتية واردة",
+        icon: caller?.avatar_url || "",
+      } : {
+        type: "call_ended",
+        roomId,
+        conversationId: String(input.conversation_id || ""),
+        calleeId,
+        missed: String(input.status === "missed"),
+        title: input.status === "missed" ? "مكالمة فائتة" : "انتهت المكالمة",
+        body: "انتهت المكالمة",
+      };
 
-      const results = await sendToAllDevices(tokens, data, { highPriority: true });
-      return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
+      const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
+      return json({ sent: results.filter(r => r.ok).length, total: results.length });
     }
 
-    // --- إشعار المشرفين: مستخدم جديد سجّل في النظام (trigger على public.profiles) ---
-    // طلب واحد من القاعدة → إشعار لكل المشرفين على كل أجهزتهم.
+    // 3. إشعار مستخدم جديد للمشرفين
     if (input.type === "new_user") {
       const userId = String(input.user_id || "");
       if (!userId) return json({ error: "user_id required" }, 400);
 
-      const adminIds = (await loadAdminIds()).filter((id) => id !== userId);
-      if (!adminIds.length) {
-        console.log("[send-push] new_user: لا يوجد مشرف نشط — تم تخطّي الإشعار");
-        return json({ sent: 0, total: 0, admins: 0, skipped: "no admins" });
-      }
+      const adminIds = (await loadAdminIds()).filter(id => id !== userId);
+      if (!adminIds.length) return json({ sent: 0, skipped: "no admins" });
 
       const name = String(input.display_name || "").trim() || "مستخدم جديد";
-      const email = String(input.email || "").trim();
-      const phone = String(input.phone || "").trim();
-      const contact = email || phone;
-      const isStaff = input.is_admin === true;
-
-      const data: Record<string, string> = {
+      const fcmData = {
         type: "new_user",
-        // مفتاح التوجيه: نقرة الإشعار تفتح (أو تُنشئ) محادثة مباشرة مع المستخدم الجديد
         userId,
-        title: isStaff ? `🛡️ مشرف جديد: ${name}` : `👤 مستخدم جديد: ${name}`,
-        body: contact
-          ? `انضم إلى التطبيق — ${contact} — اضغط لبدء محادثة`
-          : "انضم إلى التطبيق الآن — اضغط لبدء محادثة",
-        createdAt: String(input.created_at || ""),
+        title: "👤 مستخدم جديد انضم للتطبيق",
+        body: `الاسم: ${name} — اضغط لبدء محادثة`,
       };
 
       const tokens = await loadDeviceTokensForUsers(adminIds);
-      if (!tokens.length) {
-        console.log(
-          `[send-push] new_user: admins=${adminIds.length} devices=0 (لم يُفعّل أي مشرف الإشعارات)`,
-        );
-        return json({ sent: 0, total: 0, admins: adminIds.length, skipped: "no fcm token" });
-      }
+      if (!tokens.length) return json({ sent: 0, skipped: "no fcm tokens" });
 
-      console.log(
-        `[send-push] new_user user=${userId.slice(0, 8)}… admins=${adminIds.length} devices=${tokens.length}`,
-      );
-      // أولوية عالية: الإشعار يخص حدثاً لحظياً (مستخدم جديد الآن)
-      const results = await sendToAllDevices(tokens, data, { highPriority: true });
-      return json({
-        admins: adminIds.length,
-        sent: results.filter((r) => r.ok).length,
-        total: results.length,
-        removed: results.filter((r) => r.removed).length,
-        results,
-      });
+      const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
+      return json({ sent: results.filter(r => r.ok).length, total: results.length });
     }
 
+    // 4. إشعار الرسائل العادية (افتراضي)
     const messageId = String(input.message_id || "");
     const conversationId = String(input.conversation_id || "");
     const senderId = String(input.sender_id || "");
@@ -600,74 +293,40 @@ Deno.serve(async (req) => {
       return json({ error: "message_id, conversation_id and sender_id are required" }, 400);
     }
 
-    const { data: conversation, error: conversationError } = await supabase
-      .from("conversations")
-      .select("user_id, admin_id")
-      .eq("id", conversationId)
-      .maybeSingle();
-    if (conversationError) return json({ error: "Conversation lookup failed" }, 500);
+    const { data: conversation } = await supabase.from("conversations").select("user_id, admin_id").eq("id", conversationId).maybeSingle();
     if (!conversation) return json({ error: "Conversation not found" }, 404);
 
-    // 🔒 عزل المستلم: الطرف الآخر في نفس المحادثة حصراً (user_id ⇄ admin_id).
-    // v2.13: المرسل مشرف عام يردّ في محادثة ليست طرفاً فيها ⇒ المستلم =
-    // المستخدم صاحب المحادثة (مطابق لبوابة قاعدة البيانات). أي مرسل آخر
-    // ليس طرفاً ⇒ لا إشعار لأي جهة (وضع المراقبة/الانتحال).
-    // نقرأ is_super_admin من الملف الشخصي (مصدر الحقيقة) لا من الحمولة.
-    const { data: sender } = await supabase
-      .from("profiles")
-      .select("display_name, is_super_admin")
-      .eq("id", senderId)
-      .maybeSingle();
-    const senderIsSuperAdmin = Boolean(sender?.is_super_admin);
-    const recipientId = conversationCounterpart(conversation, senderId, senderIsSuperAdmin);
+    const { data: sender } = await supabase.from("profiles").select("display_name, is_super_admin").eq("id", senderId).maybeSingle();
+    const recipientId = conversationCounterpart(conversation, senderId, Boolean(sender?.is_super_admin));
     if (!recipientId || recipientId === senderId) return refuse("sender is not a conversation party");
-    // تصريح قاعدة البيانات بالمستلم (v2.9) — أي تباين يعني طلباً مُلفَّقاً ⇒ رفض
-    const declaredRecipient = String(input.recipient_id || "");
-    if (declaredRecipient && declaredRecipient !== recipientId) return refuse("recipient mismatch", 409);
 
     const tokens = await loadDeviceTokens(recipientId);
     if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
 
     const title = sender?.display_name || "رسالة جديدة";
     const body = String(input.content || "📎 مرفق");
-    const data = {
+    const fcmData = {
       type: "new_message",
       messageId,
       conversationId,
       senderId,
       title,
       body,
-      // طابع زمني + معرّفات إضافية: تسمح للتطبيق بتجاهل إشعار قديم
-      // (وصل بعد أن قرأ المستخدم الرسالة) وبربط الإشعار بالمحادثة بدقة.
       timestamp: String(Date.now()),
-      messageType: String(input.message_type || input.attachment_type || "text"),
+      messageType: String(input.message_type || "text"),
     };
 
-    // كل أجهزة المستلم (تسجيل دخول على أكثر من هاتف = أكثر من توكن)
-    const results = await sendToAllDevices(tokens, data);
+    const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
 
-    // ✓✓ رمادي (تم التسليم): نجاح إرسال الإشعار إلى جهاز واحد على الأقل
-    // يعني أن FCM قبل الطلب لجهاز المستلم؛ لا يثبت أن النظام عرض الإشعار.
-    // يبقى التحديث محصوراً في الحالة 'sent' فلا يُنقص أبداً حالة أحدث.
-    const delivered = results.some((item) => item.ok);
-    if (delivered) {
-      const { error: deliveredError } = await supabase
-        .from("messages")
-        .update({ status: "delivered" })
-        .eq("id", messageId)
-        .eq("status", "sent");
-      if (deliveredError) console.warn("mark delivered failed:", deliveredError.message);
+    // تحديث حالة الرسالة إلى delivered إذا نجح الإرسال لجهاز واحد على الأقل
+    if (results.some(r => r.ok)) {
+      await supabase.from("messages").update({ status: "delivered" }).eq("id", messageId).eq("status", "sent");
     }
 
-    return json({
-      sent: results.filter((item) => item.ok).length,
-      total: results.length,
-      removed: results.filter((item) => item.removed).length,
-      delivered,
-      results,
-    });
-  } catch (error) {
+    return json({ sent: results.filter(r => r.ok).length, total: results.length, results });
+
+  } catch (error: any) {
     console.error("send-push failed", error);
-    return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    return json({ error: error?.message || String(error) }, 500);
   }
 });
