@@ -20,6 +20,7 @@ const PENDING_KEY = "wa_pending_route";
 const PENDING_TS_KEY = "wa_pending_route_at";
 const ROUTE_TTL_MS = 30 * 60 * 1000;
 const URL_KEYS = ["conversation", "message", "room_id", "answer_call", "decline_call", "user"];
+// URL_KEYS = ["conversation", "message", "answer_call", "decline_call", "user"] // compat for admin-directory static
 
 let handler = null;
 let initialized = false;
