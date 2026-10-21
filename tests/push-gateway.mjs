@@ -14,6 +14,7 @@ const ENV = read(".env.example");
 const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
 const SCHEMA = read("sql/schema.sql");
 const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
+const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
 const CONFIG = read("supabase/config.toml");
 
 // القيم المعتمدة (مُضمَّنة في كود مسار التريگرات — بلا Vault).
@@ -95,6 +96,29 @@ check("v2.16: إعادة تعريف دوال المسار كاملةً (يصلح
   ["trigger_send_push_notification", "push_call_edge", "push_diagnostics", "push_probe",
    "push_probe_result", "push_gateway_check"].every((f) =>
     MIGRATION_V216.includes(`create or replace function public.${f}(`)));
+// ---------- v2.17: نقطة تسليم قابلة للتهيئة + تشخيص شبكة القاعدة ----------
+const v217Code = MIGRATION_V217
+  .split("\n")
+  .filter((l) => !l.trimStart().startsWith("--"))
+  .join("\n");
+check("v2.17: ملف الهجرة موجود",
+  MIGRATION_V217.includes(EXPECTED_URL) && MIGRATION_V217.includes(EXPECTED_SECRET));
+check("v2.17: لا مراجع Vault في كود الهجرة", !VAULT_REF.test(v217Code));
+check("v2.17: نقطة التسليم قابلة للتهيئة (push_settings + push_delivery_url)",
+  /create table if not exists public\.push_settings/.test(MIGRATION_V217)
+  && /create or replace function public\.push_delivery_url\(\)/.test(MIGRATION_V217));
+check("v2.17: التريغر يقرأ نقطة التسليم بدل الرابط الثابت",
+  /v_url := public\.push_delivery_url\(\)/.test(MIGRATION_V217));
+check("v2.17: مُعدِّل نقطة التسليم مقصور على service_role",
+  /revoke all on function public\.push_set_delivery_url\(text\) from public, anon, authenticated/.test(MIGRATION_V217)
+  && /grant execute on function public\.push_set_delivery_url\(text\) to service_role/.test(MIGRATION_V217));
+check("v2.17: push_net_diagnostics يفحص Several مضيفات",
+  /create or replace function public\.push_net_diagnostics\(\)/.test(MIGRATION_V217)
+  && /example\.com/.test(MIGRATION_V217) && /cloudflare\.com/.test(MIGRATION_V217));
+check("v2.17: جدول الإعدادات محمي بـ RLS",
+  /alter table public\.push_settings enable row level security/.test(MIGRATION_V217));
+check("v2.17: القسم مضاف إلى schema.sql", SCHEMA.includes("23. الإصدار v2.17 (2026-10-23)")
+  && SCHEMA.includes("create or replace function public.push_net_diagnostics()"));
 check("v2.16: القسم مضاف إلى schema.sql", SCHEMA.includes("22. الإصدار v2.16 (2026-10-22)")
   && SCHEMA.includes("create or replace function public.push_egress_check()"));
 check("send-push يبقى متاحاً لنداءات pg_net بدون JWT عند وجود السر", /verify_jwt = false/.test(CONFIG));

@@ -1270,6 +1270,13 @@ function wireChrome() {
             "السرّ المشترك: " + (diag.secret_hardcoded === true
               ? "مُضمَّن في مسار التريگرات (x-send-push-secret)"
               : "غير مُضمَّن — نفّذ migration v2.15"));
+          // v2.17: نقطة التسليم الفعّالة (قابلة للتهيئة من القاعدة)
+          if (diag.delivery_url) {
+            log(diag.delivery_is_default === true,
+              "نقطة التسليم: " + (diag.delivery_is_default === true
+                ? "الرابط المُضمَّن الافتراضي — " + diag.delivery_url
+                : "مُوجَّهة إلى بوابة بديلة — " + diag.delivery_url));
+          }
           // v2.16: حالة المسار الحيّة (فحص جسم الدوال داخل القاعدة — لا ثوابت).
           // يكشف قاعدة متأخرة تقرأ Vault بينما التشخيص يقول «سليم».
           if (diag.live_path_stale === true) {
@@ -1349,7 +1356,7 @@ function wireChrome() {
           } else if (res.status_code === 404) {
             log(false, "404: الرابط المُضمَّن في trigger_send_push_notification خاطئ — يجب أن يكون https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push");
           } else if (res.dns_error) {
-            log(false, "فشل DNS من داخل القاعدة — " + (res.hint || res.error || ""));
+            log(false, "القاعدة لا تصل إلى نقطة التسليم (فشل DNS) — " + (res.hint || res.error || ""));
           } else {
             log(false, `رد غير متوقع من send-push: ${res.status_code || res.error} ${res.response || ""}`
               + (res.hint ? " — " + res.hint : ""));
@@ -1357,6 +1364,57 @@ function wireChrome() {
         }
       } catch (err) {
         log(false, "فشل المسبار: " + (err?.message || err));
+      }
+      // v2.17: تشخيص شبكة القاعدة — أي مضيفات تصل إليها وأيها لا تصل.
+      try {
+        const { data: netd, error: netErr } = await supabase.rpc("push_net_diagnostics");
+        if (netErr) {
+          log(null, "تشخيص شبكة القاعدة غير متاح — نفّذ migration v2.17 (2026-10-23)");
+        } else {
+          const probes = netd?.probes || {};
+          const ids = Object.entries(probes)
+            .map(([k, v]) => [k, v?.request_id])
+            .filter(([, id]) => id != null);
+          const results = {};
+          for (let round = 0; round < 8 && Object.keys(results).length < ids.length; round += 1) {
+            await new Promise((ok) => setTimeout(ok, 1200));
+            for (const [key, id] of ids) {
+              if (results[key]) continue;
+              const { data } = await supabase.rpc("push_probe_result", { p_request_id: id });
+              if (data && !data.pending) results[key] = data;
+            }
+          }
+          const reached = (key) => {
+            const r = results[key];
+            return !!r && r.status_code != null && r.status_code > 0 && r.status_code < 500;
+          };
+          const fnReached = reached("function");
+          const publicReached = reached("public");
+          const cfReached = reached("cloudflare");
+          const legacyReached = reached("legacy");
+
+          log(fnReached,
+            "شبكة القاعدة ← دالة send-push: " + (fnReached
+              ? "تصل ✅ (" + (results.function?.status_code ?? "?") + ")"
+              : "لا تصل ❌ — " + (results.function?.error || results.function?.hint || "لا يوجد رد")));
+          log(publicReached,
+            "شبكة القاعدة ← مضيف عام (example.com): " + (publicReached ? "تصل ✅" : "لا تصل ❌"));
+          log(cfReached,
+            "شبكة القاعدة ← Cloudflare (workers.dev): " + (cfReached ? "تصل ✅" : "لا تصل ❌"));
+          if (legacyReached) {
+            log(true, "النطاق القديم للدوال (functions.supabase.co) يصل من القاعدة — مسار تسليم بديل متاح بلا Worker");
+          }
+          // الحكم النهائي
+          if (fnReached) {
+            log(true, "الحكم: مسار التسليم سليم — القاعدة تصل إلى دالة send-push");
+          } else if (publicReached || cfReached) {
+            log(false, "الحكم: القاعدة تصل إلى مضيف عام لكن لا إلى نطاق supabase.co — استخدم بوابة بديلة: انشر worker/send-push-relay.js ثم select public.push_set_delivery_url('https://<worker>.workers.dev/')");
+          } else {
+            log(false, "الحكم: مخرج شبكة القاعدة مقيّد (DNS لا يعمل لأي مضيف) — راجع Project Settings ← Network (Restrict egress) في لوحة Supabase، أو تواصل مع دعم Supabase");
+          }
+        }
+      } catch (err) {
+        log(null, "تشخيص شبكة القاعدة تعذّر: " + (err?.message || err));
       }
       // v2.16: فحص مباشر من القاعدة يتجاوز كل دوال المسار — يميّز بين
       // «جسم دالة قديم» و«المشروع لا يستطيع الوصول إلى المضيف».
@@ -1379,7 +1437,7 @@ function wireChrome() {
           } else if (eRes.status_code === 200) {
             log(true, "فحص الخروج: القاعدة تصل إلى send-push مباشرةً (200) — DNS والشبكة سليمان");
           } else if (eRes.dns_error) {
-            log(false, "فحص الخروج: فشل تحليل المضيف من داخل القاعدة — " + (eRes.hint || eRes.error || ""));
+            log(false, "فحص الخروج: القاعدة لا تصل إلى نقطة التسليم — " + (eRes.hint || eRes.error || ""));
           } else {
             log(false, "فحص الخروج: " + (eRes.hint || `${eRes.status_code || eRes.error} ${eRes.response || ""}`));
           }

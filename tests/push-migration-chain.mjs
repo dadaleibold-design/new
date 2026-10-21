@@ -153,7 +153,9 @@ const fns = await q(
 check("الدوال الأساسية موجودة بعد تطبيق السلسلة", fns.length === 6, fns.map((r) => r.proname).join(", "));
 
 const tsDef = (await q("select pg_get_functiondef('public.trigger_send_push_notification(text,uuid,uuid,jsonb)'::regprocedure) d"))[0]?.d || "";
-check("trigger_send_push_notification يضمّن الرابط المُضمَّن", tsDef.includes(URL));
+const duDef = (await q("select pg_get_functiondef('public.push_delivery_url()'::regprocedure) d"))[0]?.d || "";
+check("push_delivery_url يحمل الرابط المُضمَّن (نقطة التسليم)", duDef.includes(URL));
+check("trigger_send_push_notification يقرأ نقطة التسليم (قابلة للتهيئة)", tsDef.includes("public.push_delivery_url()"));
 check("trigger_send_push_notification يضمّن السرّ المُضمَّن", tsDef.includes(SECRET));
 check("trigger_send_push_notification بلا مراجع Vault", !/vault\./.test(tsDef));
 
@@ -244,8 +246,8 @@ check("push_diagnostics: live_path_vault_free = true", diagV216?.live_path_vault
 check("push_diagnostics: live_path_secret_ok = true", diagV216?.live_path_secret_ok === true);
 check("push_diagnostics: live_path_url_ok = true", diagV216?.live_path_url_ok === true);
 check("push_diagnostics: live_path_stale = false (القاعدة محدَّثة)", diagV216?.live_path_stale === false);
-check("push_diagnostics: live_path_functions يذكر الدوال الثلاث",
-  Object.keys(diagV216?.live_path_functions || {}).length === 3,
+check("push_diagnostics: live_path_functions يذكر دوال المسار",
+  Object.keys(diagV216?.live_path_functions || {}).length === 4,
   Object.keys(diagV216?.live_path_functions || {}).join(", "));
 
 // محاكاة قاعدة متأخرة: جسم push_call_edge القديم القائم على Vault
@@ -274,6 +276,17 @@ check("تطبيق v2.16: live_path_vault_free = true", fixed?.live_path_vault_fr
 const edgeDef2 = (await q("select pg_get_functiondef('public.push_call_edge(text,uuid,uuid,jsonb)'::regprocedure) d"))[0]?.d || "";
 check("تطبيق v2.16: push_call_edge بلا Vault", !/vault\./.test(edgeDef2));
 
+// تطبيق أحدث هجرة (v2.17) هو ما يُعيد المسار إلى الحالة الراهنة:
+// نقطة التسليم قابلة للتهيئة + تشخيص شبكة القاعدة.
+await db.exec(read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql"));
+const fixed217 = (await db.query("select public.push_diagnostics() d")).rows[0]?.d;
+check("تطبيق v2.17: القاعدة محدَّثة (live_path_stale = false)", fixed217?.live_path_stale === false);
+check("تطبيق v2.17: نقطة التسليم تُقرأ من الإعدادات (delivery_url)",
+  typeof fixed217?.delivery_url === "string" && fixed217?.delivery_url.length > 0, String(fixed217?.delivery_url));
+check("تطبيق v2.17: التريغر يقرأ نقطة التسليم",
+  /public\.push_delivery_url\(\)/.test(
+    (await q("select pg_get_functiondef('public.trigger_send_push_notification(text,uuid,uuid,jsonb)'::regprocedure) d"))[0]?.d || ""));
+
 // push_egress_check: فحص مباشر لـ pg_net يتجاوز كل دوال المسار
 await db.exec("delete from net.calls");
 const eg = (await db.query("select public.push_egress_check() e")).rows[0]?.e;
@@ -286,7 +299,58 @@ await db.exec(`insert into net._http_response(id, status_code, content, error_ms
   values (999999, 0, null, 'Dns resolve error: Couldn''t resolve host name') on conflict do nothing`);
 const pr = (await db.query("select public.push_probe_result(999999) r")).rows[0]?.r;
 check("push_probe_result: dns_error = true عند فشل تحليل المضيف", pr?.dns_error === true, String(pr?.error));
-check("push_probe_result: hint يشرح السبب", /v2\.16/.test(pr?.hint || ""), String(pr?.hint));
+check("push_probe_result: hint يشرح السبب", /push_net_diagnostics/.test(pr?.hint || ""), String(pr?.hint));
+
+// ── v2.17: نقطة تسليم قابلة للتهيئة + تشخيص شبكة القاعدة ──
+const settingsRow = await q("select delivery_url from public.push_settings where id");
+check("push_settings: صفّ واحد بقيمة افتراضية (الرابط المُضمَّن)",
+  settingsRow.length === 1 && settingsRow[0]?.delivery_url == null, JSON.stringify(settingsRow[0] || {}));
+
+const defUrl = (await q("select public.push_delivery_url() u"))[0]?.u;
+check("push_delivery_url: الافتراضي = الرابط المُضمَّن", defUrl === URL, String(defUrl));
+
+// التبديل إلى بوابة بديلة (Cloudflare Worker) ثم العودة
+const setRes = (await q("select public.push_set_delivery_url('https://relay.example.workers.dev/') r"))[0]?.r;
+check("push_set_delivery_url: يقبل نقطة بديلة", setRes?.ok === true, JSON.stringify(setRes || {}));
+const altUrl = (await q("select public.push_delivery_url() u"))[0]?.u;
+check("push_delivery_url: صار يشير إلى البوابة البديلة", altUrl === "https://relay.example.workers.dev/", String(altUrl));
+
+// التريغر يستخدم نقطة التسليم البديلة
+await db.exec("delete from net.calls; delete from public.push_delivery_log");
+await db.query("insert into public.messages (conversation_id, sender_id, content, message_type) values ($1,$2,$3,'text')", [conv, USER, "بريد بديل"]);
+const altCall = await q("select url, headers from net.calls order by id desc limit 1");
+check("التريغر يرسل إلى نقطة التسليم البديلة", altCall[0]?.url === "https://relay.example.workers.dev/", String(altCall[0]?.url));
+check("الترويسة x-send-push-secret = السرّ المُضمَّن (مع البوابة البديلة)",
+  altCall[0]?.headers?.["x-send-push-secret"] === SECRET);
+
+// العودة للافتراضي
+await q("select public.push_set_delivery_url(null)");
+const backUrl = (await q("select public.push_delivery_url() u"))[0]?.u;
+check("push_set_delivery_url: الرجوع للافتراضي", backUrl === URL, String(backUrl));
+
+// تشخيص الشبكة
+const netd = (await q("select public.push_net_diagnostics() d"))[0]?.d;
+check("push_net_diagnostics: يعلن 4 مسبارات (دالة/قديم/عام/Cloudflare)",
+  Object.keys(netd?.probes || {}).length === 4, Object.keys(netd?.probes || {}).join(", "));
+check("push_net_diagnostics: يذكر رابط دالة send-push + السطر البديل",
+  netd?.probes?.function?.url === URL && /workers\.dev|cloudflare/.test(JSON.stringify(netd?.probes || {})));
+check("push_net_diagnostics: يبلّغ عن حالة امتداد pg_net",
+  typeof netd?.pg_net_installed === "boolean" && netd?.pg_net_version !== undefined,
+  `installed=${netd?.pg_net_installed} version=${netd?.pg_net_version}`);
+
+// مُعدِّل نقطة التسليم مقصور على service_role
+const priv = (await q(
+  "select has_function_privilege('anon','public.push_set_delivery_url(text)','execute') anon_exec, " +
+  "has_function_privilege('authenticated','public.push_set_delivery_url(text)','execute') auth_exec, " +
+  "has_function_privilege('service_role','public.push_set_delivery_url(text)','execute') svc_exec"))[0] || {};
+check("push_set_delivery_url: لا يُمنح لـ anon/authenticated",
+  priv.anon_exec === false && priv.auth_exec === false, JSON.stringify(priv));
+check("push_set_delivery_url: مُمنح لـ service_role",
+  priv.svc_exec === true, JSON.stringify(priv));
+
+// جدول الإعدادات محمي بـ RLS
+const rlsOn = await q("select relrowsecurity from pg_class where relname='push_settings' and relnamespace='public'::regnamespace");
+check("push_settings: RLS مفعّل", rlsOn[0]?.relrowsecurity === true);
 
 await db.close();
 console.log(fails ? `\n❌ FAILED ${fails} check(s)` : "\n✅ PASSED push-migration-chain (schema + سلسلة الهجرات بلا Vault)");
