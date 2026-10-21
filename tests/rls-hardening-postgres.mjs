@@ -316,6 +316,18 @@ check("trigger_send_push_notification يضمّن السرّ المعتمد", tsD
 check("تعريف push_call_edge/trigger_send_push_notification بلا أي مرجع Vault",
   !/vault\./.test(pcDef) && !/vault\./.test(tsDef));
 
+// ---------- v2.16: التشخيص يفحص الجسم الحيّ بدل الثوابت ----------
+const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
+const v216Code = MIGRATION_V216.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+check("v2.16: ملف الهجرة موجود", MIGRATION_V216.length > 0);
+check("v2.16: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v216Code));
+check("v2.16: push_diagnostics يفحص pg_proc.prosrc (الحالة الحيّة)",
+  /pg_proc/.test(MIGRATION_V216) && /live_path_stale/.test(MIGRATION_V216));
+check("v2.16: push_egress_check معرَّف", /create or replace function public\.push_egress_check\(\)/.test(MIGRATION_V216));
+const SCHEMA_V216 = read("sql/schema.sql");
+check("v2.16: مذكور في schema.sql", SCHEMA_V216.includes("22. الإصدار v2.16 (2026-10-22)")
+  && SCHEMA_V216.includes("push_egress_check"));
+
 // لا ملف SQL في المستودع يقرأ SEND_PUSH_URL/SEND_PUSH_SECRET من Vault
 const SQL_PUSH_FILES = [
   "sql/schema.sql",

@@ -13,6 +13,7 @@ const SW = read("firebase-messaging-sw.js");
 const ENV = read(".env.example");
 const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
 const SCHEMA = read("sql/schema.sql");
+const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
 const CONFIG = read("supabase/config.toml");
 
 // القيم المعتمدة (مُضمَّنة في كود مسار التريگرات — بلا Vault).
@@ -75,6 +76,27 @@ check("v2.15: التشخيص يعلن الرابط المُضمَّن وحالة
   /'edge_function_url', 'https:\/\/gqocavvhkfzgxzscrjms/.test(MIGRATION_V215) && /'vault_dependency', false/.test(MIGRATION_V215));
 check("v2.15: القسم مضاف إلى schema.sql", SCHEMA.includes("21. الإصدار v2.15 (2026-10-21)") && SCHEMA.includes("create or replace function public.trigger_send_push_notification("));
 check("migration v2.14 موجودة في schema.sql", SCHEMA.includes("20. الإصدار v2.14 (2026-10-18)") && SCHEMA.includes("sb_(publishable|secret)_"));
+
+// ---------- v2.16: تثبيت المسار في القاعدة الحيّة + تشخيص يفحص الجسم الحيّ ----------
+const v216Code = MIGRATION_V216
+  .split("\n")
+  .filter((l) => !l.trimStart().startsWith("--"))
+  .join("\n");
+check("v2.16: ملف الهجرة موجود ويحمل السرّ والرابط المُضمَّنين",
+  MIGRATION_V216.includes(EXPECTED_SECRET) && MIGRATION_V216.includes(EXPECTED_URL));
+check("v2.16: لا مراجع Vault في كود اله��جرة", !VAULT_REF.test(v216Code));
+check("v2.16: push_diagnostics يفحص الجسم الحيّ (pg_proc.prosrc) لا ثوابت",
+  /pg_proc/.test(MIGRATION_V216) && /live_path_stale/.test(MIGRATION_V216) && /live_path_vault_free/.test(MIGRATION_V216));
+check("v2.16: push_egress_check جديد (فحص pg_net ← DNS مباشرةً)",
+  /create or replace function public\.push_egress_check\(\)/.test(MIGRATION_V216));
+check("v2.16: push_probe_result يميّز خطأ DNS ويشرح سببه",
+  /'dns_error'/.test(MIGRATION_V216) && /'hint'/.test(MIGRATION_V216));
+check("v2.16: إعادة تعريف دوال المسار كاملةً (يصلح أي قاعدة متأخرة)",
+  ["trigger_send_push_notification", "push_call_edge", "push_diagnostics", "push_probe",
+   "push_probe_result", "push_gateway_check"].every((f) =>
+    MIGRATION_V216.includes(`create or replace function public.${f}(`)));
+check("v2.16: القسم مضاف إلى schema.sql", SCHEMA.includes("22. الإصدار v2.16 (2026-10-22)")
+  && SCHEMA.includes("create or replace function public.push_egress_check()"));
 check("send-push يبقى متاحاً لنداءات pg_net بدون JWT عند وجود السر", /verify_jwt = false/.test(CONFIG));
 
 let PGlite;
