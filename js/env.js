@@ -33,10 +33,9 @@ export const REQUIRED_ENV_KEYS = Object.freeze([
 export const ENV_KEYS = Object.freeze([
   ...REQUIRED_ENV_KEYS,
   "VITE_AGORA_APP_ID",
-  // اختياري: السرّ المشترك لدالة send-push (يسمح للواجهة بالاستدعاء
-  // بالسرّ بدل رمز المستخدم). اتركه فارغاً لاستخدام رمز المستخدم فقط.
-  "VITE_SEND_PUSH_SECRET",
 ]);
+// ⛔ لا سرّ إشعارات في الواجهة إطلاقاً: الإرسال يبدأ من Database Webhook داخل
+//    Supabase، والواجهة تستدعي send-push برمز المستخدم (JWT) للاختبار فقط.
 
 /**
  * تطبيع قيمة بيئة إلى سلسلة مقصوصة (غير السلاسل تتحول إلى فارغة بأمان)
@@ -64,7 +63,6 @@ function readViteEnv() {
       "VITE_FIREBASE_APP_ID": clean(viteEnv["VITE_FIREBASE_APP_ID"]),
       "VITE_VAPID_PUBLIC_KEY": clean(viteEnv["VITE_VAPID_PUBLIC_KEY"]),
       "VITE_AGORA_APP_ID": clean(viteEnv["VITE_AGORA_APP_ID"]),
-      "VITE_SEND_PUSH_SECRET": clean(viteEnv["VITE_SEND_PUSH_SECRET"]),
     };
   } catch {
     return {};
@@ -122,13 +120,6 @@ export const VAPID_PUBLIC_KEY = initialSnapshot["VITE_VAPID_PUBLIC_KEY"] || "";
 
 /** معرّف مشروع Agora العام (اختياري — ليس سرّاً) */
 export const AGORA_APP_ID = initialSnapshot["VITE_AGORA_APP_ID"] || "";
-
-/**
- * السرّ المشترك لدالة send-push — اختياري تماماً.
- * يُستخدم في الواجهة فقط إذا أراد المالك استعمال «ترويسة x-send-push-secret»
- * بدل رمز المستخدم. فارغ ⇒ المسار الافتراضي (رمز المستخدم) وهو الآمن.
- */
-export const SEND_PUSH_SECRET = initialSnapshot["VITE_SEND_PUSH_SECRET"] || "";
 
 const FIREBASE_PROJECT_ID = initialSnapshot["VITE_FIREBASE_PROJECT_ID"] || "";
 

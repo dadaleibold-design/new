@@ -1,12 +1,9 @@
 /*
  * تحقّق فعلي من هجرة v2.8 على PostgreSQL حقيقي (41 فحصاً) — PGlite/WASM
  * -------------------------------------------------------------
- * يشغّل ملف الهجرة كما هو على محرّك PostgreSQL حقيقي مع بيئة مصغّرة تحاكي
- * Supabase (auth.uid / vault.decrypted_secrets / net._http_response /
- * push_call_edge) ويتحقق من:
- *   • إشعار المشرفين لمستخدم جديد (النداء، الحمولة، الحالات الطرفية)
+ * يشغّل ملف الهجرة كما هو على محرّك PostgreSQL حقيقي ويتحقق من:
  *   • دليل المستخدمين (البحث بالاسم/الهاتف/البريد، الترقيم، الصلاحيات، تهريب LIKE)
- *   • push_diagnostics و admin_recipient_ids
+ *   • أن الهجرة لم تعد تحمل أي مسار إشعارات (v3.0: Database Webhooks فقط)
  *   • إعادة تنفيذ الهجرة بأمان (idempotent)
  *
  * التشغيل:
@@ -93,24 +90,6 @@ await db.exec(`
   );
 
   create table public.fcm_tokens (id uuid primary key default gen_random_uuid(), user_id uuid, token text);
-  create table vault.decrypted_secrets (name text, decrypted_secret text);
-  create table net._http_response (id bigint, status_code int, content jsonb, error_msg text);
-
-  -- دالة إيزر تُسجّل كل نداء بدل إرسال طلب شبكة حقيقي
-  create table public.test_push_calls (
-    id bigserial primary key,
-    kind text,
-    ref_id uuid,
-    recipient uuid,
-    body jsonb
-  );
-
-  create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-  returns void language plpgsql security definer set search_path = public as $$
-  begin
-    insert into public.test_push_calls(kind, ref_id, recipient, body) values (p_kind, p_ref, p_recipient, p_body);
-  end;
-  $$;
 
   -- نسخة مطابقة لدالة is_admin_user في schema.sql (v2.2)
   create or replace function public.is_admin_user(p_user_id uuid default auth.uid())
@@ -145,7 +124,20 @@ check("الهجرة تُنفَّذ بلا أخطاء", true);
 await db.exec(MIGRATION);
 check("إعادة تنفيذ الهجرة بأمان (idempotent)", true);
 
-// ---------- (أ) إشعار المشرفين ----------
+// ---------- (أ) لا مسار إشعارات في الهجرة (v3.0) ----------
+const migrationCode = MIGRATION.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+check("الهجرة لا تُنشئ trigger إشعار للمستخدم الجديد",
+  !/create trigger on_profile_created_notify_admins/.test(migrationCode));
+check("الهجرة لا تعرّف notify_admins_new_profile",
+  !/create or replace function public\.notify_admins_new_profile/.test(migrationCode));
+check("الهجرة لا تستدعي push_call_edge أو net.http_post",
+  !/push_call_edge|net\.http_post/.test(migrationCode));
+check("الهجرة لا تقرأ من Vault", !/vault\./.test(migrationCode));
+check("لا دوال إشعارات في القاعدة بعد الهجرة",
+  (await db.query(`select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace
+    where ns.nspname='public' and (p.proname like 'push_%' or p.proname like 'notify_%')`)).rows[0].n === 0);
+
+// بيانات المستخدمين (كما في سيناريو الدليل)
 const insertProfile = async (id, name, { admin = false, phone = null, email = null, blocked = false } = {}) =>
   db.query(
     `insert into public.profiles (id, display_name, phone, email, is_admin, is_blocked, created_at)
@@ -153,72 +145,18 @@ const insertProfile = async (id, name, { admin = false, phone = null, email = nu
     [id, name, phone, email, admin, blocked],
   );
 
-// قبل وجود أي مشرف: لا إشعار + سطر "SKIPPED" في السجل
 await insertProfile("00000000-0000-4000-8000-000000000001", "أول مستخدم");
-let skipped = await db.query("select note from public.push_delivery_log where kind = 'new_user'");
-check(
-  "لا إشعار قبل وجود مشرف + سبب مُسجَّل في push_delivery_log",
-  skipped.rows.length === 1 && /SKIPPED/.test(skipped.rows[0].note || ""),
-  JSON.stringify(skipped.rows),
-);
-check("لا نداء لدالة send-push قبل وجود مشرف", (await db.query("select count(*)::int n from public.test_push_calls")).rows[0].n === 0);
-
 await insertProfile("11111111-0000-4000-8000-000000000001", "المشرف الأول", { admin: true, email: "admin1@example.com" });
 await insertProfile("11111111-0000-4000-8000-000000000002", "المشرف العام", { admin: true, email: "almgawell17@gmail.com" });
 await db.query("update public.profiles set is_super_admin = true where id = '11111111-0000-4000-8000-000000000002'");
 await insertProfile("11111111-0000-4000-8000-000000000003", "مشرف محظور", { admin: true, blocked: true });
-
-await db.query("delete from public.test_push_calls");
 await insertProfile("00000000-0000-4000-8000-000000000002", "سارة العتيبي", { phone: "+966501234567" });
-
-let calls = await db.query("select * from public.test_push_calls");
-check("تسجيل مستخدم جديد = نداء واحد إلى send-push", calls.rows.length === 1, `count=${calls.rows.length}`);
-const call = calls.rows[0] || {};
-check("نوع النداء new_user", call.kind === "new_user");
-check("الحمولة تحمل معرّف المستخدم الجديد", call.body?.user_id === "00000000-0000-4000-8000-000000000002");
-check("الحمولة تحمل الاسم", call.body?.display_name === "سارة العتيبي");
-check("الحمولة تحمل الهاتف", call.body?.phone === "+966501234567");
-check("عدد المشرفين المستحقين مستثنى فيه المحظور (2)", call.body?.admins_count === 2, String(call.body?.admins_count));
-
-// تعديل الملف الشخصي لا يُشعر مرة أخرى
-await db.query("update public.profiles set display_name = 'سارة ع.' where id = '00000000-0000-4000-8000-000000000002'");
-calls = await db.query("select * from public.test_push_calls");
-check("التحديث لا يُطلق إشعاراً (INSERT فقط)", calls.rows.length === 1, `count=${calls.rows.length}`);
-
-// مستخدم بهاتف: البريد الداخلي لا يُسرَّب
-await db.query("delete from public.test_push_calls");
 await insertProfile("00000000-0000-4000-8000-000000000003", "مستخدم هاتف", {
   phone: "0500000000",
   email: "phone.966500000000@users.local",
 });
-const phoneCall = (await db.query("select * from public.test_push_calls")).rows[0];
-check("البريد الداخلي phone.*@users.local لا يُرسل في الحمولة", phoneCall?.body?.email === null, JSON.stringify(phoneCall?.body?.email));
-
-// مشرف جديد يُعلَّم كـ is_admin في الحمولة
-await db.query("delete from public.test_push_calls");
 await insertProfile("11111111-0000-4000-8000-000000000004", "مشرف جديد", { admin: true, email: "new-admin@example.com" });
-check("تسجيل مشرف جديد يُعلَّم في الحمولة", (await db.query("select * from public.test_push_calls")).rows[0]?.body?.is_admin === true);
-
-// فشل push_call_edge لا يُفشل الإدراج
-await db.exec(`
-  create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-  returns void language plpgsql as $$ begin raise exception 'boom'; end; $$;
-`);
-let insertFailed = false;
-try {
-  await insertProfile("00000000-0000-4000-8000-000000000004", "مستخدم مع فشل إشعار");
-} catch {
-  insertFailed = true;
-}
-check("فشل الإشعار لا يُفشل التسجيل (لا استثناء للمستخدم)", !insertFailed);
-await db.exec(`
-  create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-  returns void language plpgsql security definer set search_path = public as $$
-  begin
-    insert into public.test_push_calls(kind, ref_id, recipient, body) values (p_kind, p_ref, p_recipient, p_body);
-  end;
-  $$;
-`);
+await insertProfile("00000000-0000-4000-8000-000000000004", "مستخدم رابع");
 
 // ---------- (ب) دليل المستخدمين ----------
 const asUser = async (uid) => db.exec(`set test.uid = '${uid}'`);
@@ -309,29 +247,11 @@ try {
 }
 check("بلا مصادقة: مرفوض", denied);
 
-// ---------- (ج) التشخيص ----------
-await asUser("11111111-0000-4000-8000-000000000001");
-let diag = null;
-let diagFailed = false;
-try {
-  diag = (await db.query("select public.push_diagnostics() as d")).rows[0].d;
-} catch (e) {
-  diagFailed = true;
-  console.log("diag error:", e.message);
-}
-check("push_diagnostics يعمل", !diagFailed);
-check("push_diagnostics يُبلّغ عن trigger_new_user", diag?.trigger_new_user === true, JSON.stringify(diag?.trigger_new_user));
-check("push_diagnostics يُبلّغ عن directory_rpc", diag?.directory_rpc === true);
-check("push_diagnostics يعرض عدد المشرفين النشطين", diag?.admins_count === 3, String(diag?.admins_count));
-check("push_diagnostics يعرض عدد المسجّلين", Number(diag?.registered_users) === 8, String(diag?.registered_users));
-
-// ---------- (د) admin_recipient_ids ----------
-const recipients = await db.query("select id from public.admin_recipient_ids() order by id");
-check(
-  "admin_recipient_ids يرجّع المشرفين النشطين فقط (بلا المحظور)",
-  recipients.rows.length === 3 && !recipients.rows.some((r) => r.id === "11111111-0000-4000-8000-000000000003"),
-  recipients.rows.map((r) => r.id).join(","),
-);
+// ---------- (ج) صلاحيات دوال الإشعارات الغائبة ----------
+check("admin_recipient_ids أُزيلت من القاعدة",
+  (await db.query(`select to_regprocedure('public.admin_recipient_ids()') is null as gone`)).rows[0].gone === true);
+check("push_diagnostics أُزيلت من القاعدة",
+  (await db.query(`select to_regprocedure('public.push_diagnostics()') is null as gone`)).rows[0].gone === true);
 
 console.log(fails ? `\n${fails} فحص فشل` : "\nكل فحوصات هجرة v2.8 نجحت");
 process.exit(fails ? 1 : 0);

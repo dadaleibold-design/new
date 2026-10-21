@@ -122,13 +122,10 @@ const FORBIDDEN_IN_FRONTEND = [
 ];
 
 /**
- * ⚠️ استثناء موثّق (v2.19): السرّ المشترك لدالة send-push مسموح في المتصفح
- *    **بصيغته الاختيارية** VITE_SEND_PUSH_SECRET (فارغ افتراضياً) — بطلب
- *    المالك: مسار إرسال الإشعارات من الواجهة (قاعدة البيانات معزولة شبكياً).
- *    يبقى الاسم العادي SEND_PUSH_SECRET ممنوعاً في الواجهة، ولا يُكتب أي
- *    قيمة سرّية داخل المستودع — القيمة تأتي من متغيّر بيئة وقت التشغيل.
+ * ⛔ v3.0: لا استثناءات. الإشعارات تبدأ من Database Webhook داخل Supabase،
+ *    ولا يوجد أي سرّ إشعارات في المتصفح — VITE_SEND_PUSH_SECRET ممنوع نهائياً.
  */
-const ALLOWED_OPTIONAL_FRONTEND_VITE_KEYS = ["VITE_SEND_PUSH_SECRET"];
+const ALLOWED_OPTIONAL_FRONTEND_VITE_KEYS = [];
 
 /** يزيل تعليقات JS/TS/HTML حتى لا يُحتسب ذكر الاسم في التوثيق */
 function stripComments(code) {
@@ -203,7 +200,7 @@ for (const key of ["AGORA_APP_ID", "AGORA_APP_CERTIFICATE"]) {
 }
 check("send-push calls FCM HTTP v1 directly", /fcm\.googleapis\.com\/v1\/projects/.test(sendPushCode));
 check("send-push signs OAuth service-account JWT without third-party secrets", /RSASSA-PKCS1-v1_5/.test(sendPushCode) && /oauth2\.googleapis\.com\/token/.test(sendPushCode));
-check("send-push builds data-only FCM message with priority and TTL", /data: fittedData/.test(sendPushCode) && /webpush:/.test(sendPushCode) && /android:/.test(sendPushCode));
+check("send-push builds data-only FCM message with priority and TTL", /data: fitFcmData\(data\)/.test(sendPushCode) && /webpush:/.test(sendPushCode) && /android:/.test(sendPushCode));
 check("send-push no longer depends on Cloudflare Worker", !/PUSH_GATEWAY_URL|PUSH_GATEWAY_SECRET|workers\.dev/.test(sendPushCode));
 
 check("لا يوجد مفتاح خاص فعلي مكتوب في أي دالة", !/-----BEGIN PRIVATE KEY-----\\s*MII[A-Za-z0-9+/=\\s]{100,}/.test(sendPush + agora));
@@ -215,9 +212,6 @@ const example = read(".env.example");
 const requiredNames = [
   ...REQUIRED_VITE,
   "VITE_AGORA_APP_ID", // إضافي/اختياري: معرّف Agora العام في الواجهة
-  // إضافي/اختياري: السرّ المشترك لدالة send-push (بصيغة VITE_ فقط — انظر
-  // الاستثناء الموثّق في ALLOWED_OPTIONAL_FRONTEND_VITE_KEYS)
-  "VITE_SEND_PUSH_SECRET",
   // أسرار FCM المباشر في Edge Function (ليست VITE_ ولا تُحقن في المتصفح)
   "SEND_PUSH_SECRET",
   "FIREBASE_SERVICE_ACCOUNT",

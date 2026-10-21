@@ -7,6 +7,8 @@
  *   from().select().eq()/.in()/.or() → await → { data, error }
  *   from().select()…().maybeSingle() → { data, error }
  *   from().update(values).eq()…     → { data, error }  (يُسجَّل في __STUB_CALLS__)
+ *   from().insert(values)           → { data, error }  (يُسجَّل في __STUB_CALLS__)
+ *   from().select()…().order().limit() → { data, error }
  *   from().delete().eq()…           → { data, error }  (يُسجَّل في __STUB_CALLS__)
  *   auth.getUser(jwt)               → { data: { user }, error }
  * البيانات من __STUB_DB__ والمكالمات إلى __STUB_CALLS__ (يضبطهما الاختبار).
@@ -21,6 +23,7 @@ const CALLS: any[] = (globalThis as any).__STUB_CALLS__ || [];
 class Query {
   table: string;
   filters: Array<[string, string, any]> = [];
+  limitCount: number | null = null;
 
   constructor(table: string) {
     this.table = table;
@@ -45,9 +48,25 @@ class Query {
     return this;
   }
 
+  order(_column: string, _options?: Row): Query {
+    return this;
+  }
+
+  limit(count: number): Query {
+    this.limitCount = count;
+    return this;
+  }
+
   update(values: Row): Query {
     CALLS.push({ kind: "update", table: this.table, values, filters: this.filters });
     return this;
+  }
+
+  insert(values: Row): Promise<{ data: null; error: null }> {
+    CALLS.push({ kind: "insert", table: this.table, values });
+    const rows = DB[this.table] || (DB[this.table] = []);
+    rows.push({ id: `row-${rows.length + 1}`, created_at: new Date().toISOString(), ...values });
+    return Promise.resolve({ data: null, error: null });
   }
 
   delete(): Query {
@@ -67,7 +86,7 @@ class Query {
         rows = rows.filter((r) => r.is_admin === true || r.is_super_admin === true);
       }
     }
-    return rows;
+    return this.limitCount === null ? rows : rows.slice(0, this.limitCount);
   }
 
   maybeSingle() {

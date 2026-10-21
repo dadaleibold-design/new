@@ -577,6 +577,36 @@ export async function sendTestNotification() {
   return json;
 }
 
+/**
+ * تشخيص الإشعارات من دالة send-push (مصدر الحقيقة الوحيد بعد v3.0).
+ * يتحقّق من: إعداد Firebase، سرّ الـ Webhook، توكنات هذا الحساب،
+ * وآخر أحداث Webhook المسجَّلة في push_delivery_log.
+ *
+ * المسار: المتصفح → send-push (JWT) → قراءة الحالة وإرجاعها.
+ * لا شبكة من قاعدة البيانات ولا أسرار في الواجهة.
+ */
+export async function getPushDiagnostics() {
+  const { supabase } = await import("./supabaseClient.js");
+  const { SUPABASE_URL, SUPABASE_ANON_KEY } = await import("./config.js");
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) throw new Error("سجّل الدخول أولاً.");
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({ type: "diagnostics" }),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = json?.error || json?.message || "";
+    throw new Error(`HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
+  }
+  return json;
+}
+
 export function getCurrentFcmToken() {
   return localStorage.getItem("fcm_token");
 }

@@ -16,15 +16,10 @@ import {
   getReadState,
 } from "./db.js";
 import {
-  clientPushCall,
-  clientPushMessage,
-  clientPushNewUser,
-  clientPushProbe,
-} from "./clientPush.js";
-import {
   enablePushNotifications,
   listenForForegroundMessages,
   sendTestNotification,
+  getPushDiagnostics,
   syncPushToken,
   disablePushNotifications,
   watchTokenRefresh,
@@ -78,13 +73,11 @@ import {
 } from "./notification-router.js";
 
 /**
- * رابط دالة send-push المُضمَّن في مسار التريگرات (migration v2.15).
- * ليس سرّاً: دالة عامة على البوابة منشورة بـ verify_jwt = false، والتحقّق
- * الفعلي يتم عبر ترويسة x-send-push-secret داخل الدالة. يُستخدم هنا لمقارنة
- * ما تعلنه القاعدة (edge_function_url / url) مع القيمة المتوقَّعة والتأكّد
- * من عدم وجود أي اعتماد على Supabase Vault.
+ * رابط دالة send-push — مُشتقّ من بيئة المشروع (لا رابط مُضمَّن ولا سرّ في الواجهة).
+ * الإشعارات تُطلقها Database Webhooks من Supabase؛ الواجهة لا ترسل إشعارات
+ * لأحد، وتستدعي الدالة فقط لـ«اختبار الإشعارات» و«التشخيص» برمز المستخدم.
  */
-const SEND_PUSH_EDGE_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
+const SEND_PUSH_EDGE_URL = `${SUPABASE_URL}/functions/v1/send-push`;
 
 /**
  * قراءة آمنة من localStorage عند تهيئة الوحدة: الوصول المباشر قد يرمي
@@ -1256,51 +1249,43 @@ function wireChrome() {
       const token = localStorage.getItem("fcm_token");
       log(!!token, token ? `توكن FCM موجود (…${token.slice(-8)})` : "تعذّر الحصول على توكن FCM");
       if (!token) return;
+      // ★ التشخيص من مصدر الحقيقة الوحيد: دالة send-push نفسها.
+      //   القاعدة لا تُرسل إشعارات (لا pg_net ولا Vault ولا تريگرات)، لذا
+      //   الفحص هنا يتحقّق من: إعداد Firebase، سرّ الـ Webhook، التوكنات،
+      //   وآخر أحداث Webhook المسجَّلة في push_delivery_log.
       try {
-        const { data: diag, error: diagErr } = await supabase.rpc("push_diagnostics");
-        if (diagErr) {
-          log(false, "دالة push_diagnostics غير موجودة — نفّذ migration v2.2 في Supabase");
-        } else {
-          log(!!diag.pg_net_installed, "امتداد pg_net " + (diag.pg_net_installed ? "مفعّل" : "غير مفعّل"));
-          const diagUrl = diag.edge_function_url || "";
-          log(!!diag.edge_url_ok && diagUrl === SEND_PUSH_EDGE_URL,
-            "مسار التريگرات → send-push " + (diag.edge_url_ok
-              ? (diagUrl === SEND_PUSH_EDGE_URL ? "سليم: " + diagUrl : "الرابط المُضمَّن لا يطابق المتوقع: " + diagUrl + " — المتوقَّع " + SEND_PUSH_EDGE_URL)
-              : "خاطئ — راجع الرابط المُضمَّن في trigger_send_push_notification (migration v2.15)"));
-          // الاعتماد على Vault: لا شيء — الرابط والسرّ مُضمَّنان في الكود
-          log(diag.vault_dependency === false,
-            "اعتماد Vault: " + (diag.vault_dependency === false
-              ? "معدوم — الرابط والسرّ مُضمَّنان في trigger_send_push_notification (migration v2.15)"
-              : "ما زال ثمّة اعتماد على Supabase Vault — طبّق migration v2.15"));
-          log(diag.secret_hardcoded === true,
-            "السرّ المشترك: " + (diag.secret_hardcoded === true
-              ? "مُضمَّن في مسار التريگرات (x-send-push-secret)"
-              : "غير مُضمَّن — نفّذ migration v2.15"));
-          // v2.17: نقطة التسليم الفعّالة (قابلة للتهيئة من القاعدة)
-          if (diag.delivery_url) {
-            log(diag.delivery_is_default === true,
-              "نقطة التسليم: " + (diag.delivery_is_default === true
-                ? "الرابط المُضمَّن الافتراضي — " + diag.delivery_url
-                : "مُوجَّهة إلى بوابة بديلة — " + diag.delivery_url));
-          }
-          // v2.16: حالة المسار الحيّة (فحص جسم الدوال داخل القاعدة — لا ثوابت).
-          // يكشف قاعدة متأخرة تقرأ Vault بينما التشخيص يقول «سليم».
-          if (diag.live_path_stale === true) {
-            log(false, "مسار الإرسال في القاعدة قديم — " + (diag.live_path_hint || "نفّذ migration v2.16 (2026-10-22)"));
-          } else if (diag.live_path_vault_free === true) {
-            log(true, "جسم دوال المسار داخل القاعدة محدَّث ومُضمَّن (بلا Vault)");
-          }
-          log(!!diag.trigger_messages, "Trigger الرسائل " + (diag.trigger_messages ? "موجود" : "مفقود"));
-          log(Number(diag.my_tokens) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag.my_tokens}`);
-          const last = (diag.last_log || [])[0];
-          if (last?.note) log(false, "آخر محاولة إرسال من الـ Trigger: " + last.note);
-          else if (last?.status_code && last.status_code !== 200) log(false, `آخر رد لـ send-push على الـ Trigger: HTTP ${last.status_code} ${last.response || ""}`);
-          else if (last?.status_code === 200) log(true, "آخر استدعاء للـ Trigger نجح (200)");
+        const diag = await getPushDiagnostics();
+        const checks = diag?.checks || {};
+        log(checks.firebase_ready === true,
+          "Firebase في send-push: " + (checks.firebase_ready
+            ? `مهيّأ (${diag?.firebase?.project_id || "project"})`
+            : "غير مهيّأ — اضبط FIREBASE_SERVICE_ACCOUNT أو المتغيرات الثلاثة"));
+        log(checks.webhook_secret_ready === true,
+          "سرّ الـ Webhook: " + (checks.webhook_secret_ready
+            ? "مضبوط في أسرار الدالة وترويسة الـ Webhook"
+            : "غير مضبوط — اضبط SEND_PUSH_SECRET وأضفه إلى ترويسة الـ Webhook"));
+        log(diag?.database_notifications?.pg_net === false && diag?.database_notifications?.vault === false,
+          "قاعدة البيانات: بلا pg_net وبلا Vault وبلا تريگرات إشعارات ✅");
+        const expected = diag?.webhook?.endpoint || SEND_PUSH_EDGE_URL;
+        log(true, "وجهة الـ Webhook: " + expected);
+        for (const hook of diag?.webhook?.expected_hooks || []) {
+          log(true, `Webhook مطلوب: ${hook.table} ← ${(hook.events || []).join(" + ")}`);
         }
-      } catch {
-        /* تجاهل */
+        log(Number(diag?.me?.devices) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag?.me?.devices ?? 0}`);
+        const seen = Number(diag?.delivery_log?.webhook_events_seen) || 0;
+        log(seen > 0,
+          seen > 0
+            ? `أحداث Webhook مسجَّلة لهذا الحساب: ${seen}`
+            : "لا سجل Webhook بعد — أنشئ الـ Webhooks الثلاثة في لوحة Supabase (Database → Webhooks)");
+        const last = (diag?.delivery_log?.recent || [])[0];
+        if (last?.skipped) log(null, `آخر حدث (${last.kind}): تم التخطي — ${last.skipped}`);
+        else if (last) log(true, `آخر حدث (${last.kind}): أُرسل إلى ${last.sent}/${last.total} جهاز`);
+        if (diag?.hint) log(null, diag.hint);
+      } catch (err) {
+        log(false, "تعذّر قراءة تشخيص send-push: " + (err?.message || err)
+          + " — تحقّق أن الدالة منشورة: supabase functions deploy send-push");
       }
-      log(null, "١) المسار المباشر: التطبيق → send-push → FCM…");
+      log(null, "اختبار مباشر: التطبيق → send-push → FCM (نفس مسار الـ Webhook بعد استلام الحدث)…");
       const r = await sendTestNotification();
       log(r.sent > 0, `السيرفر أرسل إلى ${r.sent}/${r.total} جهاز عبر FCM`);
       const failed = (r.results || []).filter((x) => !x.ok);
@@ -1318,76 +1303,8 @@ function wireChrome() {
         }
       }
 
-      log(null, "٢) مسار العميل: المتصفح → Realtime → send-push → FCM (المسار الحيّ في وضع العميل)…");
-      // ★ فحص اتصال العميل المباشر بالدالة — بديل فحص شبكة القاعدة (pg_net).
-      //   لا سرّ مشترك في المتصفح: المصادقة برمز المستخدم.
-      try {
-        const probe = await clientPushProbe();
-        log(true, "اتصال المتصفح بـ send-push: سليم ✅ (200)"
-          + " — " + (probe?.devices ?? 0) + " جهاز مرتبط بهذا الحساب"
-          + " (وضع " + (probe?.mode || "client") + ")");
-      } catch (err) {
-        log(false, "اتصال المتصفح بـ send-push فشل: " + (err?.message || err)
-          + " — تحقّق أن الدالة منشورة: supabase functions deploy send-push --no-verify-jwt");
-      }
-      // وضع القاعدة: «عميل» = لا شبكة من القاعدة إطلاقاً (وهو المطلوب هنا)
-      try {
-        const { data: diagMode, error: modeErr } = await supabase.rpc("push_diagnostics");
-        if (modeErr) {
-          log(null, "وضع القاعدة غير معروف — نفّذ migration v2.19 (2026-10-25)");
-        } else {
-          const mode = diagMode?.push_mode || "unknown";
-          log(mode === "client",
-            "وضع القاعدة: عميل فقط ✅ — القاعدة لا تُجري أي طلب شبكة (مقصود: القاعدة معزولة)",
-            "وضع القاعدة: " + mode);
-          if (mode === "db") {
-            log(false, "وضع القاعدة 'db' ⇒ التريغر يحاول pg_net وهو محجوب — select public.push_set_mode('client');");
-          }
-        }
-      } catch (err) {
-        log(null, "تعذّر قراءة وضع القاعدة: " + (err?.message || err));
-      }
-      // إعداد المسار (الرابط/السرّ/نقطة التسليم) — كما هو، بلا شبكة
-      try {
-        const { data: gw, error: gwErr } = await supabase.rpc("push_gateway_check");
-        if (gwErr) {
-          // ⚠️ نعرض الخطأ الحقيقي من القاعدة بدل التخمين
-          log(null, "فحص البوابة (push_gateway_check) فشل: " + (gwErr.message || gwErr)
-            + " — نفّذ migration v2.18 (2026-10-24) (تُنشئ الدالة من جديد بعد حذفها)");
-        } else {
-          log(gw?.url_ok === true && gw?.url === SEND_PUSH_EDGE_URL,
-            "إعداد البوابة: الرابط المُضمَّن " + (gw?.url === SEND_PUSH_EDGE_URL ? "سليم — " + (gw?.url || "") : "لا يطابق " + SEND_PUSH_EDGE_URL + " (المعلن: " + (gw?.url || "—") + ")"));
-          log(gw?.secret_hardcoded === true && gw?.vault_dependency === false,
-            "إعداد البوابة: السرّ مُضمَّن ولا اعتماد على Vault"
-            + (gw?.vault_dependency === false ? "" : " — ما زال هناك اعتماد على Vault"));
-          if (gw?.delivery_url && gw?.delivery_is_default === false) {
-            log(null, "وجهة التسليم الحالية: " + gw.delivery_url);
-          }
-          if (gw?.gateway_hint) log(null, gw.gateway_hint);
-        }
-      } catch (err) {
-        log(null, "فحص البوابة تعذّر: " + (err?.message || err));
-      }
-      // حكم مسار التسليم (في وضع العميل يُرجع فوراً: لا فائدة من فحص DNS معطّل)
-      try {
-        const { data: verdict, error: vErr } = await supabase.rpc("push_path_verdict", { p_apply: false });
-        if (vErr) {
-          log(null, "الحكم على مسار التسليم غير متاح — نفّذ migration v2.18 (2026-10-24): " + (vErr.message || vErr));
-        } else {
-          const cands = Array.isArray(verdict?.candidates) ? verdict.candidates : [];
-          for (const c of cands) {
-            log(c.works === true,
-              "وجهة التسليم [" + (c.label || "?") + "] " + (c.url || "")
-              + " — " + (c.works === true
-                ? "تعمل ✅ (200)"
-                : "لا تعمل ❌ (" + (c.status_code == null ? "لا رد" : c.status_code) + ")")
-              + (c.hint ? " — " + c.hint : ""));
-          }
-          log(null, "الحكم: " + (verdict?.verdict || "—"));
-        }
-      } catch (err) {
-        log(null, "الحكم على مسار التسليم تعذّر: " + (err?.message || err));
-      }
+      // تدفّق الـ Webhook الحقيقي يُقرأ من سجل التسليم أعلاه؛ إشعار الاختبار
+      // أدناه يثبت وصول FCM من الدالة إلى هذا الجهاز (نفس مسار الـ Webhook).
       log(null, "اختبر الآن والتطبيق في الخلفية. نجاح FCM يثبت قبول الطلب فقط؛ إن لم يظهر الإشعار، افحص سجل [push-sw] وإعدادات الإذن/النظام.");
     } catch (err) {
       const m = err?.message || String(err);
@@ -1593,11 +1510,7 @@ function subscribeCallRoomsWatch() {
           const row = payload.new || payload.old;
           if (!row || !state.me) return;
           if (row.caller_id !== state.me.id && row.callee_id !== state.me.id) return;
-          // ★ وضع العميل: المتصل يطلق إشعار الرنين (المستلَم = callee من الغرفة)
-          if (row.caller_id === state.me.id && row.status === "ringing" && payload.eventType !== "UPDATE") {
-            void clientPushCall({ roomId: row.id, callType: row.call_type || "audio" })
-              .catch((err) => console.warn("[client-push] فشل إطلاق إشعار المكالمة:", err?.message || err));
-          }
+          // إشعار الرنين يُطلقه Database Webhook على call_rooms (INSERT/UPDATE)
           refreshMissedCallsBadge();
           const modal = $("#call-history-modal");
           if (modal && !modal.classList.contains("hidden")) {
@@ -6703,11 +6616,9 @@ function subscribeGlobalMessageWatch() {
           const preview = messagePreviewText(msg);
           const lastAt = msg.created_at || new Date().toISOString();
 
-          // ★ وضع العميل (v2.19): القاعدة معزولة شبكياً ⇒ الإشعار يُطلق من
-          //   جهاز المُرسِل (يرصد الحدث عبر Realtime) ← ثم يستدعي دالة send-push
-          //   مباشرةً بمصادقة رمز المستخدم. المستلَم يُشتقّ على الخادم.
+          // إشعار المستلم يُطلقه Database Webhook على messages INSERT
+          // (Supabase → send-push). لا إرسال من المتصفح إطلاقاً.
           if (msg.sender_id === state.me.id) {
-            void notifyRecipientByClient(msg);
             if (!patchConversationRow(msg.conversation_id, { lastMessage: preview, lastAt })) {
               loadContacts();
             }
@@ -6781,35 +6692,6 @@ function subscribeGlobalMessageWatch() {
 }
 
 /**
- * ★ وضع العميل (v2.19): إطلاق إشعار الرسالة من جهاز المُرسِل.
- * - الدالة على الخادم تُثبّت المُرسِل من رمز المستخدم (لا يُقبل من العميل)
- *   وتُشتقّ المستلَم من المحادثة ⇒ لا impersonation.
- * - منع التكرار محلياً: كل رسالة تُطلق مرة واحدة لكل جهاز.
- */
-const _clientPushedMessages = new Set();
-
-async function notifyRecipientByClient(msg) {
-  if (!msg?.id) return;
-  if (_clientPushedMessages.has(msg.id)) return;
-  _clientPushedMessages.add(msg.id);
-  if (_clientPushedMessages.size > 200) {
-    const first = _clientPushedMessages.values().next().value;
-    _clientPushedMessages.delete(first);
-  }
-  try {
-    await clientPushMessage({
-      messageId: msg.id,
-      conversationId: msg.conversation_id,
-      content: msg.content || "",
-      messageType: msg.message_type || "text",
-    });
-  } catch (err) {
-    // لا تُفشل واجهة المستخدم: الإشعار opportunist — يُسجَّل فقط
-    console.warn("[client-push] فشل إطلاق إشعار الرسالة:", err?.message || err);
-  }
-}
-
-/**
  * قناة المشرفين: تسجيل مستخدم جديد.
  * تعمل كطبقة ثانية بجانب إشعار FCM (تظهر حتى لو كان الإشعار مغلقاً أو الجهاز
  * لا يدعم Push)، وتُحدّث الدليل لحظياً إن كان مفتوحاً.
@@ -6840,9 +6722,7 @@ function subscribeAdminDirectory() {
           const name = String(row.display_name || "").trim() || "مستخدم";
           showAuthError(`👤 مستخدم جديد: ${name} — اضغط لبدء محادثة`, { id: row.id });
           playNotificationSound();
-          // ★ وضع العميل: المشرف يطلق إشعار «مستخدم جديد» لبقية المشرفين
-          void clientPushNewUser({ userId: row.id, displayName: name })
-            .catch((err) => console.warn("[client-push] فشل إطلاق إشعار مستخدم جديد:", err?.message || err));
+          // إشعار «مستخدم جديد» يُطلقه Database Webhook على profiles INSERT
         },
       },
     ],

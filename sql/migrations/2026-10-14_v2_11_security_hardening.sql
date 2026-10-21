@@ -1,7 +1,8 @@
 -- ============================================================
 -- v2.11 (2026-10-14) — تدقيق الأمان وتشديد RLS
 -- ------------------------------------------------------------
--- 1) إزالة مفتاح anon الثابت من push_call_edge (لا مفاتيح في الكود)
+-- 1) (أُزيل في v3.0) مسار pg_net/Vault: لم يعد هناك أي إرسال من القاعدة.
+--    بقي ما يخصّ القاعدة فقط:
 --    ولا قراءة من Vault: منذ v2.15 الرابط والسرّ مُضمَّنان مباشرةً، والدالة
 --    منشورة بـ verify_jwt = false ⇒ لا حاجة لمفتاح anon ولا لترويسة Authorization.
 -- 2) المشرف العام = مراقب للقراءة فقط (لا كتابة على المحادثات/الرسائل/المكالمات)
@@ -11,46 +12,6 @@
 -- آمنة لإعادة التنفيذ (idempotent).
 -- ============================================================
 
-create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, net as $$
-declare
-  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
-  v_secret text := 'my_send_push_19921121_almgawell_19921121';
-  v_headers jsonb;
-  v_req bigint;
-  v_allowed boolean := false;
-begin
-  -- ⛔ البوابة: لا مستلم مطابق للحدث ⇒ لا طلب شبكة ولا إشعار (يُسجَّل السبب فقط)
-  begin
-    v_allowed := public.push_recipient_allowed(p_kind, p_ref, p_recipient, p_body);
-  exception when others then
-    v_allowed := false;
-  end;
-
-  if not v_allowed then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, public.push_skip_note(p_kind, p_recipient));
-    return;
-  end if;
-
-  -- الرابط والسرّ مُضمَّنان مباشرةً (بلا Vault) — لا ترويسة Authorization:
-  --   الدالة منشورة بـ verify_jwt = false ⇒ التحقّق عبر x-send-push-secret
-  v_headers := jsonb_build_object(
-    'Content-Type', 'application/json',
-    'x-send-push-secret', v_secret
-  );
-
-  begin
-    select net.http_post(url := v_url, headers := v_headers, body := p_body, timeout_milliseconds := 8000)
-    into v_req;
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, request_id)
-    values (p_kind, p_ref, p_recipient, v_req);
-  exception when others then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'ERROR: ' || sqlerrm);
-  end;
-end;
-$$;
 
 create or replace function public.admin_set_user_blocked(p_user_id uuid, p_blocked boolean)
 returns void language plpgsql security definer set search_path = public as $$
@@ -196,10 +157,9 @@ begin
     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'public' and p.prokind = 'f'
       and p.proname in (
-        'push_call_edge', 'expire_stale_calls', 'expire_stale_ringing_calls', 'admin_recipient_ids',
+        'expire_stale_calls', 'expire_stale_ringing_calls',
         'is_admin_email', 'is_super_admin_email', 'is_internal_phone_email', 'force_admin_presence_online',
-        'reset_call_presence', 'push_recipient_allowed', 'push_skip_note', 'conversation_direct_recipient',
-        'notify_admins_new_profile', 'notify_call_room', 'notify_new_message',
+        'reset_call_presence',
         'protect_message_immutable_fields', 'protect_profile_privileges', 'handle_new_user',
         'touch_conversation_on_call_message', 'touch_conversation_on_message')
   loop
@@ -212,9 +172,6 @@ do $$
 declare sig text;
 begin
   foreach sig in array array[
-    'public.push_diagnostics()',
-    'public.push_probe()',
-    'public.push_probe_result(bigint)',
     'public.call_room_is_ringing(uuid)',
     'public.admin_directory_search(text, integer, integer)',
     'public.unread_counts(uuid[])',
