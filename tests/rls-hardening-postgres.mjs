@@ -319,6 +319,15 @@ check("تعريف push_call_edge/trigger_send_push_notification بلا أي مر
 // ---------- v2.16: التشخيص يفحص الجسم الحيّ بدل الثوابت ----------
 const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
 const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
+const MIGRATION_V218 = read("sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql");
+const v218Code = MIGRATION_V218.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+check("v2.18: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v218Code));
+check("v2.18: push_settings محمي بـ RLS", /alter table public\.push_settings enable row level security/.test(MIGRATION_V218));
+check("v2.18: مُعدِّل وجهة التسليم لا يُمنح للمستخدمين",
+  /revoke all on function public\.push_set_delivery_url\(text\) from public, anon, authenticated/.test(MIGRATION_V218));
+check("v2.18: التحويل التلقائي محصور (service_role / جلسة SQL)",
+  /v_jwt_role = 'service_role'/.test(MIGRATION_V218) && /session_user in \('postgres', 'supabase_admin'\)/.test(MIGRATION_V218));
+check("v2.18: push_path_verdict معرَّف", /create function public\.push_path_verdict\(p_apply boolean default false\)/.test(MIGRATION_V218));
 const v217Code = MIGRATION_V217.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
 check("v2.17: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v217Code));
 check("v2.17: push_settings محمي بـ RLS",

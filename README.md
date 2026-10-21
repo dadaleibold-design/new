@@ -725,3 +725,82 @@ select public.push_set_delivery_url('https://<اسم-الـ-worker>.workers.dev/
   ⇒ لا حاجة إلى `apikey`/JWT في القاعدة.
 - `worker/send-push-relay.js` مُغطّى باختبار `tests/push-relay-worker.mjs`
   (401 بلا سرّ/بسرّ خاطئ، تمرير صحيح، لا تسريب للسرّ).
+
+---
+
+## الإصدار v2.18 — الحكم الحاسم على مسار التسليم + إصلاح ذاتي كامل
+
+الهجرة: `sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql`
+(مطابقة لما في `sql/schema.sql` §24) — آمنة لإعادة التنفيذ.
+
+### ما كشفه v2.17 في القاعدة الحيّة (نتيجة حقيقية)
+
+| المسبار | النتيجة |
+|---|---|
+| `*.supabase.co/functions/v1/send-push` | ❌ `Couldn't resolve host name` |
+| `example.com` | ✅ تصل |
+| `cloudflare.com` | ✅ تصل |
+| `*.functions.supabase.co` | ✅ تصل |
+
+⇒ **القاعدة تصل إلى الإنترنت، لكن نطاق `*.supabase.co` تحديداً غير قابل للوصول منها.**
+العطل في نطاق دوال EdgeFunctions لهذا المشروع — لا في الكود ولا في السرّ ولا في Vault.
+
+### ما يضيفه v2.18
+
+1. **إصلاح ذاتي حقيقي**: يحذف **كل** نسخ دوال المسار (أي توقيع) ثم يُنشئها من جديد
+   (`drop` + `create` بدل `create or replace`). السبب: `create or replace` **يفشل**
+   إذا اختلف نوع الإرجاع/التوقيع ⇒ عندها يتوقّف تنفيذ الملف عند تلك العبارة وتبقى
+   الدوال القديمة (وهو ما كان يُسقط `push_gateway_check` في القاعدة الحيّة). الآن
+   **مهما كانت حالة القاعدة،become النتيجة هي الملف الصحيح كاملاً**.
+2. **مسبار حاسم**: `push_probe_endpoint(url)` يرسل **POST حقيقياً** بصيغة send-push
+   مع `x-send-push-secret` ⇒ `status_code = 200` = «هذه الوجهة تخدم الدالة والسرّ
+   مطابق» (لا يكفي أن يُحلَّل اسم المضيف).
+3. **حكم شامل في نداء واحد**: `push_path_verdict()` يفحص كل المرشّحين بالتوازي
+   (primary · legacy · current) + مسبار عام (`example.com`) ويُرجع:
+   - `candidates[]` — لكل مرشّح: `status_code` · `dns_error` · `works` · `hint`
+   - `internet_reachable` — هل يعمل DNS عموماً من القاعدة؟
+   - `best_url` — الوجهة التي تعمل
+   - `verdict` — حكم جاهز بالعربية.
+4. **تحويل تلقائي**: `push_path_verdict(true)` يحوّل نقطة التسليم إلى `best_url`
+   (الأولوية: `primary` ← `legacy` ← `current`) — **لخدمة فقط**
+   (`service_role` أو جلسة SQL Editor)؛ أي مستخدم مصادَق يقرأ الحكم دون تغيير.
+5. `push_diagnostics` صار يكشف **الدوال الناقصة** (`live_path_missing`) فلا يقول
+   «سليم» مع دالة غائبة، و`push_gateway_check` صار يعمل ويُظهر وجهة التسليم.
+
+### التشغيل (بعد تطبيق الملف)
+
+```sql
+-- ① الحكم (قراءة فقط)
+select public.push_path_verdict();
+
+-- ② التحويل إلى الوجهة العاملة (سطر واحد — يكفي!)
+select public.push_path_verdict(true);
+
+-- ③ تحقّق
+select public.push_diagnostics();   -- delivery_url / delivery_overridden
+```
+
+**قراءة النتيجة:**
+
+| `verdict` | المعنى | الخطوة |
+|---|---|---|
+| `best_url` = legacy | النطاق القديم يخدم الدالة | تم التحويل تلقائياً — تحقّق من الإشعار |
+| `best_url` = null و`internet_reachable` = true | الإنترنت يعمل لكن `*.supabase.co` لا | انشر بوابة بديلة (§أدناه) |
+| `internet_reachable` = false | لا مضيف أصلاً | Project Settings ← Network ← Restrict egress |
+
+### بوابة بديلة (عند عدم نفع النطاق القديم)
+
+```bash
+cd worker
+npx wrangler deploy
+npx wrangler secret put SEND_PUSH_SECRET   # my_send_push_19921121_almgawell_19921121
+npx wrangler secret put SEND_PUSH_URL      # https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push
+```
+
+```sql
+select public.push_set_delivery_url('https://<worker>.workers.dev/');
+-- ثم تحقّق:
+select public.push_path_verdict();
+```
+
+> بعد النشر، `push_path_verdict` يجرّب الوجهة الجديدة تلقائياً (وهي `current`).

@@ -1317,13 +1317,18 @@ function wireChrome() {
       try {
         const { data: gw, error: gwErr } = await supabase.rpc("push_gateway_check");
         if (gwErr) {
-          log(null, "دالة push_gateway_check غير متاحة — قد يكون جسمها في القاعدة هو النسخة القديمة (v2.12/v2.14) التي تقرأ Vault وتthrow ⇒ نفّذ migration v2.16 (2026-10-22)");
+          // ⚠️ نعرض الخطأ الحقيقي من القاعدة بدل التخمين
+          log(null, "فحص البوابة (push_gateway_check) فشل: " + (gwErr.message || gwErr)
+            + " — نفّذ migration v2.18 (2026-10-24) (تُنشئ الدالة من جديد بعد حذفها)");
         } else {
           log(gw?.url_ok === true && gw?.url === SEND_PUSH_EDGE_URL,
             "إعداد البوابة: الرابط المُضمَّن " + (gw?.url === SEND_PUSH_EDGE_URL ? "سليم — " + (gw?.url || "") : "لا يطابق " + SEND_PUSH_EDGE_URL + " (المعلن: " + (gw?.url || "—") + ")"));
           log(gw?.secret_hardcoded === true && gw?.vault_dependency === false,
             "إعداد البوابة: السرّ مُضمَّن ولا اعتماد على Vault"
             + (gw?.vault_dependency === false ? "" : " — ما زال هناك اعتماد على Vault"));
+          if (gw?.delivery_url && gw?.delivery_is_default === false) {
+            log(null, "وجهة التسليم الحالية: " + gw.delivery_url);
+          }
           if (gw?.gateway_hint) log(null, gw.gateway_hint);
         }
       } catch (err) {
@@ -1365,56 +1370,34 @@ function wireChrome() {
       } catch (err) {
         log(false, "فشل المسبار: " + (err?.message || err));
       }
-      // v2.17: تشخيص شبكة القاعدة — أي مضيفات تصل إليها وأيها لا تصل.
+      // v2.18: حكم حاسم على مسار التسليم — نداء واحد يكفي (مسبار حقيقي لكل
+      // مرشّح + قراءة رموز الحالة + ترشيح الوجهة الصالحة).
       try {
-        const { data: netd, error: netErr } = await supabase.rpc("push_net_diagnostics");
-        if (netErr) {
-          log(null, "تشخيص شبكة القاعدة غير متاح — نفّذ migration v2.17 (2026-10-23)");
+        const { data: verdict, error: vErr } = await supabase.rpc("push_path_verdict", { p_apply: false });
+        if (vErr) {
+          log(null, "الحكم على مسار التسليم غير متاح — نفّذ migration v2.18 (2026-10-24): " + (vErr.message || vErr));
         } else {
-          const probes = netd?.probes || {};
-          const ids = Object.entries(probes)
-            .map(([k, v]) => [k, v?.request_id])
-            .filter(([, id]) => id != null);
-          const results = {};
-          for (let round = 0; round < 8 && Object.keys(results).length < ids.length; round += 1) {
-            await new Promise((ok) => setTimeout(ok, 1200));
-            for (const [key, id] of ids) {
-              if (results[key]) continue;
-              const { data } = await supabase.rpc("push_probe_result", { p_request_id: id });
-              if (data && !data.pending) results[key] = data;
-            }
+          const cands = Array.isArray(verdict?.candidates) ? verdict.candidates : [];
+          for (const c of cands) {
+            log(c.works === true,
+              "وجهة التسليم [" + (c.label || "?") + "] " + (c.url || "")
+              + " — " + (c.works === true
+                ? "تعمل ✅ (200)"
+                : "لا تعمل ❌ (" + (c.status_code == null ? "لا رد" : c.status_code) + ")")
+              + (c.hint ? " — " + c.hint : ""));
           }
-          const reached = (key) => {
-            const r = results[key];
-            return !!r && r.status_code != null && r.status_code > 0 && r.status_code < 500;
-          };
-          const fnReached = reached("function");
-          const publicReached = reached("public");
-          const cfReached = reached("cloudflare");
-          const legacyReached = reached("legacy");
-
-          log(fnReached,
-            "شبكة القاعدة ← دالة send-push: " + (fnReached
-              ? "تصل ✅ (" + (results.function?.status_code ?? "?") + ")"
-              : "لا تصل ❌ — " + (results.function?.error || results.function?.hint || "لا يوجد رد")));
-          log(publicReached,
-            "شبكة القاعدة ← مضيف عام (example.com): " + (publicReached ? "تصل ✅" : "لا تصل ❌"));
-          log(cfReached,
-            "شبكة القاعدة ← Cloudflare (workers.dev): " + (cfReached ? "تصل ✅" : "لا تصل ❌"));
-          if (legacyReached) {
-            log(true, "النطاق القديم للدوال (functions.supabase.co) يصل من القاعدة — مسار تسليم بديل متاح بلا Worker");
+          log(null, "الحكم: " + (verdict?.verdict || "—"));
+          if (verdict?.best_url && verdict?.delivery_url !== verdict?.best_url) {
+            log(null, "لتحويل مسار التسليم إلى الوجهة الناجحة: select public.push_path_verdict(true);"
+              + "  (من SQL Editor أو بمفتاح service_role)");
           }
-          // الحكم النهائي
-          if (fnReached) {
-            log(true, "الحكم: مسار التسليم سليم — القاعدة تصل إلى دالة send-push");
-          } else if (publicReached || cfReached) {
-            log(false, "الحكم: القاعدة تصل إلى مضيف عام لكن لا إلى نطاق supabase.co — استخدم بوابة بديلة: انشر worker/send-push-relay.js ثم select public.push_set_delivery_url('https://<worker>.workers.dev/')");
-          } else {
-            log(false, "الحكم: مخرج شبكة القاعدة مقيّد (DNS لا يعمل لأي مضيف) — راجع Project Settings ← Network (Restrict egress) في لوحة Supabase، أو تواصل مع دعم Supabase");
+          if (verdict?.delivery_url && verdict?.delivery_url !== verdict?.best_url && !verdict?.best_url) {
+            log(false, "لا توجد وجهة تعمل حالياً — انشر بوابة بديلة (worker/send-push-relay.js) ثم"
+              + " select public.push_set_delivery_url('https://<worker>.workers.dev/');");
           }
         }
       } catch (err) {
-        log(null, "تشخيص شبكة القاعدة تعذّر: " + (err?.message || err));
+        log(null, "الحكم على مسار التسليم تعذّر: " + (err?.message || err));
       }
       // v2.16: فحص مباشر من القاعدة يتجاوز كل دوال المسار — يميّز بين
       // «جسم دالة قديم» و«المشروع لا يستطيع الوصول إلى المضيف».

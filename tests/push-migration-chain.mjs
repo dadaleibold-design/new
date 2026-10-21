@@ -266,7 +266,7 @@ check("push_diagnostics يكشف القاعدة المتأخرة: live_path_stal
 check("push_diagnostics يكشف الاعتماد على Vault: vault_dependency = true", stale?.vault_dependency === true);
 check("push_diagnostics: live_path_functions.push_call_edge.reads_vault = true",
   stale?.live_path_functions?.push_call_edge?.reads_vault === true);
-check("push_diagnostics: live_path_hint ينبّه على v2.16", /v2\.16/.test(stale?.live_path_hint || ""), stale?.live_path_hint);
+check("push_diagnostics: live_path_hint ينبّه على أحدث هجرة", /v2\.1[68]/.test(stale?.live_path_hint || ""), stale?.live_path_hint);
 
 // تطبيق v2.16 يُصلح القاعدة المتأخرة
 await db.exec(read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql"));
@@ -301,6 +301,80 @@ const pr = (await db.query("select public.push_probe_result(999999) r")).rows[0]
 check("push_probe_result: dns_error = true عند فشل تحليل المضيف", pr?.dns_error === true, String(pr?.error));
 check("push_probe_result: hint يشرح السبب", /push_net_diagnostics/.test(pr?.hint || ""), String(pr?.hint));
 
+// ── v2.18: الحكم الحاسم + الإصلاح الذاتي ──
+// محاكاة القاعدة الحيّة: القاعدة لا تصل إلى *.supabase.co (فشل DNS)،
+// لكنها تصل إلى النطاق القديم functions.supabase.co (200).
+// نستبدل net.http_post.mock ليُجيب فوراً (كما يفعل عامل خلفية pg_net).
+await db.exec(`
+  create or replace function net.http_post(url text, headers jsonb default '{}'::jsonb, body jsonb default '{}'::jsonb, params jsonb default '{}'::jsonb, timeout_milliseconds int default 8000) returns bigint language plpgsql as $$
+  declare v_req bigint; v_status int; v_err text; begin
+    select nextval('net_request_seq') into v_req;
+    insert into net.calls (request_id, url, headers, body, timeout_milliseconds) values (v_req, url, coalesce(headers,'{}'::jsonb), coalesce(body,'{}'::jsonb), timeout_milliseconds);
+    if url like '%/functions/v1/send-push%' and url not like '%functions.supabase.co%' then
+      v_status := 0; v_err := 'Dns resolve error: Couldn''t resolve host name';
+    else
+      v_status := 200; v_err := null;
+    end if;
+    insert into net._http_response (id, status_code, content, error_msg) values (v_req, v_status, '{"sent":0,"skipped":"no fcm token"}'::jsonb, v_err);
+    return v_req; end $$;
+`);
+
+const v218Fns = await q(
+  "select p.proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace " +
+  "where n.nspname='public' and p.proname in ('push_path_verdict','push_probe_endpoint','push_fire_probe','push_await_probe') order by 1");
+check("v2.18: دوال الحكم والمسبار موجودة", v218Fns.length === 4, v218Fns.map((r) => r.proname).join(", "));
+
+
+const verdict = (await q("select public.push_path_verdict(false) v"))[0]?.v;
+check("v2.18: push_path_verdict يفحص مرشّحين على الأقل",
+  Array.isArray(verdict?.candidates) && verdict.candidates.length >= 2,
+  String(verdict?.candidates?.length));
+check("v2.18: المسبار العام (example.com) يبيّن حالة DNS العامة",
+  verdict?.internet_probe?.url === "https://example.com/" && typeof verdict?.internet_reachable === "boolean",
+  JSON.stringify(verdict?.internet_probe || {}));
+check("v2.18: كل مرشّح يحمل url + status_code + hint",
+  (verdict?.candidates || []).every((c) => c.url && c.status_code !== undefined && c.hint),
+  JSON.stringify((verdict?.candidates || []).map((c) => [c.label, c.status_code])));
+
+const verdict2 = (await q("select public.push_path_verdict(false) v"))[0]?.v;
+check("v2.18: يكتشف الوجهة العاملة (200 + ردّ من send-push)",
+  verdict2?.best_url === "https://gqocavvhkfzgxzscrjms.functions.supabase.co/send-push"
+  || (verdict2?.candidates || []).some((c) => c.works === true),
+  JSON.stringify((verdict2?.candidates || []).map((c) => [c.label, c.status_code, c.works])));
+
+// التحويل التلقائي (جلسة postgres ⇒ مسموح)
+const verdictApplied = (await q("select public.push_path_verdict(true) v"))[0]?.v;
+check("v2.18: التحويل التلقائي يعمل في جلسة SQL Editor",
+  verdictApplied?.apply_allowed === true, JSON.stringify({ allowed: verdictApplied?.apply_allowed, role: verdictApplied?.role }));
+if (verdictApplied?.best_url) {
+  check("v2.18: نقطة التسليم تحوّلت إلى الوجهة العاملة",
+    verdictApplied?.switched === true && (await q("select public.push_delivery_url() u"))[0]?.u === verdictApplied.best_url,
+    String((await q("select public.push_delivery_url() u"))[0]?.u));
+  await q("select public.push_set_delivery_url(null)");
+}
+
+// الإصلاح الذاتي: دالة مفقودة/بجسم قديم ⇒ تُنشأ من جديد
+await db.exec("drop function if exists public.push_gateway_check()");
+check("v2.18: بعد الحذف تُنشأ الدالة من جديد (لا create or replace)",
+  (await q("select count(*)::int c from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='push_gateway_check'"))[0]?.c === 0);
+await db.exec(read("sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql"));
+const gwBack = (await q("select public.push_gateway_check() g"))[0]?.g;
+check("v2.18: push_gateway_check تعمل بعد إعادة الإنشاء",
+  gwBack?.vault_dependency === false && gwBack?.secret_hardcoded === true, JSON.stringify(gwBack || {}));
+check("v2.18: push_gateway_check تعرض وجهة التسليم",
+  typeof gwBack?.delivery_url === "string" && gwBack?.delivery_url.length > 0, String(gwBack?.delivery_url));
+
+// push_diagnostics يكشف الدوال الناقصة (لا يكذب بـ «سليم»)
+await db.exec("drop function if exists public.push_gateway_check()");
+const diagMissing = (await q("select public.push_diagnostics() d"))[0]?.d;
+check("v2.18: push_diagnostics يكشف دالة ناقصة (live_path_stale = true)",
+  diagMissing?.live_path_stale === true, JSON.stringify(diagMissing?.live_path_missing));
+await db.exec(read("sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql"));
+const diagBack = (await q("select public.push_diagnostics() d"))[0]?.d;
+check("v2.18: بعد الإصلاح يعود live_path_stale = false",
+  diagBack?.live_path_stale === false && (diagBack?.live_path_missing || []).length === 0,
+  JSON.stringify(diagBack?.live_path_missing));
+
 // ── v2.17: نقطة تسليم قابلة للتهيئة + تشخيص شبكة القاعدة ──
 const settingsRow = await q("select delivery_url from public.push_settings where id");
 check("push_settings: صفّ واحد بقيمة افتراضية (الرابط المُضمَّن)",
@@ -330,10 +404,15 @@ check("push_set_delivery_url: الرجوع للافتراضي", backUrl === URL,
 
 // تشخيص الشبكة
 const netd = (await q("select public.push_net_diagnostics() d"))[0]?.d;
-check("push_net_diagnostics: يعلن 4 مسبارات (دالة/قديم/عام/Cloudflare)",
-  Object.keys(netd?.probes || {}).length === 4, Object.keys(netd?.probes || {}).join(", "));
+check("push_net_diagnostics: يعلن مرشّحَي التسليم (primary/legacy)",
+  Object.keys(netd?.probes || {}).length === 2
+  && Object.keys(netd?.probes || {}).includes("primary")
+  && Object.keys(netd?.probes || {}).includes("legacy"),
+  Object.keys(netd?.probes || {}).join(", "));
 check("push_net_diagnostics: يذكر رابط دالة send-push + السطر البديل",
-  netd?.probes?.function?.url === URL && /workers\.dev|cloudflare/.test(JSON.stringify(netd?.probes || {})));
+  netd?.probes?.primary?.url === URL
+  && /functions\.supabase\.co/.test(JSON.stringify(netd?.probes || {})),
+  JSON.stringify(netd?.probes || {}));
 check("push_net_diagnostics: يبلّغ عن حالة امتداد pg_net",
   typeof netd?.pg_net_installed === "boolean" && netd?.pg_net_version !== undefined,
   `installed=${netd?.pg_net_installed} version=${netd?.pg_net_version}`);

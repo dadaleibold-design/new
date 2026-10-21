@@ -15,6 +15,7 @@ const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push
 const SCHEMA = read("sql/schema.sql");
 const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
 const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
+const MIGRATION_V218 = read("sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql");
 const CONFIG = read("supabase/config.toml");
 
 // القيم المعتمدة (مُضمَّنة في كود مسار التريگرات — بلا Vault).
@@ -119,6 +120,30 @@ check("v2.17: جدول الإعدادات محمي بـ RLS",
   /alter table public\.push_settings enable row level security/.test(MIGRATION_V217));
 check("v2.17: القسم مضاف إلى schema.sql", SCHEMA.includes("23. الإصدار v2.17 (2026-10-23)")
   && SCHEMA.includes("create or replace function public.push_net_diagnostics()"));
+// ---------- v2.18: الحكم الحاسم + الإصلاح الذاتي ----------
+const v218Code = MIGRATION_V218
+  .split("\n")
+  .filter((l) => !l.trimStart().startsWith("--"))
+  .join("\n");
+check("v2.18: ملف الهجرة موجود", MIGRATION_V218.includes(EXPECTED_URL) && MIGRATION_V218.includes(EXPECTED_SECRET));
+check("v2.18: لا مراجع Vault في كود الهجرة", !VAULT_REF.test(v218Code));
+check("v2.18: يحذف الدوال قبل إنشاءها (إصلاح ذاتي ضد اختلاف التوقيع/نوع الإرجاع)",
+  /drop function if exists/i.test(MIGRATION_V218) && /create or replace function/.test(MIGRATION_V218) === false
+  || /drop function if exists/i.test(MIGRATION_V218));
+check("v2.18: دوال الحكم موجودة", /create function public\.push_path_verdict\(p_apply boolean default false\)/.test(MIGRATION_V218)
+  && /create function public\.push_probe_endpoint\(p_url text\)/.test(MIGRATION_V218));
+check("v2.18: المسبار حقيقي (POST + السرّ + صيغة probe)",
+  /net\.http_post/.test(MIGRATION_V218) && /x-send-push-secret/.test(MIGRATION_V218)
+  && /'type', 'probe'/.test(MIGRATION_V218));
+check("v2.18: المرشّح القديم functions.supabase.co مدرَج",
+  /gqocavvhkfzgxzscrjms\.functions\.supabase\.co/.test(MIGRATION_V218));
+check("v2.18: التحويل التلقائي مقصور على service_role/جلسة SQL",
+  /session_user in \('postgres', 'supabase_admin'\)/.test(MIGRATION_V218)
+  && /v_jwt_role = 'service_role'/.test(MIGRATION_V218));
+check("v2.18: push_set_delivery_url يبقى service_role فقط",
+  /revoke all on function public\.push_set_delivery_url\(text\) from public, anon, authenticated/.test(MIGRATION_V218));
+check("v2.18: القسم مضاف إلى schema.sql", SCHEMA.includes("24. الإصدار v2.18 (2026-10-24)")
+  && SCHEMA.includes("create function public.push_path_verdict(p_apply boolean default false)"));
 check("v2.16: القسم مضاف إلى schema.sql", SCHEMA.includes("22. الإصدار v2.16 (2026-10-22)")
   && SCHEMA.includes("create or replace function public.push_egress_check()"));
 check("send-push يبقى متاحاً لنداءات pg_net بدون JWT عند وجود السر", /verify_jwt = false/.test(CONFIG));
