@@ -318,6 +318,15 @@ check("تعريف push_call_edge/trigger_send_push_notification بلا أي مر
 
 // ---------- v2.16: التشخيص يفحص الجسم الحيّ بدل الثوابت ----------
 const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
+const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
+const v217Code = MIGRATION_V217.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+check("v2.17: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v217Code));
+check("v2.17: push_settings محمي بـ RLS",
+  /alter table public\.push_settings enable row level security/.test(MIGRATION_V217));
+check("v2.17: مُعدِّل نقطة التسليم لا يُمنح للمستخدمين",
+  /revoke all on function public\.push_set_delivery_url\(text\) from public, anon, authenticated/.test(MIGRATION_V217));
+check("v2.17: push_net_diagnostics معرَّف",
+  /create or replace function public\.push_net_diagnostics\(\)/.test(MIGRATION_V217));
 const v216Code = MIGRATION_V216.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
 check("v2.16: ملف الهجرة موجود", MIGRATION_V216.length > 0);
 check("v2.16: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v216Code));

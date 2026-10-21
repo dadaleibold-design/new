@@ -640,3 +640,88 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   ```
   supabase secrets set SEND_PUSH_SECRET=my_send_push_19921121_almgawell_19921121
   ```
+
+---
+
+## الإصدار v2.17 — نقطة تسليم قابلة للتهيئة + تشخيص شبكة القاعدة (الحلّ الجذري)
+
+الهجرة: `sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql`
+(مطابقة لما في `sql/schema.sql` §23) — آمنة لإعادة التنفيذ.
+
+### التشخيص الذي أعطاه v2.16 (ولم يُحلَّق)
+
+بعد تطبيق v2.16 وتأكّده في القاعدة الحيّة، بقي الخطأ نفسه:
+`Couldn't resolve host name` — **حتى عبر `push_egress_check()` الذي يستدعي الرابط الحرفي
+مباشرةً** ⇒ الكود سليم، والعطل **شبكي داخل حاوية القاعدة** (DNS/مخرج).
+
+- **لا يوجد نقل بديل داخل القاعدة**: `supabase_functions.http_request` (المستخدم في
+  Database Webhooks) ليس مساراً مستقلاً — هو `RETURNS trigger` يستدعي `net.http_get`/
+  `net.http_post` داخلياً ⇒ **نفس مسار DNS تماماً**. لذلك لا يمكن "تجاوز" المشكلة
+  بدالة SQL أخرى.
+- **الخارج الوحيد المتاح**: تغيير **الوجهة** (destination) إلى مضيف تصل إليه القاعدة.
+
+### ما تضيفه v2.17
+
+1. **نقطة تسليم قابلة للتهيئة وقت التشغيل** — بلا هجرة جديدة عند تغيير الوجهة:
+   - `public.push_settings` (صفّ واحد، RLS مفعّل بلا سياسات ⇒ لا أحد يقرؤه من الخارج
+     إلا `service_role`).
+   - `public.push_delivery_url()` ⇒ ترجع الرابط المُضمَّن افتراضياً أو ما هو مضبوط.
+   - `public.push_set_delivery_url(text)` ⇒ **service_role فقط** (SQL Editor)، ويقبل
+     `https://` فقط.
+   - `trigger_send_push_notification` و`push_call_edge` صارا **يقرآن** نقطة التسليم
+     بدل الرابط الثابت ⇒ تغيير الوجهة يسري فوراً.
+2. **تشخيص شبكة القاعدة** — `public.push_net_diagnostics()` يُطلق 4 مسبارات ويكشف
+   **أي مضيفات تصل إليها القاعدة فعلاً**:
+   | المسبار | الوجهة | ماذا يعني |
+   |---|---|---|
+   | `function` | رابط `send-push` | المسار الطبيعي يعمل؟ |
+   | `legacy` | `functions.supabase.co` | نطاق بديل داخل Supabase |
+   | `public` | `example.com` | هل DNS/Egress يعمل عموماً؟ |
+   | `cloudflare` | `cloudflare.com` | هل نطاق Cloudflare متاح (⇒ بوابة Worker ممكنة)؟ |
+   النتيجة تُقرأ لاحقاً: `select public.push_probe_result(<request_id>);`
+3. **بوابة تسليم بديلة جاهزة للنشر** — `worker/send-push-relay.js` (Cloudflare Worker)
+   يمرّر الطلب إلى دالة `send-push` بعد التحقّق من `x-send-push-secret`.
+
+### خطوات التشغيل (بعد تطبيق الهجرة)
+
+```sql
+-- ① طبّق ملف الهجرة في SQL Editor:
+--    sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql
+
+-- ② شغّل تشخيص الشبكة (يسجّل 4 طلبات في net.calls)
+select public.push_net_diagnostics();
+
+-- ③ اقرأ نتيجة كل مسبار (بعد ثوانٍ)
+select public.push_probe_result(<request_id>);
+```
+
+**ثم حسب النتيجة:**
+
+- **`function` ناجح (status_code > 0)** ⇒ المسار سليم — أعد اختبار الإشعار من التطبيق.
+- **`function` فاشل + `public` أو `cloudflare` ناجح** ⇒ القاعدة تصل إلى الإنترنت لكن
+  **لا** إلى `*.supabase.co` ⇒ انشر البوابة البديلة (الخطوات أدناه).
+- **كل المسبارات فاشلة** ⇒ مخرج الشبكة (egress) مقيّد في المشروع ⇒ راجع
+  Supabase Dashboard ← Project Settings ← **Network / Restrict egress** (أو تواصل مع دعم
+  Supabase) — لا علاقة للكود هنا.
+
+### نشر البوابة البديلة (Cloudflare Worker) — متى تكون ضرورية
+
+```bash
+cd worker
+npx wrangler deploy
+npx wrangler secret put SEND_PUSH_SECRET   # my_send_push_19921121_almgawell_19921121
+npx wrangler secret put SEND_PUSH_URL      # https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push
+```
+
+ثم وجّه القاعدة إليها (SQL Editor أو `service_role`):
+
+```sql
+select public.push_set_delivery_url('https://<اسم-الـ-worker>.workers.dev/');
+-- للعودة إلى النمط:  select public.push_set_delivery_url(null);
+```
+
+- الرابط والسرّ يبقىان **مُضمَّنين بلا Vault** كما هي ⇒ لا شيء يتغيّر في سياسة الأسرار.
+- البوابة **لا تمرّر** ترويسة `Authorization` القادمة من القاعدة (تبني ترويساتها من سرّها)
+  ⇒ لا حاجة إلى `apikey`/JWT في القاعدة.
+- `worker/send-push-relay.js` مُغطّى باختبار `tests/push-relay-worker.mjs`
+  (401 بلا سرّ/بسرّ خاطئ، تمرير صحيح، لا تسريب للسرّ).

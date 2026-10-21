@@ -39,6 +39,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
 const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
+const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
 
 // القيم المعتمدة (مُضمَّنة في الكود — بلا Vault).
 const EXPECTED_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
@@ -365,6 +366,27 @@ const egCall = (await db.query("select url, headers from net.calls order by id d
 check("v2.16: push_egress_check يفحص الرابط المُضمَّن مباشرةً",
   eg?.queued === true && egCall?.url === HARDCODED_URL
   && egCall?.headers?.["x-send-push-secret"] === HARDCODED_SECRET, String(egCall?.url));
+
+/* ---------- ⑧ v2.17: نقطة التسليم القابلة للتهيئة ---------- */
+await db.exec(MIGRATION_V217);
+const defUrl217 = (await db.query("select public.push_delivery_url() u")).rows[0].u;
+check("v2.17: نقطة التسليم الافتراضية = الرابط المُضمَّن", defUrl217 === HARDCODED_URL, String(defUrl217));
+const netd217 = (await db.query("select public.push_net_diagnostics() d")).rows[0].d;
+check("v2.17: push_net_diagnostics يفحص 4 مضيفات",
+  Object.keys(netd217?.probes || {}).length === 4, Object.keys(netd217?.probes || {}).join(", "));
+check("v2.17: push_net_diagnostics يبلّغ عن حالة pg_net",
+  typeof netd217?.pg_net_installed === "boolean" && netd217?.pg_net_version !== undefined,
+  `installed=${netd217?.pg_net_installed}`);
+
+// التريغر يتبع نقطة التسليم البديلة
+await db.query("select public.push_set_delivery_url('https://relay.example.workers.dev/')");
+await db.exec("delete from net.calls; delete from public.push_delivery_log");
+await db.query("insert into public.messages (conversation_id, sender_id, content, message_type) values ($1,$2,$3,'text')", [CONV, USER, "بريد بديل"]);
+const altCall = (await db.query("select url, headers from net.calls order by id desc limit 1")).rows[0];
+check("v2.17: التريغر يتبع نقطة التسليم البديلة (بلا Vault)",
+  altCall?.url === "https://relay.example.workers.dev/" && altCall?.headers?.["x-send-push-secret"] === HARDCODED_SECRET,
+  String(altCall?.url));
+await db.query("select public.push_set_delivery_url(null)");
 
 /* ---------- النتيجة ---------- */
 if (fails) {
