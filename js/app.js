@@ -1270,6 +1270,13 @@ function wireChrome() {
             "السرّ المشترك: " + (diag.secret_hardcoded === true
               ? "مُضمَّن في مسار التريگرات (x-send-push-secret)"
               : "غير مُضمَّن — نفّذ migration v2.15"));
+          // v2.16: حالة المسار الحيّة (فحص جسم الدوال داخل القاعدة — لا ثوابت).
+          // يكشف قاعدة متأخرة تقرأ Vault بينما التشخيص يقول «سليم».
+          if (diag.live_path_stale === true) {
+            log(false, "مسار الإرسال في القاعدة قديم — " + (diag.live_path_hint || "نفّذ migration v2.16 (2026-10-22)"));
+          } else if (diag.live_path_vault_free === true) {
+            log(true, "جسم دوال المسار داخل القاعدة محدَّث ومُضمَّن (بلا Vault)");
+          }
           log(!!diag.trigger_messages, "Trigger الرسائل " + (diag.trigger_messages ? "موجود" : "مفقود"));
           log(Number(diag.my_tokens) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag.my_tokens}`);
           const last = (diag.last_log || [])[0];
@@ -1303,7 +1310,7 @@ function wireChrome() {
       try {
         const { data: gw, error: gwErr } = await supabase.rpc("push_gateway_check");
         if (gwErr) {
-          log(null, "دالة push_gateway_check غير متاحة — تخطّي فحص البوابة (migration v2.12/2.15)");
+          log(null, "دالة push_gateway_check غير متاحة — قد يكون جسمها في القاعدة هو النسخة القديمة (v2.12/v2.14) التي تقرأ Vault وتthrow ⇒ نفّذ migration v2.16 (2026-10-22)");
         } else {
           log(gw?.url_ok === true && gw?.url === SEND_PUSH_EDGE_URL,
             "إعداد البوابة: الرابط المُضمَّن " + (gw?.url === SEND_PUSH_EDGE_URL ? "سليم — " + (gw?.url || "") : "لا يطابق " + SEND_PUSH_EDGE_URL + " (المعلن: " + (gw?.url || "—") + ")"));
@@ -1341,12 +1348,46 @@ function wireChrome() {
             log(false, "401 من send-push: السرّ المُضمَّن في trigger_send_push_notification (x-send-push-secret) لا يطابق SEND_PUSH_SECRET على الدالة — وحّدهما (السرّ المُضمَّن: my_send_push_19921121_almgawell_19921121)");
           } else if (res.status_code === 404) {
             log(false, "404: الرابط المُضمَّن في trigger_send_push_notification خاطئ — يجب أن يكون https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push");
+          } else if (res.dns_error) {
+            log(false, "فشل DNS من داخل القاعدة — " + (res.hint || res.error || ""));
           } else {
-            log(false, `رد غير متوقع من send-push: ${res.status_code || res.error} ${res.response || ""}`);
+            log(false, `رد غير متوقع من send-push: ${res.status_code || res.error} ${res.response || ""}`
+              + (res.hint ? " — " + res.hint : ""));
           }
         }
       } catch (err) {
         log(false, "فشل المسبار: " + (err?.message || err));
+      }
+      // v2.16: فحص مباشر من القاعدة يتجاوز كل دوال المسار — يميّز بين
+      // «جسم دالة قديم» و«المشروع لا يستطيع الوصول إلى المضيف».
+      try {
+        const { data: eg, error: egErr } = await supabase.rpc("push_egress_check");
+        if (egErr) {
+          log(null, "فحص الخروج (push_egress_check) غير متاح — نفّذ migration v2.16 (2026-10-22)");
+        } else if (eg?.queued === true && eg?.request_id) {
+          let eRes = null;
+          for (let i = 0; i < 8; i += 1) {
+            await new Promise((ok) => setTimeout(ok, 1200));
+            const { data } = await supabase.rpc("push_probe_result", { p_request_id: eg.request_id });
+            if (data && !data.pending) {
+              eRes = data;
+              break;
+            }
+          }
+          if (!eRes) {
+            log(null, "فحص الخروج: لم يصل رد من pg_net خلال 10 ثوانٍ");
+          } else if (eRes.status_code === 200) {
+            log(true, "فحص الخروج: القاعدة تصل إلى send-push مباشرةً (200) — DNS والشبكة سليمان");
+          } else if (eRes.dns_error) {
+            log(false, "فحص الخروج: فشل تحليل المضيف من داخل القاعدة — " + (eRes.hint || eRes.error || ""));
+          } else {
+            log(false, "فحص الخروج: " + (eRes.hint || `${eRes.status_code || eRes.error} ${eRes.response || ""}`));
+          }
+        } else {
+          log(false, "فحص الخروج فشل: " + (eg?.error || "—") + (eg?.hint ? " — " + eg.hint : ""));
+        }
+      } catch (err) {
+        log(null, "فحص الخروج تعذّر: " + (err?.message || err));
       }
       log(null, "اختبر الآن والتطبيق في الخلفية. نجاح FCM يثبت قبول الطلب فقط؛ إن لم يظهر الإشعار، افحص سجل [push-sw] وإعدادات الإذن/النظام.");
     } catch (err) {

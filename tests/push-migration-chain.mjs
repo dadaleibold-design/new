@@ -2,7 +2,7 @@
  * تحقّق شامل: تطبيق سلسلة الهجرات كاملةً على PostgreSQL حقيقي (PGlite)
  * والتأكد أن مسار التريگرات يعمل بالرابط والسرّ المُضمَّنين (بلا Vault).
  *
- * التشغيل: node tests/tmp-apply-all.mjs
+ * التشغيل: node tests/push-migration-chain.mjs
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -236,6 +236,57 @@ check("push_gateway_check: التلميح يؤكد المسار السليم", /
 
 const vaultAfter = (await q("select count(*)::int n from vault.decrypted_secrets"))[0].n;
 check("Vault ما زال فارغاً بعد كل المسارات (صفر قراءات/كتابات)", vaultAfter === 0, `rows=${vaultAfter}`);
+
+// ── v2.16: التشخيص يفحص الجسم الحيّ (لا ثوابت) ويكشف القاعدة المتأخرة ──
+const diagV216 = (await db.query("select public.push_diagnostics() d")).rows[0]?.d;
+check("push_diagnostics: live_path_vault_free = true", diagV216?.live_path_vault_free === true,
+  JSON.stringify(diagV216?.live_path_functions));
+check("push_diagnostics: live_path_secret_ok = true", diagV216?.live_path_secret_ok === true);
+check("push_diagnostics: live_path_url_ok = true", diagV216?.live_path_url_ok === true);
+check("push_diagnostics: live_path_stale = false (القاعدة محدَّثة)", diagV216?.live_path_stale === false);
+check("push_diagnostics: live_path_functions يذكر الدوال الثلاث",
+  Object.keys(diagV216?.live_path_functions || {}).length === 3,
+  Object.keys(diagV216?.live_path_functions || {}).join(", "));
+
+// محاكاة قاعدة متأخرة: جسم push_call_edge القديم القائم على Vault
+await db.exec(`
+  create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
+  returns void language plpgsql security definer set search_path = public, vault, net as $$
+  declare v_url text; v_secret text;
+  begin
+    select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
+    select decrypted_secret into vsecret_placeholder from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
+    perform net.http_post(url := v_url, headers := jsonb_build_object('x-send-push-secret', vsecret_placeholder), body := p_body);
+  end $$;
+`.replace("vsecret_placeholder", "v_secret"));
+const stale = (await db.query("select public.push_diagnostics() d")).rows[0]?.d;
+check("push_diagnostics يكشف القاعدة المتأخرة: live_path_stale = true", stale?.live_path_stale === true);
+check("push_diagnostics يكشف الاعتماد على Vault: vault_dependency = true", stale?.vault_dependency === true);
+check("push_diagnostics: live_path_functions.push_call_edge.reads_vault = true",
+  stale?.live_path_functions?.push_call_edge?.reads_vault === true);
+check("push_diagnostics: live_path_hint ينبّه على v2.16", /v2\.16/.test(stale?.live_path_hint || ""), stale?.live_path_hint);
+
+// تطبيق v2.16 يُصلح القاعدة المتأخرة
+await db.exec(read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql"));
+const fixed = (await db.query("select public.push_diagnostics() d")).rows[0]?.d;
+check("تطبيق v2.16 يُصلح القاعدة المتأخرة: live_path_stale = false", fixed?.live_path_stale === false);
+check("تطبيق v2.16: live_path_vault_free = true", fixed?.live_path_vault_free === true);
+const edgeDef2 = (await q("select pg_get_functiondef('public.push_call_edge(text,uuid,uuid,jsonb)'::regprocedure) d"))[0]?.d || "";
+check("تطبيق v2.16: push_call_edge بلا Vault", !/vault\./.test(edgeDef2));
+
+// push_egress_check: فحص مباشر لـ pg_net يتجاوز كل دوال المسار
+await db.exec("delete from net.calls");
+const eg = (await db.query("select public.push_egress_check() e")).rows[0]?.e;
+const egCall = (await q("select url, headers from net.calls order by id desc limit 1"))[0];
+check("push_egress_check: طلب مباشر للرابط المُضمَّن", eg?.queued === true && egCall?.url === URL, String(egCall?.url));
+check("push_egress_check: يحمل السرّ المُضمَّن", egCall?.headers?.["x-send-push-secret"] === SECRET);
+
+// push_probe_result يميّز خطأ DNS ويشرح سببه
+await db.exec(`insert into net._http_response(id, status_code, content, error_msg)
+  values (999999, 0, null, 'Dns resolve error: Couldn''t resolve host name') on conflict do nothing`);
+const pr = (await db.query("select public.push_probe_result(999999) r")).rows[0]?.r;
+check("push_probe_result: dns_error = true عند فشل تحليل المضيف", pr?.dns_error === true, String(pr?.error));
+check("push_probe_result: hint يشرح السبب", /v2\.16/.test(pr?.hint || ""), String(pr?.hint));
 
 await db.close();
 console.log(fails ? `\n❌ FAILED ${fails} check(s)` : "\n✅ PASSED push-migration-chain (schema + سلسلة الهجرات بلا Vault)");

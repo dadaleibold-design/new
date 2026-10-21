@@ -38,6 +38,7 @@ try {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
+const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
 
 // القيم المعتمدة (مُضمَّنة في الكود — بلا Vault).
 const EXPECTED_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
@@ -323,6 +324,47 @@ check("push_probe: يعيد request_id ويستدعي الرابط المُضم�
   probe?.request_id != null && probeCall?.url === HARDCODED_URL && probeCall?.headers?.["x-send-push-secret"] === HARDCODED_SECRET);
 
 await db.exec("set test.uid = ''");
+
+/* ---------- ⑦ v2.16: التشخيص يفحص الجسم الحيّ ويكشف القاعدة المتأخرة ---------- */
+await db.exec(MIGRATION_V216);
+const diag216 = (await db.query("select public.push_diagnostics() d")).rows[0].d;
+check("v2.16: live_path_vault_free = true (المسار الحيّ بلا Vault)", diag216?.live_path_vault_free === true,
+  JSON.stringify(diag216?.live_path_functions));
+check("v2.16: live_path_secret_ok + live_path_url_ok = true",
+  diag216?.live_path_secret_ok === true && diag216?.live_path_url_ok === true);
+check("v2.16: live_path_stale = false (القاعدة محدَّثة)",
+  diag216?.live_path_stale === false, String(diag216?.live_path_hint));
+
+// محاكاة قاعدة متأخرة (جسم push_call_edge القديم القائم على Vault)
+await db.exec(`
+  create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
+  returns void language plpgsql security definer set search_path = public, vault, net as $$
+  declare v_url text; v_secret text;
+  begin
+    select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
+    select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
+    perform net.http_post(url := v_url, headers := jsonb_build_object('x-send-push-secret', v_secret), body := p_body);
+  end $$;
+`);
+const staleDiag = (await db.query("select public.push_diagnostics() d")).rows[0].d;
+check("v2.16: live_path_stale = true لقاعدة متأخرة (يكشف الكذب)",
+  staleDiag?.live_path_stale === true && staleDiag?.vault_dependency === true);
+check("v2.16: live_path_hint ينبّه على هجرة v2.16",
+  /v2\.16/.test(staleDiag?.live_path_hint ?? ""), staleDiag?.live_path_hint);
+
+// تطبيق v2.16 يُصلح القاعدة المتأخرة
+await db.exec(MIGRATION_V216);
+const fixedDiag = (await db.query("select public.push_diagnostics() d")).rows[0].d;
+check("v2.16: تطبيقها يُصلح القاعدة المتأخرة (live_path_stale = false)",
+  fixedDiag?.live_path_stale === false && fixedDiag?.live_path_vault_free === true);
+
+// فحص الخروج: طلب مباشر من القاعدة يتجاوز الدوال
+await db.exec("delete from net.calls");
+const eg = (await db.query("select public.push_egress_check() e")).rows[0].e;
+const egCall = (await db.query("select url, headers from net.calls order by id desc limit 1")).rows[0];
+check("v2.16: push_egress_check يفحص الرابط المُضمَّن مباشرةً",
+  eg?.queued === true && egCall?.url === HARDCODED_URL
+  && egCall?.headers?.["x-send-push-secret"] === HARDCODED_SECRET, String(egCall?.url));
 
 /* ---------- النتيجة ---------- */
 if (fails) {

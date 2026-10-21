@@ -591,3 +591,52 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   و`npm run test:gateway` (الرابط والثابت من الكود لا من Vault)، ضمن `npm test`.
   فحوص إضافية تتأكّد أن **كل** ملف SQL في المستودع خالٍ من مراجع Vault في الكود، وأن
   السرّ المُضمَّن هو القيمة المعتمدة بالضبط (`my_send_push_19921121_almgawell_19921121`).
+
+## الإصدار v2.16 — تثبيت مسار الإشعارات في القاعدة الحيّة + تشخيص لا يكذب
+
+الهجرة: `sql/migrations/2026-10-22_v2_16_send_push_live_state.sql` (مطابقة لما في `sql/schema.sql` §22).
+
+- **المشكلة**: قواعد حيّة متأخرة بقيت على **أجسام الدوال القديمة** (القائمة على Vault) من
+  v2.12/v2.14، بينما `push_diagnostics` محدَّث (v2.15) ⇒ التقرير يقول «مسار سليم /
+  اعتماد Vault معدوم» بينما مسار الإرسال الفعلي يفشل:
+  - `push_gateway_check` (الجسم القديم: `search_path` فيه Vault) يرمي استثناءً عند التنفيذ
+    ⇒ خطأ RPC ⇒ «دالة غير متاحة» في الواجهة.
+  - `push_call_edge` (الجسم القديم) يقرأ `SEND_PUSH_URL` من `vault.decrypted_secrets`
+    ⇒ يستقبل `pg_net` نصاً مشفّراً كـ URL ⇒ `Couldn't resolve host name`.
+  - **السبب**: المشروع يطبّق SQL يدوياً من SQL Editor، و`create or replace function` =
+    آخر كاتب يفوز **لكل دالة على حدة** ⇒ إعادة تشغيل ملف قديم بعد v2.15 تُرجع أجسام
+    Vault القديمة وتترك دوال التشخيص الحديثة مكانها.
+- **الحل (v2.16) — ملف واحد يفعل ثلاث أشياء**:
+  1. **يُعيد تعريف كل دوال مسار الإشعارات** بالرابط والسرّ المُضمَّنين
+     (`trigger_send_push_notification` · `push_call_edge` · `push_diagnostics` ·
+     `push_probe` · `push_probe_result` · `push_gateway_check`) — `create or replace`
+     ⇒ آمن لإعادة التنفيذ ويُصلح أي قاعدة متأخرة.
+  2. **`push_diagnostics` يفحص الجسم الحيّ** (`pg_proc.prosrc`) بدل إرجاع ثوابت، ويُعلن:
+     - `live_path_vault_free` — لا دالة في المسار تقرأ Vault.
+     - `live_path_secret_ok` — جسم `trigger_send_push_notification` فيه السرّ المعتمد.
+     - `live_path_url_ok` — جسمها فيه الرابط الصحيح.
+     - `live_path_stale` — `true` ⇒ القاعدة متأخرة ⇒ أعد تنفيذ هذه الهجرة.
+     - `live_path_functions` — تفصيل لكل دالة.
+     و`secret_hardcoded` / `vault_dependency` / `edge_url_ok` صارت تعكس **الحالة الحيّة**
+     (وليس ما يقرّره التشخيص عن نفسه).
+  3. **`push_egress_check()` جديد**: يفحص `pg_net ← DNS ← send-push` **مباشرةً** متجاوزاً
+     كل دوال المسار — يميّز بين «جسم دالة قديم» (يُصلحه هذا الملف) و«مخرج الشبكة (egress)
+     للمشروع مقيّد أو DNS معطّل» (لا علاقة له بالكود).
+- **`push_probe_result` صار يُفسّر**: يميّز `dns_error` (فشل تحليل المضيف) عن 401/404
+  ويعطي `hint` يشرح السبب والخطوة التالية.
+- **الواجهة**: تقرير «إرسال إشعار تجريبي» يعرض سطراً أحمر عند `live_path_stale = true`
+  («مسار الإرسال في القاعدة قديم») بدل أن يقول «سليم»، ويشغّل `push_egress_check` بعد
+  المسبار.
+- **تطبيقها**: نفّذ `sql/migrations/2026-10-22_v2_16_send_push_live_state.sql` في SQL Editor
+  (أو `sql/schema.sql` كاملاً). آمنة لإعادة التنفيذ.
+- **التحقّق بعد التطبيق**:
+  ```sql
+  select public.push_diagnostics();
+  -- live_path_stale = false، live_path_vault_free = true، live_path_secret_ok = true
+  ```
+  ولو بقي `live_path_stale = true` فالقاعدة متأخرة — أعد تنفيذ الملف.
+- **تذكير**: يجب أن يطابق `SEND_PUSH_SECRET` على دالة `send-push` السرّ المُضمَّن تماماً،
+  وإلا رُدّت طلبات `pg_net` بـ 401:
+  ```
+  supabase secrets set SEND_PUSH_SECRET=my_send_push_19921121_almgawell_19921121
+  ```
