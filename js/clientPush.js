@@ -23,7 +23,7 @@
  */
 
 import { supabase } from "./supabaseClient.js";
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from "./config.js";
+import { SUPABASE_URL, SUPABASE_ANON_KEY, SEND_PUSH_SECRET } from "./config.js";
 
 /** رابط دالة send-push (نفسه الذي تستخدمه القاعدة) */
 export const SEND_PUSH_FN_URL = `${SUPABASE_URL}/functions/v1/send-push`;
@@ -42,13 +42,19 @@ export async function sendClientPush(payload) {
   const { data } = await supabase.auth.getSession();
   const token = data?.session?.access_token;
   if (!token) throw new Error("سجّل الدخول أولاً.");
+  const headers = {
+    "Content-Type": "application/json",
+    apikey: SUPABASE_ANON_KEY,
+    // مصادقة المستخدم: رمز الجلسة (JWT) — به تُثبَّت هوية المُرسِل على الخادم
+    Authorization: `Bearer ${token}`,
+  };
+  // السرّ المشترك: اختياري (VITE_SEND_PUSH_SECRET). إن كان مُهيّأً أُرسل
+  // أيضاً ⇒ تعمل مسارات client_* حتى بلا رمز صالح.
+  if (SEND_PUSH_SECRET) headers["x-send-push-secret"] = SEND_PUSH_SECRET;
+
   const res = await fetch(SEND_PUSH_FN_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${token}`,
-    },
+    headers,
     body: JSON.stringify(payload),
   });
   const json = await res.json().catch(() => ({}));

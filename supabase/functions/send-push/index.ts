@@ -303,19 +303,31 @@ serve(async (req) => {
     //       على الخادم (المُرسِل = صاحب الرمز، والمستلَم يُشتقّ من المحادثة).
     // ══════════════════════════════════════════════════════════════════════
     let clientUser: { id: string } | null = null;
+    let clientViaSecret = false;
     if (String(input.type || "").startsWith("client_")) {
+      // ① المصادقة المفضّلة: رمز المستخدم (JWT) — لا سرّ في المتصفح
       const authHeader = req.headers.get("authorization");
-      if (!authHeader) return json({ error: "Unauthorized" }, 401);
-      const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
-      const { data: { user }, error: userErr } = await supabase.auth.getUser(tokenVal);
-      if (userErr || !user) return json({ error: "Unauthorized user" }, 401);
-      clientUser = { id: String(user.id) };
+      if (authHeader) {
+        const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
+        const { data: { user }, error: userErr } = await supabase.auth.getUser(tokenVal);
+        if (!userErr && user) clientUser = { id: String(user.id) };
+      }
+      // ② بديل مُتوافق: السرّ المشترك (x-send-push-secret) — نفس سرّ دالة
+      //    send-push. حتى في هذه الحالة يبقى المُرسِل مُشتقّاً من سجلّ
+      //    القاعدة (لا من جسم الطلب) ⇒ لا انتحال.
+      if (!clientUser && isAuthorized(req)) clientViaSecret = true;
+      if (!clientUser && !clientViaSecret) {
+        return json({ error: "Unauthorized: يلزم رمز مستخدم صالح أو x-send-push-secret" }, 401);
+      }
 
       if (input.type === "client_probe") {
         // فحص الاتصال من المتصفح — بلا إشعار وبلا أثر
-        const tokens = await loadDeviceTokens(clientUser.id);
+        const probeUserId = clientUser ? clientUser.id : String(input.user_id || "");
+        const tokens = probeUserId ? await loadDeviceTokens(probeUserId) : [];
         return json({
-          ok: true, mode: "client", user_id: clientUser.id,
+          ok: true, mode: "client",
+          auth: clientUser ? "jwt" : "secret",
+          user_id: probeUserId,
           devices: tokens.length,
           service: "send-push (client mode)",
         });
@@ -329,14 +341,17 @@ serve(async (req) => {
           .select("id, conversation_id, sender_id, content, message_type, attachment_type")
           .eq("id", messageId).maybeSingle();
         if (!msg) return json({ error: "message not found" }, 404);
-        if (String(msg.sender_id) !== clientUser.id) {
+        if (clientUser && String(msg.sender_id) !== clientUser.id) {
           return json({ error: "forbidden: not the message sender" }, 403);
         }
+        // المُرسِل: من الرمز (JWT) أو من سجلّ الرسالة (سرّ مشترك) — ولا يُقبل
+        // أبداً من جسم الطلب.
+        const senderId = clientUser ? clientUser.id : String(msg.sender_id);
         input = {
           type: "new_message",
           message_id: msg.id,
           conversation_id: msg.conversation_id,
-          sender_id: clientUser.id,
+          sender_id: senderId,
           content: msg.content ?? (msg.attachment_type === "image" ? "📷 صورة" : msg.attachment_type === "audio" ? "🎤 رسالة صوتية" : "📎 مرفق"),
           message_type: msg.message_type,
         };
@@ -347,25 +362,29 @@ serve(async (req) => {
           .select("id, caller_id, callee_id, conversation_id, status, call_type, started_at")
           .eq("id", roomId).maybeSingle();
         if (!room) return json({ error: "call room not found" }, 404);
-        // المتصل هو صاحب الرمز فقط
-        if (String(room.caller_id) !== clientUser.id) {
+        // المتصل: من الرمز (JWT) أو من سجلّ الغرفة (سرّ مشترك)
+        if (clientUser && String(room.caller_id) !== clientUser.id) {
           return json({ error: "forbidden: not the call caller" }, 403);
         }
+        const callerId = clientUser ? clientUser.id : String(room.caller_id);
         const callType = String(input.call_type || room.call_type || "audio");
         input = {
           type: "incoming_call",
           room_id: room.id,
           conversation_id: room.conversation_id,
-          caller_id: clientUser.id,
+          caller_id: callerId,
           callee_id: room.callee_id,
           call_type: callType,
         };
       } else if (input.type === "client_new_user") {
         // إشعار «مستخدم جديد» للمشرفين — المتصل يجب أن يكون مشرفاً
-        const { data: me } = await supabase.from("profiles")
-          .select("is_admin, is_super_admin").eq("id", clientUser.id).maybeSingle();
-        if (!me?.is_admin && !me?.is_super_admin) {
-          return json({ error: "forbidden: admins only" }, 403);
+        // (أو أن يكون الطلب مصادقاً بالسرّ المشترك).
+        if (clientUser) {
+          const { data: me } = await supabase.from("profiles")
+            .select("is_admin, is_super_admin").eq("id", clientUser.id).maybeSingle();
+          if (!me?.is_admin && !me?.is_super_admin) {
+            return json({ error: "forbidden: admins only" }, 403);
+          }
         }
         const newUserId = String(input.user_id || "");
         if (!newUserId) return json({ error: "user_id required" }, 400);

@@ -61,14 +61,24 @@ check("send-push: مسار العميل بمصادقة رمز المستخدم",
 check("send-push: client_probe موجود (فحص من المتصفح)",
   /input\.type === "client_probe"/.test(FN));
 check("send-push: المُرسِل يُثبَّت من الرمز (لا من العميل)",
-  /if \(String\(msg\.sender_id\) !== clientUser\.id\)/.test(FN)
-  && /sender_id: clientUser\.id/.test(FN));
+  /if \(clientUser && String\(msg\.sender_id\) !== clientUser\.id\)/.test(FN)
+  && /sender_id: senderId/.test(FN));
 check("send-push: المتصل يُثبَّت من الرمز للمكالمات",
-  /if \(String\(room\.caller_id\) !== clientUser\.id\)/.test(FN));
+  /if \(clientUser && String\(room\.caller_id\) !== clientUser\.id\)/.test(FN)
+  && /caller_id: callerId/.test(FN));
 check("send-push: إشعار المستخدم الجديد للمشرفين فقط",
   /forbidden: admins only/.test(FN));
-check("send-push: مسار العميل لا يحتاج السرّ المشترك",
+check("send-push: مسار العميل لا يحتاج السرّ المشترك (رمز المستخدم يكفي)",
   /if \(!clientUser && !isAuthorized\(req\)\)/.test(FN));
+check("send-push: مسارات client_* تقبل السرّ المشترك بديلاً عن الرمز",
+  /clientViaSecret/.test(FN)
+  && /if \(!clientUser && isAuthorized\(req\)\) clientViaSecret = true;/.test(FN)
+  && /Unauthorized: يلزم رمز مستخدم صالح أو x-send-push-secret/.test(FN));
+check("send-push: بالسرّ المشترك يبقى المُرسِل من سجلّ القاعدة (لا انتحال)",
+  /const senderId = clientUser \? clientUser\.id : String\(msg\.sender_id\);/.test(FN)
+  && /const callerId = clientUser \? clientUser\.id : String\(room\.caller_id\);/.test(FN));
+check("send-push: فحص المشرف يمرّ مع الرمز فقط (السرّ مسار خادم)",
+  /if \(clientUser\) \{[\s\S]{0,320}forbidden: admins only/.test(FN));
 check("send-push: منع الإرسال المكرر (عدة أجهزة للمرسل)",
   /isDuplicatePush\(messageId\)/.test(FN) && /markPushSent\(messageId\)/.test(FN) && /_pushSeen/.test(FN));
 check("send-push: يُسجَّل التكرار بعد نجاح الإرسال فقط (لا تُضيع إعادة المحاولة)",
@@ -77,11 +87,21 @@ check("send-push: لا يُقرأ sender_id من جسم الطلب في مسار
   !/input\.sender_id/.test(FN.split('if (input.type === "client_message")')[0] || ""));
 
 // ── الواجهة ──
-check("clientPush.js: يستخدم رمز الجلسة (لا سرّ مشترك)",
+check("clientPush.js: يستخدم رمز الجلسة دائماً",
   /supabase\.auth\.getSession\(\)/.test(CLIENT_PUSH)
-  && !/x-send-push-secret/.test(CLIENT_PUSH));
-check("clientPush.js: لا يحتوي السرّ المُضمَّن",
+  && /Authorization/.test(CLIENT_PUSH));
+check("clientPush.js: لا يحتوي السرّ مُضمَّناً (يأتي من البيئة فقط)",
   !/my_send_push_19921121_almgawell_19921121/.test(CLIENT_PUSH));
+check("clientPush.js: يرسل ترويسة x-send-push-secret إن كان مُهيّأً",
+  /x-send-push-secret/.test(CLIENT_PUSH) && /SEND_PUSH_SECRET/.test(CLIENT_PUSH));
+check("clientPush.js: يرسل رمز المستخدم دائماً (Authorization)",
+  /Authorization: `Bearer \$\{token\}`/.test(CLIENT_PUSH));
+const ENV_SRC = read("js/env.js");
+const requiredBlock = (ENV_SRC.split("export const REQUIRED_ENV_KEYS")[1] || "").split("]);")[0];
+check("env.js: مفتاح السرّ اختياري (ليس ضمن المطلوب)",
+  /VITE_SEND_PUSH_SECRET/.test(ENV_SRC) && !/VITE_SEND_PUSH_SECRET/.test(requiredBlock));
+check("config.js: يعيد تصدير السرّ",
+  /SEND_PUSH_SECRET/.test(read("js/config.js")));
 check("clientPush.js: يوفّر message/call/new_user/probe",
   /clientPushMessage/.test(CLIENT_PUSH) && /clientPushCall/.test(CLIENT_PUSH)
   && /clientPushNewUser/.test(CLIENT_PUSH) && /clientPushProbe/.test(CLIENT_PUSH));
