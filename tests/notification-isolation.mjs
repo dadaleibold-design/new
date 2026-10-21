@@ -116,8 +116,10 @@ const fnBlock = (name) => {
   const next = rest.indexOf("\ncreate or replace function public.");
   return next === -1 ? SCHEMA.slice(start) : SCHEMA.slice(start, start + 1 + next);
 };
-check("آخر تعريف push_call_edge في schema.sql هو المشدّد (فيه بوابة العزل)",
-  lastIndexOf(SCHEMA, "public.push_recipient_allowed(p_kind, p_ref, p_recipient, p_body)") > lastDef("push_call_edge"));
+check("آخر تعريف trigger_send_push_notification في schema.sql هو المشدّد (فيه بوابة العزل)",
+  lastIndexOf(SCHEMA, "public.push_recipient_allowed(p_kind, p_ref, p_recipient, p_body)") > lastDef("trigger_send_push_notification"));
+check("push_call_edge تفوّض إلى trigger_send_push_notification (توافق خلفي)",
+  fnBlock("push_call_edge").includes("public.trigger_send_push_notification(p_kind, p_ref, p_recipient, p_body)"));
 check("آخر تعريف notify_new_message هو المشدّد",
   lastDef("notify_new_message") > lastIndexOf(SCHEMA, "-- (أ) ---") && SCHEMA.slice(lastDef("notify_new_message")).includes("المرسل ليس طرفاً في المحادثة"));
 check("آخر تعريف notify_call_room هو المشدّد (callee_id حصراً)",

@@ -1247,7 +1247,7 @@ function wireChrome() {
           log(false, "دالة push_diagnostics غير موجودة — نفّذ migration v2.2 في Supabase");
         } else {
           log(!!diag.pg_net_installed, "امتداد pg_net " + (diag.pg_net_installed ? "مفعّل" : "غير مفعّل"));
-          log(!!diag.vault_url_set && !!diag.vault_secret_set, "أسرار Vault (SEND_PUSH_URL/SEND_PUSH_SECRET) " + (diag.vault_url_set && diag.vault_secret_set ? "مضبوطة" : "ناقصة"));
+          log(!!diag.edge_url_ok, "مسار التريگرات → send-push " + (diag.edge_url_ok ? "سليم: " + (diag.edge_function_url || "") : "خاطئ — راجع الرابط المُضمَّن في trigger_send_push_notification (migration v2.15)"));
           log(!!diag.trigger_messages, "Trigger الرسائل " + (diag.trigger_messages ? "موجود" : "مفقود"));
           log(Number(diag.my_tokens) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag.my_tokens}`);
           const last = (diag.last_log || [])[0];
@@ -1282,7 +1282,7 @@ function wireChrome() {
         if (probeErr) {
           log(false, "دالة push_probe غير موجودة — نفّذ migration v2.3");
         } else if (!probe?.request_id) {
-          log(false, "الـ Trigger لم يستطع استدعاء pg_net — راجع SEND_PUSH_URL/SECRET في Vault");
+          log(false, "الـ Trigger لم يستطع استدعاء pg_net — تحقق أن امتداد pg_net مفعّل وأن الرابط المُضمَّن في trigger_send_push_notification (migration v2.15) صحيح");
         } else {
           let res = null;
           for (let i = 0; i < 8; i += 1) {
@@ -1294,15 +1294,15 @@ function wireChrome() {
             }
           }
           if (!res) {
-            log(false, "لم يصل رد من send-push خلال 10 ثوانٍ (timeout) — تحقق أن الرابط في Vault صحيح");
+            log(false, "لم يصل رد من send-push خلال 10 ثوانٍ (timeout) — تحقق أن الرابط المُضمَّن في trigger_send_push_notification يطابق رابط الدالة المنشورة");
           } else if (res.status_code === 200) {
             log(true, `قاعدة البيانات وصلت إلى send-push بنجاح (200): ${res.response || ""}`);
           } else if (res.status_code === 401 && /NO_AUTH_HEADER|Missing authorization|INVALID_JWT_FORMAT|Bearer/i.test(res.response || "")) {
             log(false, "401 من بوابة Supabase (وليس من الدالة): انشر الدالة بـ --no-verify-jwt ونفّذ migration v2.4 (يضيف ترويسة Authorization)");
           } else if (res.status_code === 401) {
-            log(false, "401 من send-push: قيمة SEND_PUSH_SECRET في Vault لا تطابق سر الدالة — وحّدهما ثم أعد النشر");
+            log(false, "401 من send-push: السرّ المُضمَّن في trigger_send_push_notification (x-send-push-secret) لا يطابق SEND_PUSH_SECRET على الدالة — وحّدهما");
           } else if (res.status_code === 404) {
-            log(false, "404: SEND_PUSH_URL في Vault خاطئ — يجب أن يكون https://<ref>.supabase.co/functions/v1/send-push");
+            log(false, "404: الرابط المُضمَّن في trigger_send_push_notification خاطئ — يجب أن يكون https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push");
           } else {
             log(false, `رد غير متوقع من send-push: ${res.status_code || res.error} ${res.response || ""}`);
           }

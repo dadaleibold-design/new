@@ -3,7 +3,7 @@
     "agora-rtc-sdk-ng": "4.24.8"
   },
   "scripts": {
-    "test": "node tests/smoke.mjs user && node tests/smoke.mjs admin && node tests/smoke.mjs super && node tests/composer-keys.mjs && node tests/notification-flow.mjs && node tests/ticks-presence.mjs && node tests/realtime-resilience.mjs && node tests/push-sw.mjs && node tests/send-push-payload.mjs && node tests/multidevice-push.mjs && node tests/push-sync-behavior.mjs && node tests/admin-directory.mjs && node tests/notification-isolation.mjs && node tests/rls-hardening-postgres.mjs && node tests/sql-v28-postgres.mjs && node tests/sql-v29-postgres.mjs && node tests/env-config.mjs && node tests/boot-fallback.mjs && node tests/agora-sdk-deps.mjs && node tests/agora-token-auth.mjs && node tests/calls-media.mjs && node tests/call-push-routing.mjs && node tests/app-shell-sw-routing.mjs && node tests/sql-v210-postgres.mjs && node tests/push-gateway.mjs && node tests/super-admin-write.mjs && node tests/typing-debounce.mjs",
+    "test": "node tests/smoke.mjs user && node tests/smoke.mjs admin && node tests/smoke.mjs super && node tests/composer-keys.mjs && node tests/notification-flow.mjs && node tests/ticks-presence.mjs && node tests/realtime-resilience.mjs && node tests/push-sw.mjs && node tests/send-push-payload.mjs && node tests/multidevice-push.mjs && node tests/push-sync-behavior.mjs && node tests/admin-directory.mjs && node tests/notification-isolation.mjs && node tests/rls-hardening-postgres.mjs && node tests/sql-v28-postgres.mjs && node tests/sql-v29-postgres.mjs && node tests/env-config.mjs && node tests/boot-fallback.mjs && node tests/agora-sdk-deps.mjs && node tests/agora-token-auth.mjs && node tests/calls-media.mjs && node tests/call-push-routing.mjs && node tests/app-shell-sw-routing.mjs && node tests/sql-v210-postgres.mjs && node tests/push-gateway.mjs && node tests/push-trigger-no-vault.mjs && node tests/super-admin-write.mjs && node tests/typing-debounce.mjs",
     "test:flow": "node tests/notification-flow.mjs",
     "test:push-payload": "node tests/send-push-payload.mjs",
     "lint": "eslint --config tests/eslint.config.mjs js/ *.js",
@@ -23,6 +23,7 @@
     "test:sql:v210": "node tests/sql-v210-postgres.mjs",
     "test:rls": "node tests/rls-hardening-postgres.mjs",
     "test:gateway": "node tests/push-gateway.mjs",
+    "test:push-trigger": "node tests/push-trigger-no-vault.mjs",
     "test:super-admin": "node tests/super-admin-write.mjs",
     "test:typing": "node tests/typing-debounce.mjs",
     "test:gateway:runtime": "deno run --allow-all --import-map tests/deno/import-map.json tests/deno/send-push-runtime.test.ts"
