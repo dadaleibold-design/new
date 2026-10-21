@@ -121,6 +121,15 @@ const FORBIDDEN_IN_FRONTEND = [
   "PUSH_GATEWAY_SECRET",
 ];
 
+/**
+ * ⚠️ استثناء موثّق (v2.19): السرّ المشترك لدالة send-push مسموح في المتصفح
+ *    **بصيغته الاختيارية** VITE_SEND_PUSH_SECRET (فارغ افتراضياً) — بطلب
+ *    المالك: مسار إرسال الإشعارات من الواجهة (قاعدة البيانات معزولة شبكياً).
+ *    يبقى الاسم العادي SEND_PUSH_SECRET ممنوعاً في الواجهة، ولا يُكتب أي
+ *    قيمة سرّية داخل المستودع — القيمة تأتي من متغيّر بيئة وقت التشغيل.
+ */
+const ALLOWED_OPTIONAL_FRONTEND_VITE_KEYS = ["VITE_SEND_PUSH_SECRET"];
+
 /** يزيل تعليقات JS/TS/HTML حتى لا يُحتسب ذكر الاسم في التوثيق */
 function stripComments(code) {
   return String(code)
@@ -139,10 +148,13 @@ function findSecretUsage(code, secret) {
   const name = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const patterns = [
     new RegExp(name + "\\s*[:=]\\s*" + QUOTE_CHARS + "[^\"'`]+" + QUOTE_CHARS),
-    new RegExp("VITE_" + name),
     new RegExp("Deno\\.env\\.get\\(\\s*" + QUOTE_CHARS + name + QUOTE_CHARS),
     new RegExp("localStorage\\.(?:get|set)Item\\(\\s*" + QUOTE_CHARS + name + QUOTE_CHARS),
   ];
+  // صيغة VITE_ الاختيارية مسموحة فقط لهذا الاسم (استثناء موثّق أعلاه)
+  if (!ALLOWED_OPTIONAL_FRONTEND_VITE_KEYS.includes("VITE_" + name)) {
+    patterns.push(new RegExp("VITE_" + name));
+  }
   return patterns.some((re) => re.test(code));
 }
 
@@ -203,6 +215,9 @@ const example = read(".env.example");
 const requiredNames = [
   ...REQUIRED_VITE,
   "VITE_AGORA_APP_ID", // إضافي/اختياري: معرّف Agora العام في الواجهة
+  // إضافي/اختياري: السرّ المشترك لدالة send-push (بصيغة VITE_ فقط — انظر
+  // الاستثناء الموثّق في ALLOWED_OPTIONAL_FRONTEND_VITE_KEYS)
+  "VITE_SEND_PUSH_SECRET",
   // أسرار FCM المباشر في Edge Function (ليست VITE_ ولا تُحقن في المتصفح)
   "SEND_PUSH_SECRET",
   "FIREBASE_SERVICE_ACCOUNT",
