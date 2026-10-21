@@ -299,6 +299,7 @@ const push = read("js/push.js");
 const calls = read("js/calls.js");
 const app = read("js/app.js");
 const sendPush = read("supabase/functions/send-push/index.ts");
+const recipients = read("supabase/functions/send-push/recipients.ts");
 
 check("الموجّه يحوّل WA_CALL_PUSH إلى wa-call-push", /message\.type === "WA_CALL_PUSH"[\s\S]{0,300}wa-call-push/.test(router));
 check("push.js: إشعارات المكالمات لا تشغّل صوت notify.mp3 ولا تعرض إشعاراً مكرراً", /isCallPushType\(data\.type\)[\s\S]{0,400}return;/.test(push));
@@ -308,9 +309,13 @@ check("calls.js: call_ended تمر عبر handlePeerEnded بلا شرط connecte
 check("calls.js: دفعة Push تتحقق من calleeId قبل الرنين", /data\.calleeId && data\.calleeId !== me\.id/.test(calls));
 check("app.js: لا يوجد openCallFromNotification بعد الآن", !app.includes("openCallFromNotification"));
 check("app.js: النقر يمر عبر presentIncomingCallFromRoom مع رجوع للمحادثة", /presentIncomingCallFromRoom\(route\.roomId/.test(app) && /if \(handled\.ok && handled\.data\) return;/.test(app));
-check("send-push: حارس حالة الغرفة (ringing فقط) لـ incoming_call", /call not ringing/.test(sendPush) && /String\(room\.status \|\| ""\) !== "ringing"/.test(sendPush));
-check("send-push: حداثة الرنين من started_at (ساعة الخادم) لـ incoming_call", /select\("started_at"\)/.test(sendPush) && /CALL_RING_MAX_AGE_MS/.test(sendPush));
-check("send-push: الإرسال لـ callee_id فقط (لا بث)", /loadDeviceTokens\(recipientId\)/.test(sendPush) && !/loadAdminIds[\s\S]{0,40}incoming_call/.test(sendPush));
+check("send-push: حارس حالة الغرفة (ringing فقط) لـ incoming_call",
+  /status !== "ringing"/.test(recipients) && /"ringing"/.test(recipients));
+check("send-push: حداثة الرنين من started_at (ساعة الخادم) لـ incoming_call",
+  /CALL_RING_MAX_AGE_MS/.test(recipients) && /started_at/.test(recipients));
+check("send-push: الإرسال لـ callee_id فقط (لا بث)",
+  /decision\.recipientId/.test(sendPush) && /callRecipient\(/.test(sendPush) &&
+    !/loadAdminIds[\s\S]{0,60}incoming_call/.test(sendPush));
 
 console.log(fails ? `\nFAILED ${fails}` : "\nPASSED call-push-routing");
 process.exit(fails ? 1 : 0);

@@ -1,169 +1,239 @@
-// supabase/functions/send-push/index.ts
-// إرسال مباشر إلى FCM HTTP v1 مع مصادقة JWT يدوية وتعدد أجهزة
+/**
+ * send-push — Edge Function الوحيدة لإرسال إشعارات FCM
+ * ============================================================================
+ * المسار (v3.0 — 2026-10-26):
+ *
+ *   INSERT/UPDATE على messages / call_rooms / profiles
+ *        │
+ *        ▼  Supabase Database Webhook (مُدار في اللوحة — لا SQL ولا pg_net)
+ *   POST /functions/v1/send-push      الترويسة: x-send-push-secret
+ *        │
+ *        ▼  هذه الدالة: تُحقّق، تُحدّد المستلم، تقرأ التوكنات، تُرسل
+ *   FCM HTTP v1 ──► firebase-messaging-sw.js ──► إشعار النظام
+ *
+ * ما أُزيل نهائياً (v3.0):
+ *   ✗ pg_net / net.http_post — القاعدة لا تُجري أي طلب شبكة.
+ *   ✗ Supabase Vault — لا أسرار ولا روابط مخزَّنة في القاعدة.
+ *   ✗ تريگرات الإشعارات (notify_new_message / notify_call_room / …).
+ *   ✗ مسار العميل (client_*) وWorker الوسيط — مصدر واحد فقط للحدث: الـ Webhook.
+ *
+ * المصادقة:
+ *   • الـ Webhook: ترويسة x-send-push-secret = SEND_PUSH_SECRET
+ *     (أو Authorization: Bearer <SEND_PUSH_SECRET | SUPABASE_SERVICE_ROLE_KEY>).
+ *   • الاختبار اليدوي والتشخيص: رمز مستخدم (JWT) — ولا يُقبل السرّ هنا.
+ *
+ * متغيرات البيئة (Supabase → Edge Functions → Secrets):
+ *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (يوفّرها Supabase تلقائياً)
+ *   SEND_PUSH_SECRET                        (سرّ الـ Webhook)
+ *   FIREBASE_SERVICE_ACCOUNT                (JSON حساب الخدمة — مفضّل)
+ *     أو: FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY
+ *   PUSH_NORMAL_URGENCY=1                   (اختياري: أولوية عادية لرسائل الدردشة)
+ */
 
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// --- inline payload helper (consolidated from payload.ts) ---
-const MAX_FCM_DATA_BYTES = 3500;
-const _enc = new TextEncoder();
-const _dec = new TextDecoder();
-const REQUIRED_ROUTE_FIELDS = new Set(["type", "messageId", "conversationId", "roomId", "userId"]);
-const PREFERRED_TRIM_FIELDS = ["body", "title", "icon", "email", "phone", "createdAt", "timestamp", "messageType"];
-function _utf8ByteLength(v: string) { return _enc.encode(v).length; }
-function _dataByteLength(d: Record<string, string>) { return Object.entries(d).reduce((s, [k, v]) => s + _utf8ByteLength(k) + _utf8ByteLength(v), 0); }
-function _truncateUtf8(value: string, maxBytes: number) {
-  const bytes = _enc.encode(value);
-  const limit = Math.max(0, Math.floor(maxBytes));
-  if (bytes.length <= limit) return value;
-  let end = Math.min(limit, bytes.length);
-  while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
-  return _dec.decode(bytes.subarray(0, end));
-}
-function _shortenField(data: Record<string, string>, key: string, currentBytes: number) {
-  const value = data[key]; if (value === undefined || !value) return;
-  const overBy = _dataByteLength(data) - MAX_FCM_DATA_BYTES;
-  const ellipsisBytes = _utf8ByteLength("…");
-  const retainedBytes = Math.max(0, currentBytes - overBy - ellipsisBytes);
-  const prefix = _truncateUtf8(value, retainedBytes);
-  data[key] = prefix === value ? prefix : `${prefix}…`;
-}
-function fitFcmData(input: Record<string, string>): Record<string, string> {
-  const data: Record<string, string> = {};
-  for (const [k, v] of Object.entries(input || {})) { if (!k || v === undefined || v === null) continue; data[String(k)] = String(v); }
-  let size = _dataByteLength(data); if (size <= MAX_FCM_DATA_BYTES) return data;
-  for (const k of PREFERRED_TRIM_FIELDS) { if (size <= MAX_FCM_DATA_BYTES) break; const v = data[k]; if (v === undefined) continue; _shortenField(data, k, _utf8ByteLength(v)); size = _dataByteLength(data); }
-  if (size > MAX_FCM_DATA_BYTES) { for (const k of Object.keys(data)) { if (size <= MAX_FCM_DATA_BYTES) break; if (REQUIRED_ROUTE_FIELDS.has(k)) continue; delete data[k]; size = _dataByteLength(data); } }
-  if (size > MAX_FCM_DATA_BYTES) throw new RangeError(`FCM route data exceeds ${MAX_FCM_DATA_BYTES} UTF-8 bytes`);
-  return data;
-}
+import { fitFcmData } from "./payload.ts";
+import {
+  callPartiesBelongToConversation,
+  callRecipient,
+  messagePreview,
+  messageRecipient,
+} from "./recipients.ts";
+import {
+  dedupeKey,
+  eventRefId,
+  normalizePayload,
+  type PushEvent,
+} from "./webhook.ts";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET");
-// قراءة حساب الخدمة كـ JSON أو المتغيرات المنفصلة
-const FIREBASE_SERVICE_ACCOUNT = Deno.env.get("FIREBASE_SERVICE_ACCOUNT") || "";
-let FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") || "";
-let FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") || "";
-let FIREBASE_PRIVATE_KEY = (Deno.env.get("FIREBASE_PRIVATE_KEY") || "").replace(/\\n/g, "\n");
+/* ══════════════════════════════════════════════════════════════════════════
+ * 0) البيئة والإعدادات
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET") ?? "";
+const PUSH_NORMAL_URGENCY = Deno.env.get("PUSH_NORMAL_URGENCY") === "1";
+const SERVICE_VERSION = "3.0.0";
+
+const FIREBASE_SERVICE_ACCOUNT = Deno.env.get("FIREBASE_SERVICE_ACCOUNT") ?? "";
+let FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") ?? "";
+let FIREBASE_CLIENT_EMAIL = Deno.env.get("FIREBASE_CLIENT_EMAIL") ?? "";
+let FIREBASE_PRIVATE_KEY = (Deno.env.get("FIREBASE_PRIVATE_KEY") ?? "").replace(/\\n/g, "\n");
+
 if (FIREBASE_SERVICE_ACCOUNT) {
   try {
     const sa = JSON.parse(FIREBASE_SERVICE_ACCOUNT);
     FIREBASE_PROJECT_ID = FIREBASE_PROJECT_ID || sa.project_id || "";
     FIREBASE_CLIENT_EMAIL = FIREBASE_CLIENT_EMAIL || sa.client_email || "";
     FIREBASE_PRIVATE_KEY = FIREBASE_PRIVATE_KEY || (sa.private_key || "").replace(/\\n/g, "\n");
-  } catch {}
-}
-
-// حماية من الحلقة اللانهائية — استخدم تجزئة لتجاوز فحص push-gateway الذي يمنع العبارة الحرفية
-const _gwKey = "PUSH_" + "GATEWAY_URL";
-const _gwVal = Deno.env.get(_gwKey) || "";
-if (_gwVal && _gwVal.includes("/functions/v1/send-push")) {
-  throw new Error("infinite loop: " + "PUSH_" + "GATEWAY_URL points to send-push itself");
+  } catch (error) {
+    console.error("[send-push] FIREBASE_SERVICE_ACCOUNT is not valid JSON", error);
+  }
 }
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
 }
 
+const firebaseConfigured = Boolean(
+  FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY,
+);
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const CALL_RING_MAX_AGE_MS = 2 * 60 * 1000;
 
-// ── منع التكرار: في وضع «العميل» قد يطلب أكثر من جهاز من أجهزة المرسل
-// إرسال الإشعار نفسه (كل جهاز يرصد الرسالة عبر Realtime).
-// الحل: ذاكرة قصيرة داخل العزل (isolate) بمفتاح message_id.
-const PUSH_DEDUPE_TTL_MS = 60 * 1000;
-const _pushSeen = new Map<string, number>();
-/** هل أُرسل هذا الإشعار قبل قليل؟ (قراءة فقط — لا تُسجَّل هنا) */
-function isDuplicatePush(key: string): boolean {
-  if (!key) return false;
-  const now = Date.now();
-  for (const [k, t] of _pushSeen) if (now - t > PUSH_DEDUPE_TTL_MS) _pushSeen.delete(k);
-  return _pushSeen.has(key);
-}
-/** تُستدعى بعد الإرسال الناجح فقط — حتى لا تُضيع إعادة محاولة بعد فشل */
-function markPushSent(key: string) {
-  if (!key) return;
-  _pushSeen.set(key, Date.now());
-}
 const FCM_CONCURRENCY = 10;
+const DEDUPE_TTL_MS = 60 * 1000;
+const CALL_TTL_SECONDS = 60;
+const MESSAGE_TTL_SECONDS = 86_400;
 
-function json(data: unknown, status = 200) {
+/* ══════════════════════════════════════════════════════════════════════════
+ * 1) أدوات عامة
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
 }
 
-function isAuthorized(req: Request) {
-  if (!SEND_PUSH_SECRET) return false;
-  const supplied = req.headers.get("x-send-push-secret");
-  const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  return supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET || bearer === SUPABASE_SERVICE_ROLE_KEY;
+function text(value: unknown): string {
+  return value === null || value === undefined ? "" : String(value);
 }
 
-// كاش للتوكن
+function skipped(kind: string, reason: string, status = 200): Response {
+  console.warn(`[send-push] ${kind} skipped: ${reason}`);
+  return json({ ok: true, kind, sent: 0, total: 0, skipped: reason }, status);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 2) منع التكرار (إعادة محاولات الـ Webhook + عدة أجهزة)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const _seen = new Map<string, number>();
+
+function isDuplicate(key: string): boolean {
+  if (!key) return false;
+  const now = Date.now();
+  for (const [k, at] of _seen) if (now - at > DEDUPE_TTL_MS) _seen.delete(k);
+  return _seen.has(key);
+}
+
+function markSent(key: string): void {
+  if (key) _seen.set(key, Date.now());
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 3) مصادقة الطلب
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function isWebhookAuthorized(req: Request): boolean {
+  const supplied = req.headers.get("x-send-push-secret") ?? "";
+  const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  if (SEND_PUSH_SECRET && (supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET)) {
+    return true;
+  }
+  // خدمة Supabase (service_role) — مفيدة عند الاختبار من SQL/سكربت إداري
+  return Boolean(bearer) && bearer === SUPABASE_SERVICE_ROLE_KEY;
+}
+
+async function authenticatedUserId(req: Request): Promise<string | null> {
+  const header = req.headers.get("authorization") ?? "";
+  const token = header.replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user?.id) return null;
+  return String(data.user.id);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 4) Firebase: OAuth2 + FCM HTTP v1
+ * ══════════════════════════════════════════════════════════════════════════ */
+
 let _cachedAccessToken: string | null = null;
 let _cachedExpiry = 0;
 
-function b64urlEncode(str: string): string {
-  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+function base64Url(value: string): string {
+  return btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-function b64urlEncodeBytes(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+function base64UrlBytes(bytes: Uint8Array): string {
+  let raw = "";
+  for (let i = 0; i < bytes.length; i += 1) raw += String.fromCharCode(bytes[i]);
+  return base64Url(raw);
 }
 
 async function getAccessToken(): Promise<string> {
   if (_cachedAccessToken && Date.now() < _cachedExpiry) return _cachedAccessToken;
+  if (!firebaseConfigured) throw new Error("Firebase is not configured on send-push");
+
   const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "RS256", typ: "JWT" };
-  const claims = {
-    iss: FIREBASE_CLIENT_EMAIL,
-    scope: "https://www.googleapis.com/auth/firebase.messaging",
-    aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600,
-  };
-  const headerB64 = b64urlEncode(JSON.stringify(header));
-  const claimsB64 = b64urlEncode(JSON.stringify(claims));
-  const unsigned = `${headerB64}.${claimsB64}`;
-  const pem = FIREBASE_PRIVATE_KEY.replace(/-----BEGIN PRIVATE KEY-----/g, "").replace(/-----END PRIVATE KEY-----/g, "").replace(/\s+/g, "");
+  const unsigned = `${base64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${
+    base64Url(JSON.stringify({
+      iss: FIREBASE_CLIENT_EMAIL,
+      scope: "https://www.googleapis.com/auth/firebase.messaging",
+      aud: "https://oauth2.googleapis.com/token",
+      iat: now,
+      exp: now + 3600,
+    }))
+  }`;
+
+  const pem = FIREBASE_PRIVATE_KEY
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s+/g, "");
   const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
-  // RSASSA-PKCS1-v1_5 مطلوب للتحقق في الاختبارات
-  const key = await crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
-  const sigBuf = await crypto.subtle.sign({ name: "RSASSA-PKCS1-v1_5" } as any, key, new TextEncoder().encode(unsigned));
-  const sigB64 = b64urlEncodeBytes(new Uint8Array(sigBuf));
-  const assertion = `${unsigned}.${sigB64}`;
-  const res = await fetch("https://oauth2.googleapis.com/token", {
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    der,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    { name: "RSASSA-PKCS1-v1_5" },
+    key,
+    new TextEncoder().encode(unsigned),
+  );
+  const assertion = `${unsigned}.${base64UrlBytes(new Uint8Array(signature))}`;
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }).toString(),
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion,
+    }).toString(),
   });
-  const j = await res.json();
-  if (!j.access_token) throw new Error("Failed to get access token");
-  _cachedAccessToken = j.access_token;
-  _cachedExpiry = Date.now() + (j.expires_in ? j.expires_in * 1000 - 60_000 : 3_500_000);
-  return _cachedAccessToken;
+  const payload = await response.json();
+  if (!payload?.access_token) throw new Error("Failed to obtain a Firebase access token");
+
+  _cachedAccessToken = String(payload.access_token);
+  _cachedExpiry = Date.now() + (payload.expires_in ? payload.expires_in * 1000 - 60_000 : 3_500_000);
+  return _cachedAccessToken as string;
 }
 
-async function sendToFcm(token: string, data: Record<string, string>, opts: { priority?: string; ttlSeconds?: number } = {}) {
-  const priority = opts.priority || (opts as any).highPriority ? "high" : "high";
-  // تحديد TTL حسب النوع: الرسائل اليومية، الاختبار 60s
-  const ttlSeconds = opts.ttlSeconds ?? ((data.type === "test" || data.type === "probe") ? 60 : 86400);
-  // للتلميح في الاختبارات: 429, 500, 502, 503, 504 هي الحالات القابلة لإعادة المحاولة
-  const RETRY_CODES = [429, 500, 502, 503, 504];
+type FcmOptions = { priority?: "high" | "normal"; ttlSeconds?: number };
+type FcmResult = { ok: boolean; status: number; details: any };
 
-  const cleanedData: Record<string, string> = {};
-  for (const [k, v] of Object.entries(data)) {
-    if (v !== null && v !== undefined) cleanedData[k] = String(v);
-  }
-  const fittedData = fitFcmData(cleanedData);
+const RETRY_STATUS_CODES = [429, 500, 502, 503, 504];
+
+async function sendToFcm(
+  token: string,
+  data: Record<string, string>,
+  options: FcmOptions = {},
+): Promise<FcmResult> {
+  const priority = options.priority ?? "high";
+  const ttlSeconds = options.ttlSeconds ??
+    (data.type === "test" || data.type === "probe" ? 60 : MESSAGE_TTL_SECONDS);
 
   const message = {
     token,
-    data: fittedData,
+    data: fitFcmData(data),
     android: {
       priority: priority === "high" ? "HIGH" : "NORMAL",
       ttl: `${ttlSeconds}s`,
@@ -174,8 +244,9 @@ async function sendToFcm(token: string, data: Record<string, string>, opts: { pr
   };
 
   const accessToken = await getAccessToken();
-  let lastResult: any = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  let last: FcmResult = { ok: false, status: 0, details: null };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     const response = await fetch(
       `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`,
       {
@@ -188,99 +259,524 @@ async function sendToFcm(token: string, data: Record<string, string>, opts: { pr
         signal: AbortSignal.timeout(10_000),
       },
     );
-    const text = await response.text();
+    const body = await response.text();
     let details: any = null;
-    try { details = text ? JSON.parse(text) : null; } catch { details = { error: text.slice(0, 500) }; }
-    lastResult = { ok: response.ok, status: response.status, details };
-    if (response.ok) return lastResult;
-    if (!RETRY_CODES.includes(response.status)) break;
-    if (attempt < 2) await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+    try {
+      details = body ? JSON.parse(body) : null;
+    } catch {
+      details = { error: body.slice(0, 500) };
+    }
+    last = { ok: response.ok, status: response.status, details };
+    if (response.ok) return last;
+    if (!RETRY_STATUS_CODES.includes(response.status)) break;
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
   }
-  return lastResult;
-}
-
-type DeviceRow = { id: string; token: string; user_id?: string | null; platform?: string | null; device_id?: string | null; device_info?: any };
-
-async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
-  // يحفظ سجل عدد أجهزة المستلم للتشخيص
-  const { data, error } = await supabase.from("fcm_tokens").select("id, token, platform, device_id, device_info").eq("user_id", userId);
-  if (error) throw error;
-  const rows = (data || []) as DeviceRow[];
-  console.log(`[send-push] recipient=${userId} devices=${rows.length}`);
-  const seen = new Set<string>();
-  const out: DeviceRow[] = [];
-  for (const r of rows) {
-    if (!r.token || seen.has(r.token)) continue;
-    seen.add(r.token);
-    out.push(r);
-  }
-  return out;
-}
-
-async function loadDeviceTokensForUsers(userIds: string[]): Promise<DeviceRow[]> {
-  const ids = [...new Set((userIds || []).filter(Boolean))];
-  if (!ids.length) return [];
-  const { data, error } = await supabase.from("fcm_tokens").select("id, token, user_id, platform, device_id, device_info").in("user_id", ids);
-  if (error) throw error;
-  const seen = new Set<string>();
-  const out: DeviceRow[] = [];
-  for (const r of (data || []) as DeviceRow[]) {
-    if (!r.token || seen.has(r.token)) continue;
-    seen.add(r.token);
-    out.push(r);
-  }
-  return out;
-}
-
-async function loadAdminIds(): Promise<string[]> {
-  const { data, error } = await supabase.from("profiles").select("id, is_admin, is_super_admin, is_blocked").or("is_admin.eq.true,is_super_admin.eq.true");
-  if (error) throw error;
-  return (data || []).filter((row: any) => row?.id && row.is_blocked !== true).map((row: any) => String(row.id));
-}
-
-function conversationCounterpart(
-  conversation: { user_id?: string | null; admin_id?: string | null } | null | undefined,
-  senderId: string,
-  senderIsSuperAdmin = false,
-): string | null {
-  if (!conversation || !senderId) return null;
-  if (conversation.user_id === senderId) return conversation.admin_id || null;
-  if (conversation.admin_id === senderId) return conversation.user_id || null;
-  if (senderIsSuperAdmin) return conversation.user_id || null;
-  return null;
-}
-
-function refuse(reason: string, status = 200) {
-  console.warn(`[send-push] notification refused: ${reason}`);
-  return json({ sent: 0, total: 0, skipped: reason }, status);
+  return last;
 }
 
 function isDeadToken(status: number, details: any): boolean {
-  const text = JSON.stringify(details || {});
-  return /UNREGISTERED|registration-token-not-registered/i.test(text);
+  return /UNREGISTERED|registration-token-not-registered/i.test(JSON.stringify(details ?? {}));
 }
 
-async function sendToAllDevices(rows: DeviceRow[], data: Record<string, string>, opts: any = {}) {
-  const priority = opts.priority || "high";
-  const ttlSeconds = opts.ttlSeconds ?? (data.type === "test" || data.type === "probe" ? 60 : 86400);
-  const results: any[] = [];
+/* ══════════════════════════════════════════════════════════════════════════
+ * 5) قاعدة البيانات: توكنات + ملفات + سجل التسليم
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+type DeviceRow = {
+  id: string;
+  token: string;
+  platform?: string | null;
+  device_id?: string | null;
+  user_id?: string | null;
+};
+
+async function loadDeviceTokens(userId: string): Promise<DeviceRow[]> {
+  if (!userId) return [];
+  const { data, error } = await supabase
+    .from("fcm_tokens")
+    .select("id, token, platform, device_id, user_id")
+    .eq("user_id", userId);
+  if (error) throw error;
+  const rows = (data ?? []) as DeviceRow[];
+  console.log(`[send-push] recipient=${userId} devices=${rows.length}`);
+  return rows;
+}
+
+async function loadDeviceTokensForUsers(userIds: string[]): Promise<DeviceRow[]> {
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (!ids.length) return [];
+  const { data, error } = await supabase
+    .from("fcm_tokens")
+    .select("id, token, platform, device_id, user_id")
+    .in("user_id", ids);
+  if (error) throw error;
+  return (data ?? []) as DeviceRow[];
+}
+
+async function loadConversation(conversationId: string) {
+  if (!conversationId) return null;
+  const { data, error } = await supabase
+    .from("conversations")
+    .select("id, user_id, admin_id")
+    .eq("id", conversationId)
+    .maybeSingle();
+  if (error) throw error;
+  return data as { id: string; user_id: string | null; admin_id: string | null } | null;
+}
+
+async function loadProfile(userId: string) {
+  if (!userId) return null;
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, display_name, avatar_url, is_admin, is_super_admin")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) throw error;
+  return data as {
+    id: string;
+    display_name?: string | null;
+    avatar_url?: string | null;
+    is_admin?: boolean | null;
+    is_super_admin?: boolean | null;
+  } | null;
+}
+
+async function loadAdminIds(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, is_admin, is_super_admin")
+    .or("is_admin.eq.true,is_super_admin.eq.true");
+  if (error) throw error;
+  return ((data ?? []) as any[])
+    .filter((row) => row?.id && (row.is_admin || row.is_super_admin))
+    .map((row) => String(row.id));
+}
+
+async function loadRecentDeliveries(userId: string, limit = 5): Promise<any[]> {
+  try {
+    const { data, error } = await supabase
+      .from("push_delivery_log")
+      .select("kind, source, sent, total, skipped, created_at")
+      .eq("recipient_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    return (data ?? []) as any[];
+  } catch (error) {
+    console.warn("[send-push] push_delivery_log read failed", error);
+    return [];
+  }
+}
+
+type DeliveryLog = {
+  kind: string;
+  refId?: string | null;
+  recipientId?: string | null;
+  source?: string;
+  sent?: number;
+  total?: number;
+  skipped?: string | null;
+  detail?: Record<string, unknown>;
+};
+
+/** تسجيل نتيجة كل حدث — يكتبه service_role فقط (لا سياسات كتابة في RLS). */
+async function logDelivery(entry: DeliveryLog): Promise<void> {
+  try {
+    const { error } = await supabase.from("push_delivery_log").insert({
+      kind: entry.kind,
+      ref_id: entry.refId || null,
+      recipient_id: entry.recipientId || null,
+      source: entry.source ?? "webhook",
+      sent: entry.sent ?? 0,
+      total: entry.total ?? 0,
+      skipped: entry.skipped ?? null,
+      detail: entry.detail ?? {},
+    });
+    if (error) throw error;
+  } catch (error) {
+    // السجل تشخيصي فقط — لا يُفشل الإرسال أبداً.
+    console.warn("[send-push] delivery log write failed", error);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 6) إرسال إلى كل أجهزة المستخدم + تنظيف التوكنات الميتة
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+type SendSummary = {
+  sent: number;
+  total: number;
+  results: Array<Record<string, unknown>>;
+};
+
+async function sendToAllDevices(
+  rows: DeviceRow[],
+  data: Record<string, string>,
+  options: FcmOptions = {},
+): Promise<SendSummary> {
+  const results: SendSummary["results"] = [];
   for (let i = 0; i < rows.length; i += FCM_CONCURRENCY) {
+    const batch = rows.slice(i, i + FCM_CONCURRENCY);
     const settled = await Promise.all(
-      rows.slice(i, i + FCM_CONCURRENCY).map(async (row) => {
-        const result = await sendToFcm(row.token, data, { priority, ttlSeconds });
+      batch.map(async (row) => {
+        const result = await sendToFcm(row.token, data, options);
         const removed = !result.ok && isDeadToken(result.status, result.details);
         if (removed) {
           await supabase.from("fcm_tokens").delete().eq("id", row.id);
         }
-        return { tokenId: row.id, ok: result.ok, status: result.status, removed, error: result.ok ? undefined : JSON.stringify(result.details) };
+        return {
+          tokenId: row.id,
+          ok: result.ok,
+          status: result.status,
+          removed,
+          error: result.ok ? undefined : JSON.stringify(result.details),
+        };
       }),
     );
     results.push(...settled);
   }
-  return results;
+  return { sent: results.filter((r) => r.ok).length, total: results.length, results };
 }
 
-serve(async (req) => {
+/* ══════════════════════════════════════════════════════════════════════════
+ * 7) معالجة الأحداث
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+async function handleNewMessage(event: Extract<PushEvent, { kind: "new_message" }>): Promise<Response> {
+  const record = event.record;
+  const messageId = text(record.id);
+  if (!messageId) return json({ error: "message record without id" }, 400);
+
+  const key = dedupeKey(event);
+  if (isDuplicate(key)) return skipped("new_message", "duplicate (already pushed)");
+
+  const [conversation, sender] = await Promise.all([
+    loadConversation(text(record.conversation_id)),
+    loadProfile(text(record.sender_id)),
+  ]);
+
+  const decision = messageRecipient(
+    conversation,
+    text(record.sender_id),
+    Boolean(sender?.is_super_admin),
+  );
+
+  // تعارض صريح في المستلم (اختبار يدوي/حمولة معدّلة) ⇒ 409 بدل الإرسال الخاطئ
+  if (record.recipient_id && (!decision.allowed || text(record.recipient_id) !== decision.recipientId)) {
+    await logDelivery({
+      kind: "new_message",
+      refId: messageId,
+      recipientId: text(record.recipient_id),
+      skipped: "recipient mismatch",
+    });
+    return skipped("new_message", "recipient mismatch", 409);
+  }
+
+  if (!decision.allowed) {
+    await logDelivery({ kind: "new_message", refId: messageId, skipped: decision.reason });
+    return skipped("new_message", decision.reason);
+  }
+
+  const tokens = await loadDeviceTokens(decision.recipientId);
+  if (!tokens.length) {
+    await logDelivery({
+      kind: "new_message",
+      refId: messageId,
+      recipientId: decision.recipientId,
+      skipped: "no fcm token",
+    });
+    return skipped("new_message", "no fcm token");
+  }
+
+  const summary = await sendToAllDevices(
+    tokens,
+    {
+      type: "new_message",
+      messageId,
+      conversationId: text(record.conversation_id),
+      senderId: text(record.sender_id),
+      title: sender?.display_name || "رسالة جديدة",
+      body: messagePreview(record),
+      icon: text(sender?.avatar_url),
+      timestamp: text(Date.now()),
+      messageType: text(record.message_type) || "text",
+    },
+    {
+      priority: PUSH_NORMAL_URGENCY ? "normal" : "high",
+      ttlSeconds: MESSAGE_TTL_SECONDS,
+    },
+  );
+
+  let delivered = false;
+  if (summary.sent > 0) {
+    delivered = true;
+    markSent(key);
+    // ✓✓ رمادي حتى لو كان المستقبِل مغلقاً (الإشعار وصل الجهاز)
+    await supabase
+      .from("messages")
+      .update({ status: "delivered" })
+      .eq("id", messageId)
+      .eq("status", "sent");
+  }
+
+  await logDelivery({
+    kind: "new_message",
+    refId: messageId,
+    recipientId: decision.recipientId,
+    sent: summary.sent,
+    total: summary.total,
+  });
+
+  return json({
+    ok: true,
+    kind: "new_message",
+    recipient: decision.recipientId,
+    sent: summary.sent,
+    total: summary.total,
+    delivered,
+    results: summary.results,
+  });
+}
+
+async function handleCall(
+  event: Extract<PushEvent, { kind: "incoming_call" | "call_ended" }>,
+): Promise<Response> {
+  const kind = event.kind;
+  const record = event.record;
+
+  const key = dedupeKey(event);
+  if (isDuplicate(key)) return skipped(kind, "duplicate (already pushed)");
+
+  const decision = callRecipient(kind, record);
+  if (!decision.allowed) {
+    await logDelivery({ kind, refId: text(record.id), skipped: decision.reason });
+    return skipped(kind, decision.reason);
+  }
+
+  const conversation = await loadConversation(text(record.conversation_id));
+  if (!callPartiesBelongToConversation(conversation, text(record.caller_id), decision.recipientId)) {
+    const reason = "call parties are not the conversation parties";
+    await logDelivery({ kind, refId: text(record.id), skipped: reason });
+    return skipped(kind, reason);
+  }
+
+  const tokens = await loadDeviceTokens(decision.recipientId);
+  if (!tokens.length) {
+    await logDelivery({
+      kind,
+      refId: text(record.id),
+      recipientId: decision.recipientId,
+      skipped: "no fcm token",
+    });
+    return skipped(kind, "no fcm token");
+  }
+
+  const isVideo = text(record.call_type) === "video";
+  const caller = kind === "incoming_call" ? await loadProfile(text(record.caller_id)) : null;
+
+  const data: Record<string, string> = kind === "incoming_call"
+    ? {
+      type: "incoming_call",
+      roomId: text(record.id),
+      conversationId: text(record.conversation_id),
+      callerId: text(record.caller_id),
+      calleeId: decision.recipientId,
+      callType: isVideo ? "video" : "audio",
+      title: caller?.display_name || "مكالمة واردة",
+      body: isVideo ? "📹 مكالمة فيديو واردة" : "📞 مكالمة صوتية واردة",
+      icon: text(caller?.avatar_url),
+    }
+    : {
+      type: "call_ended",
+      roomId: text(record.id),
+      conversationId: text(record.conversation_id),
+      callerId: text(record.caller_id),
+      calleeId: decision.recipientId,
+      missed: String(text(record.status) === "missed"),
+      title: text(record.status) === "missed" ? "مكالمة فائتة" : "انتهت المكالمة",
+      body: text(record.status) === "missed" ? "مكالمة لم يتم الرد عليها" : "انتهت المكالمة",
+    };
+
+  const summary = await sendToAllDevices(tokens, data, {
+    priority: "high",
+    ttlSeconds: CALL_TTL_SECONDS,
+  });
+  if (summary.sent > 0) markSent(key);
+
+  await logDelivery({
+    kind,
+    refId: text(record.id),
+    recipientId: decision.recipientId,
+    sent: summary.sent,
+    total: summary.total,
+    detail: { status: text(record.status), call_type: text(record.call_type) },
+  });
+
+  return json({
+    ok: true,
+    kind,
+    recipient: decision.recipientId,
+    sent: summary.sent,
+    total: summary.total,
+  });
+}
+
+async function handleNewUser(event: Extract<PushEvent, { kind: "new_user" }>): Promise<Response> {
+  const record = event.record;
+  const userId = text(record.id);
+  if (!userId) return json({ error: "profile record without id" }, 400);
+
+  const key = dedupeKey(event);
+  if (isDuplicate(key)) return skipped("new_user", "duplicate (already pushed)");
+
+  const adminIds = (await loadAdminIds()).filter((id) => id !== userId);
+  if (!adminIds.length) {
+    await logDelivery({ kind: "new_user", refId: userId, skipped: "no admins" });
+    return skipped("new_user", "no admins");
+  }
+
+  const tokens = await loadDeviceTokensForUsers(adminIds);
+  if (!tokens.length) {
+    await logDelivery({ kind: "new_user", refId: userId, skipped: "no fcm token" });
+    return skipped("new_user", "no fcm token");
+  }
+
+  const name = text(record.display_name).trim() || "مستخدم جديد";
+  const summary = await sendToAllDevices(
+    tokens,
+    {
+      type: "new_user",
+      userId,
+      title: `👤 مستخدم جديد: ${name}`,
+      body: `الاسم: ${name} — اضغط لبدء محادثة`,
+    },
+    { priority: "high" },
+  );
+  if (summary.sent > 0) markSent(key);
+
+  await logDelivery({
+    kind: "new_user",
+    refId: userId,
+    sent: summary.sent,
+    total: summary.total,
+    detail: { admins: adminIds.length },
+  });
+
+  return json({
+    ok: true,
+    kind: "new_user",
+    admins: adminIds.length,
+    sent: summary.sent,
+    total: summary.total,
+  });
+}
+
+async function handleEvent(event: PushEvent): Promise<Response> {
+  switch (event.kind) {
+    case "new_message":
+      return await handleNewMessage(event);
+    case "incoming_call":
+    case "call_ended":
+      return await handleCall(event);
+    case "new_user":
+      return await handleNewUser(event);
+    default:
+      return json({ error: "unsupported event" }, 400);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 8) مسارات يدوية: اختبار + تشخيص
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+async function handleTest(userId: string): Promise<Response> {
+  const tokens = await loadDeviceTokens(userId);
+  if (!tokens.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب" }, 404);
+
+  const summary = await sendToAllDevices(
+    tokens,
+    {
+      type: "test",
+      title: "✅ الإشعارات تعمل",
+      body: "هذا إشعار تجريبي يعمل حتى وإن كان التطبيق مغلقاً.",
+    },
+    { priority: "high", ttlSeconds: 60 },
+  );
+
+  await logDelivery({
+    kind: "test",
+    refId: userId,
+    recipientId: userId,
+    source: "manual",
+    sent: summary.sent,
+    total: summary.total,
+  });
+
+  return json({ ok: true, sent: summary.sent, total: summary.total, results: summary.results });
+}
+
+async function handleDiagnostics(userId: string): Promise<Response> {
+  const [me, tokens, deliveries] = await Promise.all([
+    loadProfile(userId),
+    loadDeviceTokens(userId),
+    loadRecentDeliveries(userId),
+  ]);
+
+  const webhookDeliveries = deliveries.filter((row) => row?.source === "webhook");
+
+  return json({
+    ok: true,
+    service: "send-push",
+    version: SERVICE_VERSION,
+    architecture: "supabase-database-webhooks",
+    database_notifications: {
+      pg_net: false,
+      vault: false,
+      db_triggers: false,
+      note: "قاعدة البيانات لا تُجري أي طلب HTTP؛ الإرسال يبدأ من Database Webhook فقط.",
+    },
+    firebase: {
+      configured: firebaseConfigured,
+      project_id: FIREBASE_PROJECT_ID || null,
+      service_account_email: FIREBASE_CLIENT_EMAIL || null,
+    },
+    webhook: {
+      secret_configured: Boolean(SEND_PUSH_SECRET),
+      endpoint: `${SUPABASE_URL}/functions/v1/send-push`,
+      required_header: "x-send-push-secret",
+      expected_hooks: [
+        { table: "messages", events: ["INSERT"] },
+        { table: "call_rooms", events: ["INSERT", "UPDATE"] },
+        { table: "profiles", events: ["INSERT"] },
+      ],
+    },
+    me: {
+      user_id: userId,
+      display_name: me?.display_name ?? null,
+      is_admin: Boolean(me?.is_admin || me?.is_super_admin),
+      devices: tokens.length,
+    },
+    delivery_log: {
+      recent: deliveries,
+      webhook_events_seen: webhookDeliveries.length,
+    },
+    checks: {
+      firebase_ready: firebaseConfigured,
+      webhook_secret_ready: Boolean(SEND_PUSH_SECRET),
+      has_device: tokens.length > 0,
+      webhook_flow_observed: webhookDeliveries.length > 0,
+    },
+    hint: webhookDeliveries.length
+      ? "✅ وُصلت أحداث Webhook سابقة — المسار الحيّ يعمل. أرسل رسالة تجريبية للتأكيد."
+      : "ℹ️ لا يوجد سجل Webhook بعد: تأكد من إنشاء الـ Webhooks الثلاثة في لوحة Supabase (Database → Webhooks).",
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 9) الخادم
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+Deno.serve(async (req: Request): Promise<Response> => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -293,264 +789,45 @@ serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   try {
-    let input = await req.json();
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 0) مسار العميل (client_*) — مصادقة برمز المستخدم (JWT) لا بالسرّ المشترك.
-    //    الغرض: نقل إرسال الإشعارات من قاعدة البيانات (محجوبة شبكياً) إلى
-    //    الواجهة — المتصفح يرصد الحدث عبر Realtime ثم يستدعي هذه الدالة.
-    //    ⚠️ لا سرّ مشترك في المتصفح: المصادقة برمز المستخدم + التحقّق
-    //       على الخادم (المُرسِل = صاحب الرمز، والمستلَم يُشتقّ من المحادثة).
-    // ══════════════════════════════════════════════════════════════════════
-    let clientUser: { id: string } | null = null;
-    let clientViaSecret = false;
-    if (String(input.type || "").startsWith("client_")) {
-      // ① المصادقة المفضّلة: رمز المستخدم (JWT) — لا سرّ في المتصفح
-      const authHeader = req.headers.get("authorization");
-      if (authHeader) {
-        const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
-        const { data: { user }, error: userErr } = await supabase.auth.getUser(tokenVal);
-        if (!userErr && user) clientUser = { id: String(user.id) };
-      }
-      // ② بديل مُتوافق: السرّ المشترك (x-send-push-secret) — نفس سرّ دالة
-      //    send-push. حتى في هذه الحالة يبقى المُرسِل مُشتقّاً من سجلّ
-      //    القاعدة (لا من جسم الطلب) ⇒ لا انتحال.
-      if (!clientUser && isAuthorized(req)) clientViaSecret = true;
-      if (!clientUser && !clientViaSecret) {
-        return json({ error: "Unauthorized: يلزم رمز مستخدم صالح أو x-send-push-secret" }, 401);
-      }
-
-      if (input.type === "client_probe") {
-        // فحص الاتصال من المتصفح — بلا إشعار وبلا أثر
-        const probeUserId = clientUser ? clientUser.id : String(input.user_id || "");
-        const tokens = probeUserId ? await loadDeviceTokens(probeUserId) : [];
-        return json({
-          ok: true, mode: "client",
-          auth: clientUser ? "jwt" : "secret",
-          user_id: probeUserId,
-          devices: tokens.length,
-          service: "send-push (client mode)",
-        });
-      }
-
-      if (input.type === "client_message") {
-        // نقرأ الرسالة من القاعدة: المُرسِل يُثبَت من الرمز (لا يُقبل من العميل)
-        const messageId = String(input.message_id || "");
-        if (!messageId) return json({ error: "message_id required" }, 400);
-        const { data: msg } = await supabase.from("messages")
-          .select("id, conversation_id, sender_id, content, message_type, attachment_type")
-          .eq("id", messageId).maybeSingle();
-        if (!msg) return json({ error: "message not found" }, 404);
-        if (clientUser && String(msg.sender_id) !== clientUser.id) {
-          return json({ error: "forbidden: not the message sender" }, 403);
-        }
-        // المُرسِل: من الرمز (JWT) أو من سجلّ الرسالة (سرّ مشترك) — ولا يُقبل
-        // أبداً من جسم الطلب.
-        const senderId = clientUser ? clientUser.id : String(msg.sender_id);
-        input = {
-          type: "new_message",
-          message_id: msg.id,
-          conversation_id: msg.conversation_id,
-          sender_id: senderId,
-          content: msg.content ?? (msg.attachment_type === "image" ? "📷 صورة" : msg.attachment_type === "audio" ? "🎤 رسالة صوتية" : "📎 مرفق"),
-          message_type: msg.message_type,
-        };
-      } else if (input.type === "client_call") {
-        const roomId = String(input.room_id || "");
-        if (!roomId) return json({ error: "room_id required" }, 400);
-        const { data: room } = await supabase.from("call_rooms")
-          .select("id, caller_id, callee_id, conversation_id, status, call_type, started_at")
-          .eq("id", roomId).maybeSingle();
-        if (!room) return json({ error: "call room not found" }, 404);
-        // المتصل: من الرمز (JWT) أو من سجلّ الغرفة (سرّ مشترك)
-        if (clientUser && String(room.caller_id) !== clientUser.id) {
-          return json({ error: "forbidden: not the call caller" }, 403);
-        }
-        const callerId = clientUser ? clientUser.id : String(room.caller_id);
-        const callType = String(input.call_type || room.call_type || "audio");
-        input = {
-          type: "incoming_call",
-          room_id: room.id,
-          conversation_id: room.conversation_id,
-          caller_id: callerId,
-          callee_id: room.callee_id,
-          call_type: callType,
-        };
-      } else if (input.type === "client_new_user") {
-        // إشعار «مستخدم جديد» للمشرفين — المتصل يجب أن يكون مشرفاً
-        // (أو أن يكون الطلب مصادقاً بالسرّ المشترك).
-        if (clientUser) {
-          const { data: me } = await supabase.from("profiles")
-            .select("is_admin, is_super_admin").eq("id", clientUser.id).maybeSingle();
-          if (!me?.is_admin && !me?.is_super_admin) {
-            return json({ error: "forbidden: admins only" }, 403);
-          }
-        }
-        const newUserId = String(input.user_id || "");
-        if (!newUserId) return json({ error: "user_id required" }, 400);
-        const { data: prof } = await supabase.from("profiles")
-          .select("display_name").eq("id", newUserId).maybeSingle();
-        input = { type: "new_user", user_id: newUserId, display_name: prof?.display_name || "مستخدم جديد" };
-      } else {
-        return json({ error: "unknown client type" }, 400);
-      }
+    let payload: unknown;
+    try {
+      payload = await req.json();
+    } catch {
+      return json({ error: "invalid JSON body" }, 400);
     }
 
-    // 1. اختبار يدوي لتأكيد عمل الإشعارات
-    if (input.type === "test") {
-      const authHeader = req.headers.get("authorization");
-      if (!authHeader) return json({ error: "Unauthorized" }, 401);
-      const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
-      const { data: { user } } = await supabase.auth.getUser(tokenVal);
-      if (!user) return json({ error: "Unauthorized user" }, 401);
-      const tokens = await loadDeviceTokens(user.id);
-      if (!tokens.length) return json({ error: "لا يوجد توكن مسجّل لهذا الحساب" }, 404);
-      const results = await sendToAllDevices(tokens, {
-        type: "test",
-        title: "✅ الإشعارات تعمل",
-        body: "هذا إشعار تجريبي يعمل حتى وإن كان التطبيق مغلقاً.",
-      }, { priority: "high", ttlSeconds: 60 });
-      return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
+    const type = text((payload as Record<string, unknown>)?.type);
+
+    // ── مسارات المستخدم (JWT) ──────────────────────────────────────────
+    if (type === "test" || type === "diagnostics") {
+      const userId = await authenticatedUserId(req);
+      if (!userId) return json({ error: "Unauthorized: a valid user JWT is required" }, 401);
+      return type === "test" ? await handleTest(userId) : await handleDiagnostics(userId);
     }
 
-    // probe alias
-    if (input.type === "probe") {
-      if (!isAuthorized(req)) return json({ error: "Unauthorized" }, 401);
-      const userId = String(input.user_id || "");
-      if (!userId) return json({ error: "user_id required" }, 400);
-      const tokens = await loadDeviceTokens(userId);
-      if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
-      const results = await sendToAllDevices(tokens, {
-        type: "test",
-        title: "probe",
-        body: "probe",
-      }, { priority: "high", ttlSeconds: 60 });
-      return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
+    // ── مسار الـ Webhook (سرّ مشترك) ──────────────────────────────────
+    if (!isWebhookAuthorized(req)) {
+      return json(
+        { error: "Unauthorized: send x-send-push-secret matching SEND_PUSH_SECRET" },
+        401,
+      );
     }
 
-    // مسار العميل مُصادق برمز المستخدم ⇒ لا يحتاج السرّ المشترك
-    if (!clientUser && !isAuthorized(req)) return json({ error: "Unauthorized: Invalid Secret" }, 401);
-
-    // 2. إشعارات المكالمات (Incoming Call / Call Ended)
-    if (input.type === "incoming_call" || input.type === "call_ended") {
-      const roomId = String(input.room_id || "");
-      const calleeId = String(input.callee_id || "");
-      const callerId = String(input.caller_id || "");
-      if (!roomId || !calleeId || !callerId) return json({ error: "room_id, caller_id, callee_id required" }, 400);
-      const { data: room } = await supabase.from("call_rooms").select("id, caller_id, callee_id, status, started_at").eq("id", roomId).maybeSingle();
-      // isolation check expects .select("id, caller_id, callee_id, status")
-      void '.select("id, caller_id, callee_id, status")';
-      // select("started_at") مطلوب للتحقق من حداثة الرنين
-      void 'select("started_at")';
-      if (!room) return refuse("call room not found", 404);
-      if (String(room.callee_id || "") !== calleeId) return refuse("callee mismatch", 409);
-      if (input.type === "incoming_call" && String(room.status || "") !== "ringing") {
-        return refuse("call not ringing", 200);
-      }
-      if (input.type === "incoming_call" && (room as any).started_at) {
-        const age = Date.now() - new Date((room as any).started_at).getTime();
-        if (age > CALL_RING_MAX_AGE_MS) return refuse("ring expired", 200);
-      }
-      const recipientId = String(room.callee_id || calleeId || "");
-      // conversationCounterpart(conversation, senderId, senderIsSuperAdmin) check
-      void 'conversationCounterpart(conversation, senderId, senderIsSuperAdmin)';
-      const [{ data: caller }, tokens] = await Promise.all([
-        supabase.from("profiles").select("display_name, avatar_url").eq("id", callerId).maybeSingle(),
-        loadDeviceTokens(recipientId),
-      ]);
-      if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
-      const isVideo = input.call_type === "video";
-      const fcmData = input.type === "incoming_call" ? {
-        type: "incoming_call",
-        roomId,
-        conversationId: String(input.conversation_id || ""),
-        callerId,
-        calleeId,
-        callType: isVideo ? "video" : "audio",
-        title: caller?.display_name || "مكالمة واردة",
-        body: isVideo ? "📹 مكالمة فيديو واردة" : "📞 مكالمة صوتية واردة",
-        icon: caller?.avatar_url || "",
-      } : {
-        type: "call_ended",
-        roomId,
-        conversationId: String(input.conversation_id || ""),
-        calleeId,
-        missed: String(input.status === "missed"),
-        title: input.status === "missed" ? "مكالمة فائتة" : "انتهت المكالمة",
-        body: "انتهت المكالمة",
-      };
-      const results = await sendToAllDevices(tokens, fcmData, { priority: "high", ttlSeconds: 60 });
-      return json({ sent: results.filter((r) => r.ok).length, total: results.length });
+    const normalized = normalizePayload(payload);
+    if (!normalized.ok) {
+      if ("ignored" in normalized) return json({ ok: true, ignored: normalized.ignored });
+      return json({ error: normalized.error }, 400);
     }
 
-    // 3. إشعار مستخدم جديد للمشرفين
-    if (input.type === "new_user") {
-      const userId = String(input.user_id || "");
-      if (!userId) return json({ error: "user_id required" }, 400);
-      const adminIds = (await loadAdminIds()).filter((id) => id !== userId);
-      if (!adminIds.length) return json({ sent: 0, skipped: "no admins" });
-      const name = String(input.display_name || "").trim() || "مستخدم جديد";
-      // new_user — من trigger على profiles
-      const fcmData = {
-        type: "new_user",
-        userId,
-        title: `👤 مستخدم جديد: ${name}`,
-        body: `الاسم: ${name} — اضغط لبدء محادثة`,
-      };
-      const tokens = await loadDeviceTokensForUsers(adminIds);
-      if (!tokens.length) return json({ sent: 0, skipped: "no fcm tokens", admins: adminIds.length });
-      const results = await sendToAllDevices(tokens, fcmData, { highPriority: true });
-      // sendToAllDevices(tokens, data, { highPriority: true }) compat
-      return json({ sent: results.filter((r) => r.ok).length, total: results.length, admins: adminIds.length });
+    if (!firebaseConfigured) {
+      return json({ error: "Firebase is not configured on send-push" }, 503);
     }
 
-    // 4. إشعار الرسائل العادية (افتراضي)
-    const messageId = String(input.message_id || "");
-    const conversationId = String(input.conversation_id || "");
-    const senderId = String(input.sender_id || "");
-    if (!messageId || !conversationId || !senderId) {
-      return json({ error: "message_id, conversation_id and sender_id are required" }, 400);
-    }
-    // منع الإرسال المكرر (عدة أجهزة للمرسل قد تطلب الإشعار نفسه)
-    if (isDuplicatePush(messageId)) {
-      return json({ sent: 0, total: 0, skipped: "duplicate (already pushed)" });
-    }
-    const { data: conversation } = await supabase.from("conversations").select("user_id, admin_id").eq("id", conversationId).maybeSingle();
-    if (!conversation) return json({ error: "Conversation not found" }, 404);
-    const { data: sender } = await supabase.from("profiles").select("display_name, is_super_admin").eq("id", senderId).maybeSingle();
-    // استخدام loadDeviceTokens(recipientId) للإرسال لطرف واحد فقط
-    // required literal for isolation test
-    const recipientId = conversationCounterpart(conversation, senderId, Boolean(sender?.is_super_admin));
-    void 'conversationCounterpart(conversation, senderId, senderIsSuperAdmin)';
-    if (!recipientId || recipientId === senderId) return refuse("sender is not a conversation party");
-    if (input.recipient_id && String(input.recipient_id) !== recipientId) {
-      return json({ sent: 0, total: 0, skipped: "recipient mismatch" }, 409);
-    }
-    const tokens = await loadDeviceTokens(recipientId);
-    if (!tokens.length) return json({ sent: 0, skipped: "no fcm token" });
-    const title = sender?.display_name || "رسالة جديدة";
-    const body = String(input.content || "📎 مرفق");
-    const fcmData = {
-      type: "new_message",
-      messageId,
-      conversationId,
-      senderId,
-      title,
-      body,
-      timestamp: String(Date.now()),
-      messageType: String(input.message_type || "text"),
-    };
-    const results = await sendToAllDevices(tokens, fcmData, { priority: "high", ttlSeconds: 86400 });
-    let delivered = false;
-    if (results.some((r) => r.ok)) {
-      delivered = true;
-      // تُسجَّل بعد نجاح الإرسال فقط — حتى لا تُضيع إعادة محاولة بعد فشل
-      markPushSent(messageId);
-      await supabase.from("messages").update({ status: "delivered" }).eq("id", messageId).eq("status", "sent");
-    }
-    return json({ sent: results.filter((r) => r.ok).length, total: results.length, results, delivered });
+    const event = normalized.event;
+    console.log(`[send-push] event=${event.kind} ref=${eventRefId(event)}`);
+    return await handleEvent(event);
   } catch (error: any) {
-    console.error("send-push failed", error);
-    return json({ error: error?.message || String(error) }, 500);
+    console.error("[send-push] failed", error);
+    return json({ error: error?.message ?? String(error) }, 500);
   }
 });

@@ -148,8 +148,10 @@ begin
 end;
 $$;
 
+-- v3.0: توقيع الإرجاع jsonb (كما في v2.2 وما بعده) — كان void هنا فيفشل
+-- التطبيق المتسلسل بـ 42P13 (cannot change return type). السلوك لم يتغيّر.
 create or replace function public.admin_delete_user(p_user_id uuid)
-returns void language plpgsql security definer set search_path = public as $$
+returns jsonb language plpgsql security definer set search_path = public as $$
 begin
   if not public.is_admin_user() then
     raise exception 'غير مصرّح: هذه العملية للمشرفين فقط' using errcode = '42501';
@@ -160,6 +162,7 @@ begin
   -- حذف من auth.users يحذف profiles وما يتبعها تتابعياً (on delete cascade)
   delete from auth.users where id = p_user_id;
   delete from public.profiles where id = p_user_id;
+  return jsonb_build_object('deleted', true, 'user_id', p_user_id);
 end;
 $$;
 
@@ -312,80 +315,7 @@ create policy "call history hidden own delete" on public.call_history_hidden
 --      عند إنشاء غرفة "ringing" يُرسل إشعار مكالمة واردة عالي الأولوية،
 --      وعند تحوّلها إلى missed يُرسل إشعار "مكالمة فائتة" ويُغلق الرنين.
 -- ------------------------------------------------------------
-create extension if not exists pg_net;
-
-create or replace function public.notify_call_room()
-returns trigger language plpgsql security definer set search_path = public, net as $$
-declare
-  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
-  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
-  v_type text;
-begin
-  if tg_op = 'INSERT' and new.status = 'ringing' then
-    v_type := 'incoming_call';
-  elsif tg_op = 'UPDATE' and old.status is distinct from new.status
-        and new.status in ('missed', 'ended', 'declined', 'failed', 'network_lost') then
-    v_type := 'call_ended';
-  else
-    return new;
-  end if;
-
-  if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
-    return new;
-  end if;
-
-  perform net.http_post(
-    url := v_function_url,
-    headers := jsonb_build_object('Content-Type', 'application/json', 'x-send-push-secret', v_push_secret),
-    body := jsonb_build_object(
-      'type', v_type,
-      'room_id', new.id,
-      'conversation_id', new.conversation_id,
-      'caller_id', new.caller_id,
-      'callee_id', new.callee_id,
-      'call_type', new.call_type,
-      'status', new.status
-    )
-  );
-  return new;
-end;
-$$;
-
-drop trigger if exists on_call_room_notify on public.call_rooms;
-create trigger on_call_room_notify
-  after insert or update on public.call_rooms
-  for each row execute procedure public.notify_call_room();
-
 -- لا تُرسل إشعار "رسالة جديدة" لبطاقات المكالمات (لها إشعارها الخاص)
-create or replace function public.notify_new_message()
-returns trigger language plpgsql security definer set search_path = public, net as $$
-declare
-  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
-  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
-begin
-  if new.message_type = 'call' then
-    return new;
-  end if;
-
-
-  perform net.http_post(
-    url := v_function_url,
-    headers := jsonb_build_object('Content-Type', 'application/json', 'x-send-push-secret', v_push_secret),
-    body := jsonb_build_object(
-      'message_id', new.id,
-      'conversation_id', new.conversation_id,
-      'sender_id', new.sender_id,
-      'content', coalesce(new.content, case new.attachment_type when 'image' then '📷 صورة' when 'audio' then '🎤 رسالة صوتية' else '📎 مرفق' end)
-    )
-  );
-  return new;
-end;
-$$;
-
-drop trigger if exists on_message_inserted on public.messages;
-create trigger on_message_inserted
-  after insert on public.messages
-  for each row execute procedure public.notify_new_message();
 
 -- بطاقة المكالمة تحدّث معاينة آخر رسالة في قائمة المحادثات
 create or replace function public.touch_conversation_on_call_message()

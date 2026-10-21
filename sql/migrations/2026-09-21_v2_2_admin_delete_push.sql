@@ -2,7 +2,8 @@
 -- Migration v2.2 — 2026-09-21
 -- (أ) حذف المستخدم بواسطة أي مشرف (is_admin أو is_super_admin) مع كل بياناته
 --     في كل الجداول + ملفات التخزين، بدون أن تعيقه قيود المفاتيح الأجنبية.
--- (ب) دالة فحص جاهزية الإشعارات (لتشخيص «الإشعار لا يصل»).
+-- 🔁 v3.0: أُزيلت من هذه الهجرة دالة فحص الإشعارات (push_diagnostics) — لم يعد
+--    لها معنى بعد الانتقال إلى Database Webhooks.
 -- آمن لإعادة التنفيذ. نفّذه بعد v2.1.
 -- ============================================================
 
@@ -133,25 +134,3 @@ drop policy if exists "reactions delete by admins" on public.message_reactions;
 create policy "reactions delete by admins" on public.message_reactions
   for delete using (public.is_admin_user() or user_id = auth.uid());
 
--- (ب) فحص جاهزية الإشعارات
-create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, extensions as $$
-declare
-  v jsonb;
-begin
-  select jsonb_build_object(
-    'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
-    'edge_url_hardcoded', true,
-    'edge_url_ok', true,
-    'secret_hardcoded', true,
-    'vault_dependency', false,
-    'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted'),
-    'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify'),
-    'my_tokens', (select count(*) from public.fcm_tokens where user_id = auth.uid()),
-    'last_log', (select jsonb_agg(l) from (select kind, note, request_id, created_at from public.push_delivery_log where recipient_id = auth.uid() or public.is_admin_user() order by id desc limit 5) l)
-  ) into v;
-  return v;
-end;
-$$;
-grant execute on function public.push_diagnostics() to authenticated;

@@ -9,6 +9,8 @@
  *   • المشرف العادي يحظر ويفتح محادثاته فقط
  *   • الزائر (anon) لا يصل لأي بيانات ولا ينفّذ دوال داخلية
  *   • لا مفتاح JWT ثابت في ملفات SQL
+ *   • v3.0: قاعدة البيانات بلا pg_net/Vault/تريگرات إشعارات — الإرسال عبر
+ *     Database Webhook، وقواعد المستلمين في supabase/functions/send-push/recipients.ts
  * التشغيل: npm i --no-save @electric-sql/pglite && node tests/rls-hardening-postgres.mjs
  * (يتخطّى بلا فشل إن لم تكن الحزمة مثبّتة.)
  */
@@ -80,16 +82,18 @@ try {
 } catch (e) {
   check("هجرة v2.11 تُنفَّذ فوق المخطط ثم تُعاد بأمان (idempotent)", false, String(e.message).slice(0, 200));
 }
-// v2.15 هي آخر هجرة في المسار (تُطبَّق فوق v2.11 كما في الإنتاج): تضمين رابط/سرّ
-// send-push في trigger_send_push_notification بلا Vault.
-const MIG_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
+// آخر هجرة في المسار (v3.0): تفصل الإشعارات عن قاعدة البيانات نهائياً.
+const MIG_V30_PATH = "sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql";
+const MIG_V30 = read(MIG_V30_PATH);
 try {
-  await db.exec(MIG_V215);
-  await db.exec(MIG_V215); // إعادة التنفيذ
-  check("هجرة v2.15 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", true);
+  await db.exec(MIG_V30);
+  await db.exec(MIG_V30); // إعادة التنفيذ
+  check("هجرة v3.0 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", true);
 } catch (e) {
-  check("هجرة v2.15 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", false, String(e.message).slice(0, 200));
+  check("هجرة v3.0 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", false, String(e.message).slice(0, 200));
 }
+
+const { messageRecipient } = await import("../supabase/functions/send-push/recipients.ts");
 
 // ---------- بيانات اختبار (بصلاحية المالك، أي بلا RLS) ----------
 const S = "00000000-0000-4000-8000-00000000000a"; // مشرف عام
@@ -177,9 +181,9 @@ check("زائر: لا يسرد مرفقات التخزين (0 صفوف أو مر
 const anonRpc = await as({ role: "anon" }, "select public.expire_stale_calls()");
 check("زائر: لا ينفّذ expire_stale_calls (تنظيف عام للمكالمات)", !anonRpc.ok && /permission denied/i.test(anonRpc.error), anonRpc.error ?? "");
 const anonPush = await as({ role: "anon" }, `select public.push_call_edge('probe', gen_random_uuid(), '${U1}', '{}'::jsonb)`);
-check("زائر: لا ينفّذ push_call_edge مباشرة", !anonPush.ok && /permission denied/i.test(anonPush.error), anonPush.error ?? "");
-const anonAdm = await as({ role: "anon" }, "select public.admin_recipient_ids()");
-check("زائر: لا يرى قائمة المشرفين عبر admin_recipient_ids", !anonAdm.ok, anonAdm.error ?? "");
+check("زائر: push_call_edge لم تعد موجودة في القاعدة (v3.0)", !anonPush.ok, anonPush.error ?? "");
+const anonAdm = await as({ role: "anon" }, "select * from public.admin_recipient_ids()");
+check("زائر: admin_recipient_ids لم تعد موجودة في القاعدة (v3.0)", !anonAdm.ok, anonAdm.error ?? "");
 const anonDir = await as({ role: "anon" }, "select public.admin_directory_search('a', 10, 0)");
 check("زائر: لا يستخدم دليل المستخدمين", !anonDir.ok, anonDir.error ?? "");
 
@@ -242,19 +246,26 @@ const sDel = await as({ uid: S }, `select public.admin_delete_user('${U1}')`);
 check("S لا يحذف مستخدماً (إدارة المستخدمين قراءة فقط)", !sDel.ok && /للقراءة فقط/.test(sDel.error), sDel.error ?? "");
 const stillThere = await as({}, `select count(*)::int n from public.profiles where id='${U1}' and is_blocked=false`);
 check("بقاء U1 غير متأثر بمحاولات S", stillThere.rows?.[0]?.n === 1);
-// v2.13: توجيه إشعار ردّ S ⇒ المستخدم صاحب المحادثة (وليس المشرف المالك).
-// الدالتان داخليتان (REVOKEd من الأدوار عمداً — مسار Triggers) ⇒ تُستدعيان فوق RLS.
-const directRecipient = async (conv, sender) =>
-  (await db.query(`select public.conversation_direct_recipient('${conv}','${sender}') r`)).rows?.[0]?.r;
-const pushAllowed = async (recipient, sender, conv) =>
-  (await db.query(`select public.push_recipient_allowed('new_message','${M1}','${recipient}', jsonb_build_object('sender_id','${sender}','conversation_id','${conv}')) ok`)).rows?.[0]?.ok;
-
-check("conversation_direct_recipient: ردّ S ⇒ المستخدم صاحب المحادثة", (await directRecipient(C1, S)) === U1, String(await directRecipient(C1, S)));
-check("conversation_direct_recipient: ردّ المستخدم ⇒ المشرف المالك (كما هو)", (await directRecipient(C1, U1)) === A);
-check("conversation_direct_recipient: مرسل غريب ليس طرفاً ولا مشرفاً عاماً ⇒ null", (await directRecipient(C1, U2)) === null);
-check("push_recipient_allowed: يسمح بردّ S إلى صاحب المحادثة", (await pushAllowed(U1, S, C1)) === true);
-check("push_recipient_allowed: يرفض توجيه ردّ S للمشرف المالك (المستخدم حصراً)", (await pushAllowed(A, S, C1)) === false);
-check("push_recipient_allowed: يرفض مرسلاً غريباً (كما في v2.9)", (await pushAllowed(U1, U2, C1)) === false);
+// v3.0: توجيه إشعار ردّ S ⇒ المستخدم صاحب المحادثة. القاعدة انتقلت من
+// دوال SQL المحذوفة إلى recipients.ts (نفس السلوك، مصدر واحد للحقيقة).
+const CONV_C1 = { id: C1, user_id: U1, admin_id: A };
+check("recipients: ردّ S (غير طرف) ⇒ المستخدم صاحب المحادثة",
+  messageRecipient(CONV_C1, S, true).recipientId === U1);
+check("recipients: ردّ المستخدم ⇒ المشرف المالك",
+  messageRecipient(CONV_C1, U1).recipientId === A);
+check("recipients: ردّ المشرف المالك ⇒ المستخدم",
+  messageRecipient(CONV_C1, A).recipientId === U1);
+check("recipients: مرسل غريب ليس طرفاً ولا مشرفاً عاماً ⇒ لا إشعار",
+  messageRecipient(CONV_C1, U2).allowed === false);
+const noSqlPushFns = await as({}, `select
+  to_regprocedure('public.push_call_edge(text,uuid,uuid,jsonb)') is null as no_edge,
+  to_regprocedure('public.trigger_send_push_notification(text,uuid,uuid,jsonb)') is null as no_trigger,
+  to_regprocedure('public.conversation_direct_recipient(uuid,uuid)') is null as no_direct,
+  to_regprocedure('public.push_recipient_allowed(text,uuid,uuid,jsonb)') is null as no_gate`);
+const nf = noSqlPushFns.rows?.[0] ?? {};
+check("دوال الإشعارات القديمة غير موجودة في القاعدة (v3.0)",
+  nf.no_edge === true && nf.no_trigger === true && nf.no_direct === true && nf.no_gate === true,
+  JSON.stringify(nf));
 
 // ---------- 4) المشرف العادي A: صلاحياته الفعلية ----------
 const aBlock = await as({ uid: A }, `select public.admin_set_user_blocked('${U1}', true)`);
@@ -273,9 +284,9 @@ check("A لا يحذف محادثة ليس طرفاً فيها", aDelOther === 0
 const uExpire = await as({ uid: U1 }, "select public.expire_stale_calls()");
 check("U1 لا ينفّذ expire_stale_calls", !uExpire.ok && /permission denied/i.test(uExpire.error), uExpire.error ?? "");
 const uPush = await as({ uid: U1 }, `select public.push_call_edge('probe', gen_random_uuid(), '${U2}', '{}'::jsonb)`);
-check("U1 لا ينفّذ push_call_edge مباشرة (لا إرسال لمستخدم آخر)", !uPush.ok && /permission denied/i.test(uPush.error), uPush.error ?? "");
+check("U1 لا يستطيع إرسال إشعارات من القاعدة (الدالة غير موجودة)", !uPush.ok, uPush.error ?? "");
 const uProbe = await as({ uid: U1 }, "select public.push_probe()");
-check("U1 ينفّذ push_probe (ميزة تشخيص لحسابه)", uProbe.ok, uProbe.error ?? "");
+check("U1 لا ينفّذ push_probe (حُذف مع مسار الإشعارات)", !uProbe.ok, uProbe.error ?? "");
 const uUnread = await as({ uid: U1 }, `select public.unread_counts(array['${C1}']::uuid[])`);
 check("U1 ينفّذ unread_counts (ميزة الواجهة)", uUnread.ok, uUnread.error ?? "");
 const uRing = await as({ uid: U1 }, `select public.call_room_is_ringing(gen_random_uuid())`);
@@ -283,13 +294,11 @@ check("U1 ينفّذ call_room_is_ringing (ميزة الواجهة)", uRing.ok, 
 
 // ---------- 6) مقاييس الصلاحيات المباشرة ----------
 const priv = await as({}, `select
-  has_function_privilege('anon','public.push_call_edge(text,uuid,uuid,jsonb)','EXECUTE') as anon_push,
-  has_function_privilege('authenticated','public.push_call_edge(text,uuid,uuid,jsonb)','EXECUTE') as auth_push,
+  to_regprocedure('public.push_call_edge(text,uuid,uuid,jsonb)') is null as no_push_fn,
   has_function_privilege('anon','public.expire_stale_calls()','EXECUTE') as anon_exp,
   has_function_privilege('authenticated','public.register_fcm_token(text,text,text,jsonb)','EXECUTE') as auth_fcm`);
 const p = priv.rows?.[0] ?? {};
-check("لا EXECUTE لـ anon على push_call_edge", p.anon_push === false);
-check("لا EXECUTE لـ authenticated على push_call_edge", p.auth_push === false);
+check("push_call_edge أُزيلت من القاعدة (لا مسار إرسال من SQL)", p.no_push_fn === true);
 check("لا EXECUTE لـ anon على expire_stale_calls", p.anon_exp === false);
 check("EXECUTE لـ authenticated على register_fcm_token (ميزة الواجهة)", p.auth_fcm === true);
 
@@ -306,45 +315,21 @@ for (const t of ["messages", "typing_status", "message_reactions", "profiles", "
 const SQL_FILES = ["sql/schema.sql", ...fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => "sql/migrations/" + f)];
 const leaks = SQL_FILES.filter((f) => /eyJhbGciOiJIUzI1NiIs/.test(read(f)));
 check("لا JWT ثابت في أي ملف SQL", leaks.length === 0, leaks.join(", "));
-const pcDef = (await db.query("select pg_get_functiondef('public.push_call_edge(text,uuid,uuid,jsonb)'::regprocedure) d")).rows[0].d;
-const tsDef = (await db.query("select pg_get_functiondef('public.trigger_send_push_notification(text,uuid,uuid,jsonb)'::regprocedure) d")).rows[0].d;
-check("push_call_edge تفوّض إلى trigger_send_push_notification", /public\.trigger_send_push_notification\(p_kind, p_ref, p_recipient, p_body\)/.test(pcDef));
-check("trigger_send_push_notification يضمّن رابط send-push مباشرة", /https:\/\/gqocavvhkfzgxzscrjms\.supabase\.co\/functions\/v1\/send-push/.test(tsDef));
-check("trigger_send_push_notification لا يقرأ من Vault إطلاقاً", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(tsDef));
-check("trigger_send_push_notification يُرسل ترويسة x-send-push-secret", /'x-send-push-secret', v_secret/.test(tsDef));
-check("trigger_send_push_notification يضمّن السرّ المعتمد", tsDef.includes("my_send_push_19921121_almgawell_19921121"));
-check("تعريف push_call_edge/trigger_send_push_notification بلا أي مرجع Vault",
-  !/vault\./.test(pcDef) && !/vault\./.test(tsDef));
+const noNet = await db.query("select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and (p.proname like 'push_%' or p.proname like 'notify_%')");
+check("لا دوال إشعارات (push_*/notify_*) في القاعدة بعد v3.0", noNet.rows[0].n === 0, String(noNet.rows[0].n));
+const pushPolicy = await db.query("select count(*)::int n from pg_policies where schemaname='public' and tablename='push_delivery_log'");
+check("push_delivery_log محمي بـ RLS (قراءة المشرفين فقط)", pushPolicy.rows[0].n >= 1, String(pushPolicy.rows[0].n));
 
-// ---------- v2.16: التشخيص يفحص الجسم الحيّ بدل الثوابت ----------
-const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
-const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
-const MIGRATION_V218 = read("sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql");
-const v218Code = MIGRATION_V218.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
-check("v2.18: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v218Code));
-check("v2.18: push_settings محمي بـ RLS", /alter table public\.push_settings enable row level security/.test(MIGRATION_V218));
-check("v2.18: مُعدِّل وجهة التسليم لا يُمنح للمستخدمين",
-  /revoke all on function public\.push_set_delivery_url\(text\) from public, anon, authenticated/.test(MIGRATION_V218));
-check("v2.18: التحويل التلقائي محصور (service_role / جلسة SQL)",
-  /v_jwt_role = 'service_role'/.test(MIGRATION_V218) && /session_user in \('postgres', 'supabase_admin'\)/.test(MIGRATION_V218));
-check("v2.18: push_path_verdict معرَّف", /create function public\.push_path_verdict\(p_apply boolean default false\)/.test(MIGRATION_V218));
-const v217Code = MIGRATION_V217.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
-check("v2.17: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v217Code));
-check("v2.17: push_settings محمي بـ RLS",
-  /alter table public\.push_settings enable row level security/.test(MIGRATION_V217));
-check("v2.17: مُعدِّل نقطة التسليم لا يُمنح للمستخدمين",
-  /revoke all on function public\.push_set_delivery_url\(text\) from public, anon, authenticated/.test(MIGRATION_V217));
-check("v2.17: push_net_diagnostics معرَّف",
-  /create or replace function public\.push_net_diagnostics\(\)/.test(MIGRATION_V217));
-const v216Code = MIGRATION_V216.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
-check("v2.16: ملف الهجرة موجود", MIGRATION_V216.length > 0);
-check("v2.16: هجرة بلا مراجع Vault", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v216Code));
-check("v2.16: push_diagnostics يفحص pg_proc.prosrc (الحالة الحيّة)",
-  /pg_proc/.test(MIGRATION_V216) && /live_path_stale/.test(MIGRATION_V216));
-check("v2.16: push_egress_check معرَّف", /create or replace function public\.push_egress_check\(\)/.test(MIGRATION_V216));
-const SCHEMA_V216 = read("sql/schema.sql");
-check("v2.16: مذكور في schema.sql", SCHEMA_V216.includes("22. الإصدار v2.16 (2026-10-22)")
-  && SCHEMA_V216.includes("push_egress_check"));
+// ---------- v3.0: الوثائق والمسارات ----------
+check("v3.0: هجرة الإشعارات تعلن Database Webhooks", /Database Webhook/i.test(MIG_V30));
+check("v3.0: الهجرة تُسقط امتداد pg_net", /execute 'drop extension pg_net'/i.test(MIG_V30));
+check("v3.0: الهجرة لا تُنشئ أي دالة إشعارات",
+  !/create (or replace )?function public\.(push_|notify_)/i.test(
+    MIG_V30.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n"),
+  ));
+check("v3.0: schema.sql يوثّق الـ Webhooks بدل التريگرات", /Database Webhook/i.test(read("sql/schema.sql")));
+check("v3.0: لا مسار لطابع زمني/سرّ مدفون في القاعدة",
+  !/gqocavvhkfzgxzscrjms\.supabase\.co/.test(read("sql/schema.sql").split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n")));
 
 // لا ملف SQL في المستودع يقرأ SEND_PUSH_URL/SEND_PUSH_SECRET من Vault
 const SQL_PUSH_FILES = [

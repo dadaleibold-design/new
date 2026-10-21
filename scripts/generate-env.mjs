@@ -46,6 +46,8 @@ const FORBIDDEN_KEYS = [
   "FIREBASE_SERVICE_ACCOUNT",
   "AGORA_APP_CERTIFICATE",
   "SEND_PUSH_SECRET",
+  // الإصدار القديم للسرّ في الواجهة — ممنوع نهائياً (v3.0)
+  "VITE_SEND_PUSH_SECRET",
 ];
 
 /** قارئ `.env` مبسّط (KEY=VALUE، يدعم علامات التنصيص و # للتعليق) */

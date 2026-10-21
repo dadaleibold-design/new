@@ -151,7 +151,9 @@ check("migration v2.7: الإرجاع يحوي action", MIG27.includes("'action'
 check("migration v2.7: SECURITY DEFINER + search_path", MIG27.includes("security definer") && MIG27.includes("set search_path = public"));
 check("migration v2.7: منح EXECUTE للمستخدم المسجّل فقط", MIG27.includes("grant execute on function public.register_fcm_token(text, text, text, jsonb) to authenticated;"));
 
-check("send-push: يقرأ device_info و device_id", SEND_PUSH.includes('.select("id, token, platform, device_id, device_info")'));
+check("send-push: يقرأ معرّف الجهاز والمستخدم من fcm_tokens",
+  SEND_PUSH.includes('.from("fcm_tokens")') &&
+    SEND_PUSH.includes('.select("id, token, platform, device_id, user_id")'));
 check("send-push: سجل عدد أجهزة المستلم", SEND_PUSH.includes("[send-push] recipient="));
 check("send-push: الإرسال إلى كل التوكنات (Promise.all لكل شريحة، لا أول توكن فقط)", SEND_PUSH.includes("const settled = await Promise.all(") && SEND_PUSH.includes("rows.slice(i, i + FCM_CONCURRENCY)"));
 check("send-push: الحذف مقصور على التوكنات الميّتة", SEND_PUSH.includes("const removed = !result.ok && isDeadToken(result.status, result.details);"));

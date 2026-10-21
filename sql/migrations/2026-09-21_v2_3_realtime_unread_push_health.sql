@@ -2,7 +2,7 @@
 -- Migration v2.3 — 2026-09-21
 -- (أ) صحة توكنات FCM: طابع آخر تحقق + مؤشرات تشخيص للنقر
 -- (ب) قراءة المحادثة في طلب واحد: mark_conversation_read() تُعيد عدد الرسائل
--- (ج) تنظيف سجل محاولات الإرسال حتى لا ينمو بلا حد
+-- (ج) تنظيف سجل تسليم الإشعارات (يكتبه Edge Function) حتى لا ينمو بلا حد
 --
 -- آمن لإعادة التنفيذ (idempotent).
 -- ============================================================
@@ -67,52 +67,7 @@ end;
 $$;
 
 -- (د) --------------------------------------------------------
--- إثراء دالة التشخيص: عمر التوكنات + آخر تسليم + حالة الصف نفسه.
--- تُستخدم من زر "إرسال إشعار تجريبي" في الإعدادات.
-create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, extensions as $$
-declare
-  v jsonb;
-begin
-  select jsonb_build_object(
-    'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
-    'edge_url_hardcoded', true,
-    'edge_url_ok', true,
-    'secret_hardcoded', true,
-    'vault_dependency', false,
-    'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted'),
-    'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify'),
-    'my_tokens', (select count(*) from public.fcm_tokens where user_id = auth.uid()),
-    'my_tokens_platforms', (
-      select coalesce(jsonb_agg(distinct platform), '[]'::jsonb)
-      from public.fcm_tokens where user_id = auth.uid()
-    ),
-    'my_oldest_token_age_minutes', (
-      select floor(extract(epoch from (now() - min(updated_at))) / 60)::int
-      from public.fcm_tokens where user_id = auth.uid()
-    ),
-    'unread_counts_rpc', exists (
-      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-      where n.nspname = 'public' and p.proname = 'unread_counts'
-    ),
-    'mark_read_rpc', exists (
-      select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-      where n.nspname = 'public' and p.proname = 'mark_conversation_read'
-    ),
-    'last_log', (
-      select jsonb_agg(l) from (
-        select kind, note, request_id, created_at
-        from public.push_delivery_log
-        where recipient_id = auth.uid() or public.is_admin_user()
-        order by id desc limit 5
-      ) l
-    )
-  ) into v;
-  return v;
-end;
-$$;
-grant execute on function public.push_diagnostics() to authenticated;
+-- تأكيد بث Realtime (يستخدمه عدّاد غير المقروء على كل الأجهزة).
 
 -- رسائل ثم تذكير: تأكد أن Realtime يبث تحديثات الرسائل (لتصفير العدّادات
 -- من أي جهاز آخر) — لا يفشل السكربت إن كانت مضافة مسبقاً.

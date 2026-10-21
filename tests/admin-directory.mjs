@@ -1,8 +1,9 @@
 /*
  * اختبار ميزتي المشرفين (v2.8) — jsdom + فحوصات ثابتة على الملفات
  * -------------------------------------------------------------
- * (أ) إشعار «مستخدم جديد» لكل المشرفين:
- *     - trigger على profiles في الهجرة و schema.sql
+ * (أ) إشعار «مستخدم جديد» لكل المشرفين (v3.0 — Database Webhook):
+ *     - لا trigger ولا دالة إشعار في قاعدة البيانات (فُصلت في v3.0)
+ *     - webhook على profiles INSERT ⇒ send-push (نوع new_user)
  *     - فرع new_user في send-push (كل المشرفين غير المحظورين × كل أجهزتهم)
  *     - توجيه النقرة: ?user=<id> ورسالة SW {type:"OPEN_CONVERSATION", userId}
  *       → فتح/إنشاء محادثة فورية مع المستخدم الجديد.
@@ -69,16 +70,21 @@ if (requested === "static") {
   const appJs = read("js/app.js");
   const pkg = JSON.parse(read("package.json"));
 
-  // --- قاعدة البيانات: إشعار المستخدم الجديد ---
-  check("الهجرة تُنشئ trigger على profiles بعد INSERT", /create trigger on_profile_created_notify_admins\s+after insert on public\.profiles/.test(migration));
-  check("الهجرة تعرّف دالة الإشعار notify_admins_new_profile", /create or replace function public\.notify_admins_new_profile\(\)/.test(migration));
-  check("قائمة مستلمي الإشعار = is_admin أو is_super_admin غير محظورين", /\(p\.is_admin = true or p\.is_super_admin = true\)\s+and p\.is_blocked = false/.test(migration));
-  check("الحمولة تحمل اسم المستخدم الجديد", /'display_name', coalesce\(nullif\(btrim\(coalesce\(new\.display_name/.test(migration));
-  check("الحمولة تحمل البريد والهاتف", /'email', v_email/.test(migration) && /'phone', new\.phone/.test(migration));
-  check("البريد الداخلي phone.*@users.local لا يُسرَّب", /like 'phone\.%@users\.local' then null/.test(migration));
-  check("فشل الإشعار لا يُفشل التسجيل (exception → warning)", /exception when others then[\s\S]{0,200}raise warning 'notify_admins_new_profile/.test(migration));
-  check("الهجرة ترسل عبر push_call_edge بنوع new_user", /perform public\.push_call_edge\(\s*'new_user'/.test(migration));
-  check("لا إشعار بلا مشرف نشط (SKIPPED مُسجَّل)", /SKIPPED: لا يوجد مشرف/.test(migration));
+  // --- قاعدة البيانات: لا مسار إشعارات (v3.0) ---
+  check("الهجرة لم تعد تُنشئ trigger على profiles",
+    !/create trigger on_profile_created_notify_admins/.test(migration));
+  check("الهجرة لم تعد تعرّف notify_admins_new_profile",
+    !/create or replace function public\.notify_admins_new_profile/.test(migration));
+  check("الهجرة لم تعد تستدعي push_call_edge",
+    !/push_call_edge/.test(migration) && !/net\.http_post/.test(migration));
+  check("الهجرة تُبقي دليل المستخدمين (admin_directory_search)",
+    /create or replace function public\.admin_directory_search\(/.test(migration));
+  check("schema.sql لا يحوي trigger المستخدم الجديد",
+    !/create trigger on_profile_created_notify_admins/.test(schema));
+  check("schema.sql يحوي admin_directory_search",
+    /create or replace function public\.admin_directory_search\(/.test(schema));
+  check("schema.sql لا يحوي admin_recipient_ids (حُذفت مع مسار الإشعارات)",
+    !/create or replace function public\.admin_recipient_ids\(\)/.test(schema));
 
   // --- قاعدة البيانات: دليل المستخدمين ---
   check("الهجرة تعرّف admin_directory_search", /create or replace function public\.admin_directory_search\(/.test(migration));
@@ -90,21 +96,28 @@ if (requested === "static") {
   check("البحث مُهيَّأ لمحارف LIKE الخاصة", /replace\(replace\(replace\(v_query/.test(migration) && /'_', '\\_'\)/.test(migration) && /'%', '\\%'\)/.test(migration));
   check("فهارس البحث الثلاثية (pg_trgm) مُضافة بأمان", /idx_profiles_display_name_trgm/.test(migration) && /exception when others then\s+raise notice 'فهرس الثلاثيات/.test(migration));
   check("صلاحية تنفيذ الدالة للمستخدم المسجّل فقط", /grant execute on function public\.admin_directory_search\(text, integer, integer\) to authenticated/.test(migration));
-  check("push_diagnostics يعرض trigger_new_user و directory_rpc", /'trigger_new_user', v_admin_triggers > 0/.test(migration) && /'directory_rpc', exists/.test(migration));
-  check("schema.sql يحوي أيضاً trigger المستخدم الجديد", /create trigger on_profile_created_notify_admins/.test(schema));
   check("schema.sql يحوي أيضاً admin_directory_search", /create or replace function public\.admin_directory_search\(/.test(schema));
-  check("schema.sql يحوي admin_recipient_ids", /create or replace function public\.admin_recipient_ids\(\)/.test(schema));
+  check("التشخيص لم يعد يعتمد على trigger قاعدة بيانات", !/'trigger_new_user', v_admin_triggers/.test(migration));
 
-  // --- Edge Function ---
-  check("send-push يعالج نوع new_user", /if \(input\.type === "new_user"\)/.test(sendPush));
-  check("send-push يجلب كل المشرفين (is_admin أو is_super_admin)", /\.or\("is_admin\.eq\.true,is_super_admin\.eq\.true"\)/.test(sendPush));
-  check("send-push يستثني المشرفين المحظورين", /row\.is_blocked !== true/.test(sendPush));
-  check("send-push يرسل لكل أجهزة المشرفين بطلب واحد", /loadDeviceTokensForUsers/.test(sendPush) && /\.in\("user_id", ids\)/.test(sendPush));
-  check("send-push يبني عنواناً يحمل اسم المستخدم الجديد", /مستخدم جديد: \$\{name\}/.test(sendPush));
-  check("send-push يمرّر userId للتوجيه عند النقر", /userId,\s*\n\s*title:/.test(sendPush));
-  check("send-push يرسل بأولوية عالية", /sendToAllDevices\(tokens, data, \{ highPriority: true \}\)/.test(sendPush));
-  check("send-push يتخطّى بلا مشرف أو بلا توكن", /skipped: "no admins"/.test(sendPush) && /skipped: "no fcm token"/.test(sendPush));
-  check("send-push موثّق للأنواع المدعومة", /new_user\s+— من trigger على profiles/.test(sendPush));
+  // --- Edge Function (المسار الوحيد) ---
+  check("send-push يعالج نوع new_user القادم من الـ Webhook",
+    /case "new_user"/.test(sendPush) && /async function handleNewUser/.test(sendPush));
+  check("send-push يجلب كل المشرفين (is_admin أو is_super_admin)",
+    /\.or\("is_admin\.eq\.true,is_super_admin\.eq\.true"\)/.test(sendPush));
+  check("send-push يستثني الحساب الجديد نفسه من البث",
+    /\.filter\(\(id\) => id !== userId\)/.test(sendPush));
+  check("send-push يرسل لكل أجهزة المشرفين بطلب واحد",
+    /loadDeviceTokensForUsers/.test(sendPush) && /\.in\("user_id", ids\)/.test(sendPush));
+  check("send-push يبني عنواناً يحمل اسم المستخدم الجديد",
+    /مستخدم جديد: \$\{name\}/.test(sendPush));
+  check("send-push يمرّر userId للتوجيه عند النقر",
+    /userId,\s*\n\s*title:/.test(sendPush));
+  check("send-push يرسل بأولوية عالية",
+    /priority: "high"/.test(sendPush));
+  check("send-push يتخطّى بلا مشرف أو بلا توكن",
+    /skipped: "no admins"/.test(sendPush) && /skipped: "no fcm token"/.test(sendPush));
+  check("send-push موثّق لجدول profiles عبر Database Webhook",
+    /profiles/.test(sendPush) && /Database Webhook/i.test(sendPush));
 
   // --- Service Worker ---
   check("SW version مُحدَّث", /SW_BUILD = "2026-10-15\.2"/.test(sw));
