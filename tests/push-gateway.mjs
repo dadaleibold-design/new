@@ -15,10 +15,24 @@ const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push
 const SCHEMA = read("sql/schema.sql");
 const CONFIG = read("supabase/config.toml");
 
+// القيم المعتمدة (مُضمَّنة في كود مسار التريگرات — بلا Vault).
+const EXPECTED_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
+const EXPECTED_SECRET = "my_send_push_19921121_almgawell_19921121";
+
 // الرابط والسر المُضمَّنان في مسار التريگرات (v2.15) — يُستخرجان من نص الهجرة
 // حتى يبقى الاختبار متوافقاً مع أي تعديل لاحق على القيمتين.
 const HARDCODED_URL = MIGRATION_V215.match(/v_url text := '([^']+)'/)?.[1] ?? "";
 const HARDCODED_SECRET = MIGRATION_V215.match(/v_secret text := '([^']+)'/)?.[1] ?? "";
+
+// كل ملفات SQL في المستودع: يجب ألا تقرأ SEND_PUSH_URL/SEND_PUSH_SECRET من Vault
+const SQL_FILES = [
+  "sql/schema.sql",
+  ...fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => "sql/migrations/" + f),
+];
+const SQL_VAULT_REFS = SQL_FILES.filter((f) => {
+  const code = read(f).split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+  return /vault\.(decrypted_secrets|secrets)/.test(code);
+});
 
 let fails = 0;
 const check = (name, ok, extra = "") => {
@@ -36,9 +50,14 @@ check("Service Worker يعرض data-only من push الخام حتى مع تعذ
 
 // --- v2.15: مسار التريگرات برابط وسرّ مُضمَّنين — بلا Vault ---
 check("v2.15: رابط send-push مُضمَّن مباشرة في trigger_send_push_notification",
-  HARDCODED_URL === "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push", HARDCODED_URL);
-check("v2.15: السر المشترك مُضمَّن ويُرسل في x-send-push-secret",
-  HARDCODED_SECRET.length > 0 && /'x-send-push-secret', v_secret/.test(MIGRATION_V215));
+  HARDCODED_URL === EXPECTED_URL, HARDCODED_URL);
+check("v2.15: السر المشترك مُضمَّن بالقيمة المعتمدة ويُرسل في x-send-push-secret",
+  HARDCODED_SECRET === EXPECTED_SECRET && /'x-send-push-secret', v_secret/.test(MIGRATION_V215),
+  HARDCODED_SECRET);
+check("v2.15: السرّ المُضمَّن ظاهر في schema.sql أيضاً (نفس القيمة)",
+  SCHEMA.includes(EXPECTED_SECRET) && SCHEMA.includes(EXPECTED_URL));
+check("v2.15: لا ملف SQL في المستودع يقرأ SEND_PUSH_* من Vault إطلاقاً",
+  SQL_VAULT_REFS.length === 0, SQL_VAULT_REFS.join(", "));
 // نصوص SQL بلا تعليقات: فحص «بلا Vault» يستهدف مراجع الكائنات لا الكلمة في الشروح
 const v215Code = MIGRATION_V215
   .split("\n")

@@ -16,9 +16,10 @@
 --   • pg_net.http_post غير متزامن: يعيد request_id فوراً والرد يُقرأ لاحقاً من
 --     net._http_response ⇒ إدراج الرسالة/المكالمة لا ينتظر الشبكة ولا يتأثر بفكّ Vault.
 --
--- ⚠️ SECRET: قيمة x-send-push-secret المُضمَّنة في trigger_send_push_notification
---    يجب أن تطابق تماماً سرّ الدالة SEND_PUSH_SECRET (Edge Function Secrets)،
---    وإلا رُدّت الطلبات بـ 401.
+-- ⚠️ SECRET: قيمة x-send-push-secret مُضمَّنة عمداً ومكتوبة أدناه مباشرةً
+--    (القيمة المعتمدة: my_send_push_19921121_almgawell_19921121) — يجب أن تطابق تماماً سرّ الدالة
+--    SEND_PUSH_SECRET (Edge Function Secrets)، وإلا رُدّت الطلبات بـ 401.
+--    لا تُقرأ من Vault إطلاقاً.
 --
 -- آمنة لإعادة التنفيذ (idempotent): create or replace + تريگرات مُحصّنة.
 -- ============================================================
@@ -47,9 +48,10 @@ create or replace function public.trigger_send_push_notification(
 )
 returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  -- ⚠️ SECRET — استبدل القيمة أدناه بقيمة SEND_PUSH_SECRET المضبوطة على
-  --    دالة send-push (Edge Function Secrets). إن اختلفت القيمتان ⇒ 401.
-  v_secret text := 'REPLACE_WITH_SEND_PUSH_SECRET';
+  -- ⚠️ SECRET — مُضمَّن مباشرةً (بلا Vault). يجب أن يطابق تماماً
+  --    SEND_PUSH_SECRET المضبوط على دالة send-push (Edge Function Secrets)،
+  --    وإلا رُدّت الطلبات بـ 401.
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   -- رابط دالة send-push العام على البوابة (مُضمَّن مباشرة — بلا Vault)
   v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
   v_headers jsonb;

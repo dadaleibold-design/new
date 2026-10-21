@@ -72,6 +72,15 @@ import {
 } from "./notification-router.js";
 
 /**
+ * رابط دالة send-push المُضمَّن في مسار التريگرات (migration v2.15).
+ * ليس سرّاً: دالة عامة على البوابة منشورة بـ verify_jwt = false، والتحقّق
+ * الفعلي يتم عبر ترويسة x-send-push-secret داخل الدالة. يُستخدم هنا لمقارنة
+ * ما تعلنه القاعدة (edge_function_url / url) مع القيمة المتوقَّعة والتأكّد
+ * من عدم وجود أي اعتماد على Supabase Vault.
+ */
+const SEND_PUSH_EDGE_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
+
+/**
  * قراءة آمنة من localStorage عند تهيئة الوحدة: الوصول المباشر قد يرمي
  * (وضع التصفّح الخاص الصارم/حظر التخزين/iframe رملي) — واستثناءٌ هنا،
  * قبل أي try/catch، كان يُسقط الوحدة كلها ويترك شاشة التحميل للأبد.
@@ -1247,7 +1256,20 @@ function wireChrome() {
           log(false, "دالة push_diagnostics غير موجودة — نفّذ migration v2.2 في Supabase");
         } else {
           log(!!diag.pg_net_installed, "امتداد pg_net " + (diag.pg_net_installed ? "مفعّل" : "غير مفعّل"));
-          log(!!diag.edge_url_ok, "مسار التريگرات → send-push " + (diag.edge_url_ok ? "سليم: " + (diag.edge_function_url || "") : "خاطئ — راجع الرابط المُضمَّن في trigger_send_push_notification (migration v2.15)"));
+          const diagUrl = diag.edge_function_url || "";
+          log(!!diag.edge_url_ok && diagUrl === SEND_PUSH_EDGE_URL,
+            "مسار التريگرات → send-push " + (diag.edge_url_ok
+              ? (diagUrl === SEND_PUSH_EDGE_URL ? "سليم: " + diagUrl : "الرابط المُضمَّن لا يطابق المتوقع: " + diagUrl + " — المتوقَّع " + SEND_PUSH_EDGE_URL)
+              : "خاطئ — راجع الرابط المُضمَّن في trigger_send_push_notification (migration v2.15)"));
+          // الاعتماد على Vault: لا شيء — الرابط والسرّ مُضمَّنان في الكود
+          log(diag.vault_dependency === false,
+            "اعتماد Vault: " + (diag.vault_dependency === false
+              ? "معدوم — الرابط والسرّ مُضمَّنان في trigger_send_push_notification (migration v2.15)"
+              : "ما زال ثمّة اعتماد على Supabase Vault — طبّق migration v2.15"));
+          log(diag.secret_hardcoded === true,
+            "السرّ المشترك: " + (diag.secret_hardcoded === true
+              ? "مُضمَّن في مسار التريگرات (x-send-push-secret)"
+              : "غير مُضمَّن — نفّذ migration v2.15"));
           log(!!diag.trigger_messages, "Trigger الرسائل " + (diag.trigger_messages ? "موجود" : "مفقود"));
           log(Number(diag.my_tokens) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag.my_tokens}`);
           const last = (diag.last_log || [])[0];
@@ -1277,6 +1299,22 @@ function wireChrome() {
       }
 
       log(null, "٢) مسار الخلفية: قاعدة البيانات → pg_net → send-push (نفس مسار الرسائل الحقيقية)…");
+      // فحص إعداد البوابة: الرابط والسرّ مُضمَّنان (لا استعلام عن Vault إطلاقاً)
+      try {
+        const { data: gw, error: gwErr } = await supabase.rpc("push_gateway_check");
+        if (gwErr) {
+          log(null, "دالة push_gateway_check غير متاحة — تخطّي فحص البوابة (migration v2.12/2.15)");
+        } else {
+          log(gw?.url_ok === true && gw?.url === SEND_PUSH_EDGE_URL,
+            "إعداد البوابة: الرابط المُضمَّن " + (gw?.url === SEND_PUSH_EDGE_URL ? "سليم — " + (gw?.url || "") : "لا يطابق " + SEND_PUSH_EDGE_URL + " (المعلن: " + (gw?.url || "—") + ")"));
+          log(gw?.secret_hardcoded === true && gw?.vault_dependency === false,
+            "إعداد البوابة: السرّ مُضمَّن ولا اعتماد على Vault"
+            + (gw?.vault_dependency === false ? "" : " — ما زال هناك اعتماد على Vault"));
+          if (gw?.gateway_hint) log(null, gw.gateway_hint);
+        }
+      } catch (err) {
+        log(null, "فحص البوابة تعذّر: " + (err?.message || err));
+      }
       try {
         const { data: probe, error: probeErr } = await supabase.rpc("push_probe");
         if (probeErr) {
@@ -1298,9 +1336,9 @@ function wireChrome() {
           } else if (res.status_code === 200) {
             log(true, `قاعدة البيانات وصلت إلى send-push بنجاح (200): ${res.response || ""}`);
           } else if (res.status_code === 401 && /NO_AUTH_HEADER|Missing authorization|INVALID_JWT_FORMAT|Bearer/i.test(res.response || "")) {
-            log(false, "401 من بوابة Supabase (وليس من الدالة): انشر الدالة بـ --no-verify-jwt ونفّذ migration v2.4 (يضيف ترويسة Authorization)");
+            log(false, "401 من بوابة Supabase (وليس من الدالة): انشر الدالة بـ --no-verify-jwt — المسار الجديد (v2.15) لا يحتاج ترويسة Authorization إطلاقاً");
           } else if (res.status_code === 401) {
-            log(false, "401 من send-push: السرّ المُضمَّن في trigger_send_push_notification (x-send-push-secret) لا يطابق SEND_PUSH_SECRET على الدالة — وحّدهما");
+            log(false, "401 من send-push: السرّ المُضمَّن في trigger_send_push_notification (x-send-push-secret) لا يطابق SEND_PUSH_SECRET على الدالة — وحّدهما (السرّ المُضمَّن: my_send_push_19921121_almgawell_19921121)");
           } else if (res.status_code === 404) {
             log(false, "404: الرابط المُضمَّن في trigger_send_push_notification خاطئ — يجب أن يكون https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push");
           } else {
