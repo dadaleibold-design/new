@@ -80,6 +80,16 @@ try {
 } catch (e) {
   check("هجرة v2.11 تُنفَّذ فوق المخطط ثم تُعاد بأمان (idempotent)", false, String(e.message).slice(0, 200));
 }
+// v2.15 هي آخر هجرة في المسار (تُطبَّق فوق v2.11 كما في الإنتاج): تضمين رابط/سرّ
+// send-push في trigger_send_push_notification بلا Vault.
+const MIG_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
+try {
+  await db.exec(MIG_V215);
+  await db.exec(MIG_V215); // إعادة التنفيذ
+  check("هجرة v2.15 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", true);
+} catch (e) {
+  check("هجرة v2.15 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", false, String(e.message).slice(0, 200));
+}
 
 // ---------- بيانات اختبار (بصلاحية المالك، أي بلا RLS) ----------
 const S = "00000000-0000-4000-8000-00000000000a"; // مشرف عام
@@ -297,8 +307,11 @@ const SQL_FILES = ["sql/schema.sql", ...fs.readdirSync(path.join(ROOT, "sql/migr
 const leaks = SQL_FILES.filter((f) => /eyJhbGciOiJIUzI1NiIs/.test(read(f)));
 check("لا JWT ثابت في أي ملف SQL", leaks.length === 0, leaks.join(", "));
 const pcDef = (await db.query("select pg_get_functiondef('public.push_call_edge(text,uuid,uuid,jsonb)'::regprocedure) d")).rows[0].d;
-check("push_call_edge يقرأ مفتاح Authorization من Vault", /SUPABASE_ANON_KEY/.test(pcDef) && /SUPABASE_SERVICE_ROLE_KEY/.test(pcDef));
-check("push_call_edge fail-closed بلا مفتاح صالح (SKIPPED)", /SKIPPED: SUPABASE_ANON_KEY/.test(pcDef));
+const tsDef = (await db.query("select pg_get_functiondef('public.trigger_send_push_notification(text,uuid,uuid,jsonb)'::regprocedure) d")).rows[0].d;
+check("push_call_edge تفوّض إلى trigger_send_push_notification", /public\.trigger_send_push_notification\(p_kind, p_ref, p_recipient, p_body\)/.test(pcDef));
+check("trigger_send_push_notification يضمّن رابط send-push مباشرة", /https:\/\/gqocavvhkfzgxzscrjms\.supabase\.co\/functions\/v1\/send-push/.test(tsDef));
+check("trigger_send_push_notification لا يقرأ من Vault إطلاقاً", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(tsDef));
+check("trigger_send_push_notification يُرسل ترويسة x-send-push-secret", /'x-send-push-secret', v_secret/.test(tsDef));
 
 if (fails) {
   console.log(`\nFAILED ${fails} check(s)`);
