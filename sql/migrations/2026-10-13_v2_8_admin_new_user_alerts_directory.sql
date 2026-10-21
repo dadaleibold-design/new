@@ -8,7 +8,7 @@
 -- آمنة لإعادة التنفيذ (idempotent). نفّذها بعد v2.7 (أو نفّذ schema.sql كاملاً).
 --
 -- المتطلبات المسبقة للإشعارات (نفس مسار رسائل الخلفية):
---   • امتداد pg_net + أسرار Vault: SEND_PUSH_URL و SEND_PUSH_SECRET
+--   • امتداد pg_net (الرابط والسرّ مُضمَّنان مباشرةً منذ v2.15 — بلا Vault)
 --   • نشر دالة send-push (النسخة التي تدعم type = 'new_user')
 -- ============================================================
 
@@ -42,7 +42,7 @@ create or replace function public.notify_admins_new_profile()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, vault, net
+set search_path = public, net
 as $$
 declare
   v_admins integer;
@@ -274,7 +274,7 @@ grant execute on function public.registered_users_count() to authenticated;
 -- (ج) تشخيص: أضف مؤشرات الميزتين إلى push_diagnostics()
 -- ============================================================
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions, net as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions, net as $$
 declare
   v jsonb;
   v_last jsonb;
@@ -308,10 +308,11 @@ begin
 
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url', (select decrypted_secret from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_len', (select length(decrypted_secret) from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted' and not tgisinternal),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify' and not tgisinternal),
     'trigger_new_user', v_admin_triggers > 0,

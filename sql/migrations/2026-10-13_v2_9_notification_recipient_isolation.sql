@@ -29,7 +29,7 @@
 -- لكن النسخة المشدّدة من الدالة (v2.9) تحقّق من نفس القواعد من جهتها أيضاً.
 --
 -- المتطلبات المسبقة (نفس مسار الإشعارات القائم):
---   • امتداد pg_net + أسرار Vault: SEND_PUSH_URL و SEND_PUSH_SECRET
+--   • امتداد pg_net (الرابط والسرّ مُضمَّنان مباشرةً منذ v2.15 — بلا Vault)
 --   • نشر دالة send-push
 -- ============================================================
 
@@ -336,11 +336,10 @@ create trigger on_call_room_notify
 --    نفس التوقيع السابق (بلا تغيير) ⇒ لا يتأثّر أي مستدعٍ قائم.
 -- ============================================================
 create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, vault, net as $$
+returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  v_url text;
-  v_secret text;
-  v_auth text;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_headers jsonb;
   v_req bigint;
   v_allowed boolean := false;
@@ -358,31 +357,11 @@ begin
     return;
   end if;
 
-  select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-  -- ترويسة Authorization: مفتاح anon من Vault إن وُجد، وإلا السر المشترك نفسه
-  select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_ANON_KEY' limit 1;
-  if coalesce(v_auth, '') = '' then
-    select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_SERVICE_ROLE_KEY' limit 1;
-  end if;
-  -- لا مفتاح مكتوب في الكود: بلا JWT صالح في Vault لا يُرسَل أي طلب (fail-closed)
-  if coalesce(v_auth, '') = '' or v_auth !~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SUPABASE_ANON_KEY غير مضبوط في Vault');
-    return;
-  end if;
-
-  if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SEND_PUSH_URL/SEND_PUSH_SECRET غير مضبوطين في Vault');
-    return;
-  end if;
-
+  -- الرابط والسرّ مُضمَّنان مباشرةً (بلا Vault) — لا ترويسة Authorization:
+  --   الدالة منشورة بـ verify_jwt = false ⇒ التحقّق عبر x-send-push-secret
   v_headers := jsonb_build_object(
     'Content-Type', 'application/json',
-    'x-send-push-secret', v_secret,
-    'Authorization', 'Bearer ' || v_auth,
-    'apikey', v_auth
+    'x-send-push-secret', v_secret
   );
 
   begin
@@ -409,7 +388,7 @@ create or replace function public.notify_admins_new_profile()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, vault, net
+set search_path = public, net
 as $$
 declare
   v_admins integer;
@@ -636,7 +615,7 @@ end $$;
 -- ⑧ التشخيص: مؤشرات العزل في push_diagnostics()
 -- ============================================================
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions, net as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions, net as $$
 declare
   v jsonb;
   v_last jsonb;
@@ -689,10 +668,11 @@ begin
 
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url', (select decrypted_secret from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_len', (select length(decrypted_secret) from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted' and not tgisinternal),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify' and not tgisinternal),
     'trigger_new_user', v_admin_triggers > 0,

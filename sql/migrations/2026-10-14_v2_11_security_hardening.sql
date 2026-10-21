@@ -2,8 +2,8 @@
 -- v2.11 (2026-10-14) — تدقيق الأمان وتشديد RLS
 -- ------------------------------------------------------------
 -- 1) إزالة مفتاح anon الثابت من push_call_edge (لا مفاتيح في الكود)
---    المفتاح يأتي من Vault: SUPABASE_ANON_KEY، وإلا SUPABASE_SERVICE_ROLE_KEY.
---    بلا JWT صالح ⇒ تسجيل SKIPPED ولا إرسال.
+--    ولا قراءة من Vault: منذ v2.15 الرابط والسرّ مُضمَّنان مباشرةً، والدالة
+--    منشورة بـ verify_jwt = false ⇒ لا حاجة لمفتاح anon ولا لترويسة Authorization.
 -- 2) المشرف العام = مراقب للقراءة فقط (لا كتابة على المحادثات/الرسائل/المكالمات)
 --    ويُرفض حظر/حذف المستخدمين من حسابه (تتطلب كتابة).
 -- 3) تقليص صلاحيات تنفيذ الدوال (لا RPC للزوار، لا دوال داخلية للمستخدمين).
@@ -12,11 +12,10 @@
 -- ============================================================
 
 create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, vault, net as $$
+returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  v_url text;
-  v_secret text;
-  v_auth text;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_headers jsonb;
   v_req bigint;
   v_allowed boolean := false;
@@ -34,31 +33,11 @@ begin
     return;
   end if;
 
-  select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-  -- ترويسة Authorization: مفتاح anon من Vault إن وُجد، وإلا السر المشترك نفسه
-  select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_ANON_KEY' limit 1;
-  if coalesce(v_auth, '') = '' then
-    select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_SERVICE_ROLE_KEY' limit 1;
-  end if;
-  -- لا مفتاح مكتوب في الكود: بلا JWT صالح في Vault لا يُرسَل أي طلب (fail-closed)
-  if coalesce(v_auth, '') = '' or v_auth !~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SUPABASE_ANON_KEY غير مضبوط في Vault');
-    return;
-  end if;
-
-  if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SEND_PUSH_URL/SEND_PUSH_SECRET غير مضبوطين في Vault');
-    return;
-  end if;
-
+  -- الرابط والسرّ مُضمَّنان مباشرةً (بلا Vault) — لا ترويسة Authorization:
+  --   الدالة منشورة بـ verify_jwt = false ⇒ التحقّق عبر x-send-push-secret
   v_headers := jsonb_build_object(
     'Content-Type', 'application/json',
-    'x-send-push-secret', v_secret,
-    'Authorization', 'Bearer ' || v_auth,
-    'apikey', v_auth
+    'x-send-push-secret', v_secret
   );
 
   begin

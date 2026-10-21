@@ -209,6 +209,13 @@ Supabase Vault. السبب: قراءة `SEND_PUSH_URL`/`SEND_PUSH_SECRET` من
 `pg_net.http_post` بخطأ `Couldn't resolve host name`. الرابط ليس سرّاً (دالة عامة على
 البوابة منشورة بـ `verify_jwt = false`)، والتحقّق الفعلي عبر ترويسة `x-send-push-secret`.
 
+التضمين الآن **شامل في كل ملفات SQL بالمستودع** (لا `sql/schema.sql` ولا أي هجرة في
+`sql/migrations/` تقرأ `SEND_PUSH_URL`/`SEND_PUSH_SECRET` من Vault — صفر مراجع
+`vault.decrypted_secrets`/`vault.secrets` في الكود)، وتشمل كل دوال التريغرات
+(`notify_new_message` / `notify_call_room` / `notify_admins_new_profile` /
+`push_call_edge` / `trigger_send_push_notification`) وكل دوال التشخيص
+(`push_diagnostics` / `push_gateway_check` / `push_probe` / `push_probe_result`).
+
 ```sql
 -- مطلوب على القواعد القائمة (آمن لإعادة التنفيذ):
 -- sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql
@@ -216,7 +223,9 @@ Supabase Vault. السبب: قراءة `SEND_PUSH_URL`/`SEND_PUSH_SECRET` من
 
 -- ⚠️ السرّ المُضمَّن في trigger_send_push_notification يجب أن يطابق تماماً
 --    SEND_PUSH_SECRET المضبوط على دالة send-push (أعلاه)، وإلا رُدّت الطلبات بـ 401.
+--    القيمة المعتمدة حالياً: my_send_push_19921121_almgawell_19921121
 --    لتغييره: عدّل ثابت v_secret داخل الدالة ثم أعد تنفيذ الهجرة.
+--    (المقابل في أسرار الدالة: supabase secrets set SEND_PUSH_SECRET=<القيمة>)
 ```
 
 طبّق `sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql` على قواعد البيانات القائمة؛ `sql/schema.sql` يتضمن التعديل (القسم 21) للتثبيت الجديد. للتحقق:
@@ -554,9 +563,19 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   `https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push` وثابت `v_secret`
   (يُرسل في `x-send-push-secret`) **مُضمَّنين مباشرةً** — بلا أي قراءة من Vault.
   الرابط ليس سرّاً (الدالة عامة على البوابة ومُنشورة بـ `verify_jwt = false`).
+- **تغطية المستودع كاملةً**: استُبدلت كل قراءات Vault في مسار الإشعارات — في
+  `sql/schema.sql` وفي كل هجرة (`v2.1` … `v2.15`): تريگرات الرسائل والمكالمات
+  والمستخدم الجديد، `push_call_edge`، ودوال التشخيص `push_diagnostics` /
+  `push_gateway_check` / `push_probe` / `push_probe_result`. صفر مراجع
+  `vault.decrypted_secrets`/`vault.secrets` في أي كود SQL، وفروع «SKIPPED: … Vault»
+  أُزيلت لأن القيم مُضمَّنة لا يُفترض أن تكون فارغة.
+- **الواجهة**: تقرير «إرسال إشعار تجريبي» في `js/app.js` صار يفحص الرابط والسرّ
+  المُضمَّنين (`push_diagnostics` ⇒ `edge_function_url`/`secret_hardcoded`/
+  `vault_dependency=false`، و`push_gateway_check` قبل المسبار) بدل توقّع سجلات Vault.
 - **⚠️ السرّ**: ثابت `v_secret` داخل `trigger_send_push_notification` يجب أن يطابق تماماً
   `SEND_PUSH_SECRET` المضبوط على دالة `send-push` (Edge Function Secrets)، وإلا رُدّت
-  الطلبات بـ 401. لتغييره: عدّل الثابت ثم أعد تنفيذ الهجرة.
+  الطلبات بـ 401. القيمة المعتمدة الآن: `my_send_push_19921121_almgawell_19921121`.
+  لتغييره: عدّل الثابت داخل الدالة (و`sql/schema.sql`) ثم أعد تنفيذ الهجرة.
 - **التوافق**: `push_call_edge` تبقى بنفس التوقيع وتفوّض إلى `trigger_send_push_notification`
   (notify_new_message / notify_call_room / notify_admins_new_profile / push_probe كما هي)،
   والبوابة المركزية `push_recipient_allowed` (عزل v2.9) تعمل قبل أي نداء شبكة.
@@ -570,3 +589,5 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **الاختبارات**: `npm run test:push-trigger` (مسار التريگر كامل على PGlite بجدول Vault فارغ:
   INSERT على messages ⇒ net.http_post بالرابط المُضمَّن + صفر قراءات Vault + الرد غير المتزامن)،
   و`npm run test:gateway` (الرابط والثابت من الكود لا من Vault)، ضمن `npm test`.
+  فحوص إضافية تتأكّد أن **كل** ملف SQL في المستودع خالٍ من مراجع Vault في الكود، وأن
+  السرّ المُضمَّن هو القيمة المعتمدة بالضبط (`my_send_push_19921121_almgawell_19921121`).

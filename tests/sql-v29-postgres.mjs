@@ -186,9 +186,10 @@ await db.exec(`
   do $$ begin create role anon; exception when duplicate_object then null; end $$;
   do $$ begin create role service_role; exception when duplicate_object then null; end $$;
 
+  -- قيم متعمَّدة في Vault: يجب أن يتجاهلها المسار تماماً (v2.15 — بلا Vault)
   insert into vault.decrypted_secrets (name, decrypted_secret) values
-    ('SEND_PUSH_URL', 'https://example.supabase.co/functions/v1/send-push'),
-    ('SEND_PUSH_SECRET', 'test-secret'),
+    ('SEND_PUSH_URL', 'https://decoy.invalid/functions/v1/send-push'),
+    ('SEND_PUSH_SECRET', 'decoy-secret-must-not-be-used'),
     ('SUPABASE_ANON_KEY', 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.signature');
 `);
 
@@ -307,6 +308,12 @@ check("رسالة سارة ⇒ المستلم هو المشرف المخصص ل�
   rows[0]?.kind === "new_message" && rows[0]?.recipient_id === ADMIN, JSON.stringify(rows[0] || {}));
 check("رسالة سارة ⇒ لا طلب شبكة إلا لجهة واحدة",
   (await db.query("select count(*)::int n from public.test_http_posts")).rows[0].n === 1);
+const pushUrl = (await db.query("select url from public.test_http_posts order by id desc limit 1")).rows[0]?.url || "";
+const pushHeaders = (await db.query("select headers from public.test_http_posts order by id desc limit 1")).rows[0]?.headers || {};
+check("طلب الشبكة يستخدم الرابط المُضمَّن (لا قيمة Vault)",
+  pushUrl === "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push", pushUrl);
+check("طلب الشبكة يحمل السرّ المُضمَّن (لا قيمة Vault)",
+  pushHeaders["x-send-push-secret"] === "my_send_push_19921121_almgawell_19921121", String(pushHeaders["x-send-push-secret"]));
 
 await reset();
 await db.query(`insert into public.messages (conversation_id, sender_id, content) values ($1,$2,'رد المشرف')`, [convA, ADMIN]);
@@ -584,8 +591,8 @@ await setUid("");
       select exists (select 1 from public.profiles where id = p_user_id and (is_admin or is_super_admin));
     $$;
     insert into vault.decrypted_secrets (name, decrypted_secret) values
-      ('SEND_PUSH_URL', 'https://example.supabase.co/functions/v1/send-push'),
-      ('SEND_PUSH_SECRET', 'test-secret'),
+      ('SEND_PUSH_URL', 'https://decoy.invalid/functions/v1/send-push'),
+      ('SEND_PUSH_SECRET', 'decoy-secret-must-not-be-used'),
       ('SUPABASE_ANON_KEY', 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.signature');
   `);
 

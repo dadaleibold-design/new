@@ -39,9 +39,23 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
 
+// القيم المعتمدة (مُضمَّنة في الكود — بلا Vault).
+const EXPECTED_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
+const EXPECTED_SECRET = "my_send_push_19921121_almgawell_19921121";
+
 // القيم المُضمَّنة (v2.15) — تُستخرج من نص الهجرة ليبقى الاختبار متوافقاً معها
 const HARDCODED_URL = MIGRATION_V215.match(/v_url text := '([^']+)'/)?.[1] ?? "";
 const HARDCODED_SECRET = MIGRATION_V215.match(/v_secret text := '([^']+)'/)?.[1] ?? "";
+
+// كل ملفات SQL: لا مراجع Vault في كود مسار الإشعارات
+const SQL_FILES = [
+  "sql/schema.sql",
+  ...fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => "sql/migrations/" + f),
+];
+const SQL_VAULT_REFS = SQL_FILES.filter((f) => {
+  const code = read(f).split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+  return /vault\.(decrypted_secrets|secrets)/.test(code);
+});
 
 const db = new PGlite();
 
@@ -233,8 +247,9 @@ try {
 
 /* ---------- ① ثوابت نص الهجرة ---------- */
 const v215Code = MIGRATION_V215.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
-check("v2.15: الرابط العام المُضمَّن صحيح", HARDCODED_URL === "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push", HARDCODED_URL);
-check("v2.15: السرّ المُضمَّن موجود", HARDCODED_SECRET.length > 0);
+check("v2.15: الرابط العام المُضمَّن صحيح", HARDCODED_URL === EXPECTED_URL, HARDCODED_URL);
+check("v2.15: السرّ المُضمَّن مطابق للقيمة المعتمدة", HARDCODED_SECRET === EXPECTED_SECRET, HARDCODED_SECRET);
+check("v2.15: لا ملف SQL في المستودع يقرأ من Vault (إطلاقاً)", SQL_VAULT_REFS.length === 0, SQL_VAULT_REFS.join(", "));
 check("v2.15: لا مراجع لـ Vault في كود مسار التريگر", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(v215Code));
 check("v2.15: الهجرة تضمن امتداد pg_net (محاطاً بحاجز للبيئات البديلة)", /create extension if not exists pg_net;/.test(v215Code));
 check("v2.15: الهجرة تضمن تريگر الإدراج على messages", /create trigger on_message_inserted[\s\S]*?after insert on public\.messages[\s\S]*?execute procedure public\.notify_new_message\(\)/.test(v215Code));

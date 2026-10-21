@@ -1,12 +1,12 @@
 -- ============================================================
 -- Migration v2.3 — تشخيص مسار الإشعارات من قاعدة البيانات (Trigger → pg_net → send-push)
 -- يكشف سبب «الإشعار التجريبي يعمل لكن إشعارات الرسائل لا تصل»:
--- عادةً 401 (SEND_PUSH_SECRET في Vault ≠ سر الدالة) أو 404 (رابط خاطئ) أو timeout.
+-- عادةً 401 (السرّ المُضمَّن ≠ سر الدالة) أو 404 (رابط خاطئ) أو timeout.
 -- ============================================================
 
 -- نتيجة آخر طلبات pg_net الصادرة من الـ Trigger مع حالة HTTP وجسم الرد
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions, net as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions, net as $$
 declare
   v jsonb;
   v_last jsonb;
@@ -29,10 +29,11 @@ begin
 
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url', (select decrypted_secret from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_len', (select length(decrypted_secret) from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted' and not tgisinternal),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify' and not tgisinternal),
     'my_tokens', (select count(*) from public.fcm_tokens where user_id = auth.uid()),

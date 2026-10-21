@@ -312,6 +312,20 @@ check("push_call_edge تفوّض إلى trigger_send_push_notification", /public
 check("trigger_send_push_notification يضمّن رابط send-push مباشرة", /https:\/\/gqocavvhkfzgxzscrjms\.supabase\.co\/functions\/v1\/send-push/.test(tsDef));
 check("trigger_send_push_notification لا يقرأ من Vault إطلاقاً", !/vault\.(decrypted_secrets|secrets|create_secret)/.test(tsDef));
 check("trigger_send_push_notification يُرسل ترويسة x-send-push-secret", /'x-send-push-secret', v_secret/.test(tsDef));
+check("trigger_send_push_notification يضمّن السرّ المعتمد", tsDef.includes("my_send_push_19921121_almgawell_19921121"));
+check("تعريف push_call_edge/trigger_send_push_notification بلا أي مرجع Vault",
+  !/vault\./.test(pcDef) && !/vault\./.test(tsDef));
+
+// لا ملف SQL في المستودع يقرأ SEND_PUSH_URL/SEND_PUSH_SECRET من Vault
+const SQL_PUSH_FILES = [
+  "sql/schema.sql",
+  ...fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => "sql/migrations/" + f),
+];
+const vaultPushRefs = SQL_PUSH_FILES.filter((f) => {
+  const code = read(f).split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+  return /vault\.(decrypted_secrets|secrets)/.test(code);
+});
+check("لا ملف SQL يقرأ أسرار send-push من Vault (المسار مُضمَّن بالكامل)", vaultPushRefs.length === 0, vaultPushRefs.join(", "));
 
 if (fails) {
   console.log(`\nFAILED ${fails} check(s)`);

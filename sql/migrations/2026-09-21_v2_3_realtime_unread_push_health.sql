@@ -70,14 +70,17 @@ $$;
 -- إثراء دالة التشخيص: عمر التوكنات + آخر تسليم + حالة الصف نفسه.
 -- تُستخدم من زر "إرسال إشعار تجريبي" في الإعدادات.
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions as $$
 declare
   v jsonb;
 begin
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted'),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify'),
     'my_tokens', (select count(*) from public.fcm_tokens where user_id = auth.uid()),

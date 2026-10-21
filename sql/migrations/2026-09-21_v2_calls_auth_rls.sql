@@ -315,10 +315,10 @@ create policy "call history hidden own delete" on public.call_history_hidden
 create extension if not exists pg_net;
 
 create or replace function public.notify_call_room()
-returns trigger language plpgsql security definer set search_path = public, vault, net as $$
+returns trigger language plpgsql security definer set search_path = public, net as $$
 declare
-  v_function_url text;
-  v_push_secret text;
+  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_type text;
 begin
   if tg_op = 'INSERT' and new.status = 'ringing' then
@@ -330,8 +330,6 @@ begin
     return new;
   end if;
 
-  select decrypted_secret into v_function_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_push_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
   if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
     return new;
   end if;
@@ -360,22 +358,15 @@ create trigger on_call_room_notify
 
 -- لا تُرسل إشعار "رسالة جديدة" لبطاقات المكالمات (لها إشعارها الخاص)
 create or replace function public.notify_new_message()
-returns trigger language plpgsql security definer set search_path = public, vault, net as $$
+returns trigger language plpgsql security definer set search_path = public, net as $$
 declare
-  v_function_url text;
-  v_push_secret text;
+  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
 begin
   if new.message_type = 'call' then
     return new;
   end if;
 
-  select decrypted_secret into v_function_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_push_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-
-  if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
-    raise warning 'send-push secrets are not configured in Supabase Vault';
-    return new;
-  end if;
 
   perform net.http_post(
     url := v_function_url,

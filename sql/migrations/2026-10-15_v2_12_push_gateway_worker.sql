@@ -14,12 +14,12 @@
 -- Edge Function نفسه (يُنشر بـ `supabase functions deploy send-push`).
 --
 -- إعداد المتغيرات بعد النشر:
---   1) Vault (للتريگرات — كما هي دون تغيير):
+--   1) التريگرات (منذ v2.15 — بلا Vault، القيم مُضمَّنة في الكود):
 --        SEND_PUSH_URL    = رابط دالة send-push
 --                           https://<project-ref>.supabase.co/functions/v1/send-push
 --                           ⛔ لا توجّهها إلى workers.dev — ذلك يتجاوز طبقة الأمان.
 --        SEND_PUSH_SECRET = السر المشترك (كما هو)
---        SUPABASE_ANON_KEY = مفتاح anon (كما هو — ترويسة Authorization للبوابة)
+--        (لا SUPABASE_ANON_KEY — الدالة verify_jwt = false فلا ترويسة Authorization)
 --   2) أسرار دالة send-push (Edge Function Secrets):
 --        PUSH_GATEWAY_URL    = https://nameless-dew-aac1.aabntlal680.workers.dev/
 --        PUSH_GATEWAY_SECRET = سرّ مصادقة الـ Worker (Authorization: Bearer)
@@ -33,60 +33,37 @@
 
 -- توثيق دالة بوابة الإشعارات (التوقيع والمنطق دون تغيير)
 comment on function public.push_call_edge(text, uuid, uuid, jsonb) is
-'بوابة الإشعارات من قاعدة البيانات: Trigger → pg_net → Edge Function send-push (الأمان والعزل) → Cloudflare Worker (توليد OAuth2/JWT والاتصال بـ FCM) → Firebase. Vault: SEND_PUSH_URL = رابط دالة send-push (ليس الـ Worker)، SEND_PUSH_SECRET = السر المشترك.';
+'بوابة الإشعارات من قاعدة البيانات: Trigger → pg_net → Edge Function send-push (الأمان والعزل) → Cloudflare Worker (توليد OAuth2/JWT والاتصال بـ FCM) → Firebase. منذ v2.15: رابط دالة send-push والسرّ مُضمَّنان مباشرةً — بلا Vault.';
 
 -- ============================================================
 -- تشخيص إعداد بوابة الإشعارات (v2.12)
--- يتحقق من أن Vault SEND_PUSH_URL يشير إلى دالة send-push (طبقة الأمان)
+-- يتحقق من أن الرابط المُضمَّن يشير إلى دالة send-push (طبقة الأمان)
 -- ولا يشير إلى الـ Worker مباشرة (خطأ شائع يتجاوز كل قواعد العزل).
 -- لا يكشف أي قيمة سرّية — أعلام منطقية وتلميح نصي فقط.
 -- ============================================================
 create or replace function public.push_gateway_check()
-returns jsonb language plpgsql security definer set search_path = public, vault as $$
+returns jsonb language plpgsql security definer set search_path = public as $$
 declare
-  v_url text;
-  v_secret_set boolean;
-  v_auth_set boolean;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
 begin
-  select decrypted_secret into v_url
-    from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-
-  select exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret, '') <> ''
-  ) into v_secret_set;
-
-  select exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SUPABASE_ANON_KEY' and coalesce(decrypted_secret, '') <> ''
-  ) or exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SUPABASE_SERVICE_ROLE_KEY' and coalesce(decrypted_secret, '') <> ''
-  ) into v_auth_set;
-
   return jsonb_build_object(
-    'vault_url_set', coalesce(v_url, '') <> '',
-    -- Vault SEND_PUSH_URL يجب أن يكون رابط دالة send-push (طبقة الأمان)
-    'vault_url_is_edge_function', v_url like '%/functions/v1/send-push%',
-    -- ⛔ خطأ إعداد: توجيه التريگرات إلى الـ Worker يتجاوز الأمان والعزل
-    'vault_url_is_worker', v_url like '%workers.dev%',
-    'vault_url_ok', coalesce(v_url, '') <> '' and v_url like '%/functions/v1/send-push%',
-    'vault_secret_set', v_secret_set,
-    'auth_key_set', v_auth_set,
-    'chain', 'Database Trigger → Edge Function (أمان/عزل) → Cloudflare Worker → FCM → Service Worker',
+    'url', v_url,
+    'url_hardcoded', true,
+    'url_is_edge_function', v_url like '%/functions/v1/send-push%',
+    'url_is_worker', coalesce(v_url, '') like '%workers.dev%',
+    'url_ok', coalesce(v_url, '') like '%/functions/v1/send-push%',
+    'secret_hardcoded', true,
+    'vault_dependency', false,
+    'chain', 'Database Trigger → pg_net (http_post غير متزامن) → Edge Function send-push (رابط وسرّ مُضمَّنان — verify_jwt = false) → FCM HTTP v1 → Service Worker',
     'gateway_hint', case
-      when v_url like '%workers.dev%' then
-        '⚠️ خطأ إعداد: Vault SEND_PUSH_URL يشير إلى الـ Worker مباشرة — هذا يتجاوز طبقة الأمان والعزل. أعد ضبطه على رابط دالة send-push، وضع رابط الـ Worker في أسرار الدالة (PUSH_GATEWAY_URL أو SEND_PUSH_URL).'
+      when coalesce(v_url, '') like '%workers.dev%' then
+        '⚠️ الرابط المُضمَّن يشير إلى الـ Worker مباشرة — يجب أن يشير إلى دالة send-push.'
       when coalesce(v_url, '') = '' then
-        '⚠️ Vault SEND_PUSH_URL غير مضبوط — لن تُرسل أي إشعارات من الـ Triggers.'
+        '⚠️ الرابط المُضمَّن فارغ — لن تُرسل إشعارات الـ Triggers.'
       when v_url not like '%/functions/v1/send-push%' then
-        '⚠️ Vault SEND_PUSH_URL لا يبدو رابط دالة send-push — راجع الإعداد.'
-      when not v_secret_set then
-        '⚠️ Vault SEND_PUSH_SECRET غير مضبوط.'
-      when not v_auth_set then
-        '⚠️ لا SUPABASE_ANON_KEY ولا SUPABASE_SERVICE_ROLE_KEY في Vault — طلبات pg_net سترفض بـ 401 (fail-closed).'
+        '⚠️ الرابط المُضمَّن يجب أن يشير إلى Edge Function send-push.'
       else
-        '✅ المسار سليم: الـ Triggers تستدعي send-push (الأمان/العزل) والإرسال النهائي عبر الـ Worker.'
+        '✅ المسار سليم: التريگرات تستدعي send-push برابط وسرّ مُضمَّنين بلا Vault.'
     end
   );
 end;

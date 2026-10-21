@@ -360,26 +360,13 @@ drop function if exists public.handle_keyword_autoreply();
 -- ------------------------------------------------------------
 create extension if not exists pg_net;
 
--- خزّن SEND_PUSH_URL و SEND_PUSH_SECRET في Supabase Vault قبل التفعيل.
+-- رابط دالة send-push والسرّ المشترك مُضمَّنان مباشرةً (بلا Supabase Vault).
 create or replace function public.notify_new_message()
-returns trigger language plpgsql security definer set search_path = public, vault, net as $$
+returns trigger language plpgsql security definer set search_path = public, net as $$
 declare
-  v_function_url text;
-  v_push_secret text;
+  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
 begin
-  select decrypted_secret into v_function_url
-  from vault.decrypted_secrets
-  where name = 'SEND_PUSH_URL'
-  limit 1;
-  select decrypted_secret into v_push_secret
-  from vault.decrypted_secrets
-  where name = 'SEND_PUSH_SECRET'
-  limit 1;
-
-  if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
-    raise warning 'send-push secrets are not configured in Supabase Vault';
-    return new;
-  end if;
 
   perform net.http_post(
     url := v_function_url,
@@ -1336,10 +1323,10 @@ create policy "call history hidden own delete" on public.call_history_hidden
 create extension if not exists pg_net;
 
 create or replace function public.notify_call_room()
-returns trigger language plpgsql security definer set search_path = public, vault, net as $$
+returns trigger language plpgsql security definer set search_path = public, net as $$
 declare
-  v_function_url text;
-  v_push_secret text;
+  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_type text;
 begin
   if tg_op = 'INSERT' and new.status = 'ringing' then
@@ -1351,8 +1338,6 @@ begin
     return new;
   end if;
 
-  select decrypted_secret into v_function_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_push_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
   if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
     return new;
   end if;
@@ -1381,22 +1366,15 @@ create trigger on_call_room_notify
 
 -- لا تُرسل إشعار "رسالة جديدة" لبطاقات المكالمات (لها إشعارها الخاص)
 create or replace function public.notify_new_message()
-returns trigger language plpgsql security definer set search_path = public, vault, net as $$
+returns trigger language plpgsql security definer set search_path = public, net as $$
 declare
-  v_function_url text;
-  v_push_secret text;
+  v_function_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_push_secret text := 'my_send_push_19921121_almgawell_19921121';
 begin
   if new.message_type = 'call' then
     return new;
   end if;
 
-  select decrypted_secret into v_function_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_push_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-
-  if coalesce(v_function_url, '') = '' or coalesce(v_push_secret, '') = '' then
-    raise warning 'send-push secrets are not configured in Supabase Vault';
-    return new;
-  end if;
 
   perform net.http_post(
     url := v_function_url,
@@ -1496,20 +1474,12 @@ create policy "push log superadmin read" on public.push_delivery_log
   for select using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.is_super_admin));
 
 create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, vault, net as $$
+returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  v_url text;
-  v_secret text;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_req bigint;
 begin
-  select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-
-  if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SEND_PUSH_URL/SEND_PUSH_SECRET غير مضبوطين في Vault');
-    return;
-  end if;
 
   begin
     select net.http_post(
@@ -1842,14 +1812,17 @@ create policy "reactions delete by admins" on public.message_reactions
 
 -- (ب) فحص جاهزية الإشعارات
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions as $$
 declare
   v jsonb;
 begin
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted'),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify'),
     'trigger_first_welcome', exists (select 1 from pg_trigger where tgname = 'on_message_first_welcome'),
@@ -1887,7 +1860,7 @@ grant execute on function public.push_diagnostics() to authenticated;
 -- ============================================================
 -- نتيجة آخر طلبات pg_net الصادرة من الـ Trigger مع حالة HTTP وجسم الرد
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions, net as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions, net as $$
 declare
   v jsonb;
   v_last jsonb;
@@ -1910,10 +1883,11 @@ begin
 
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url', (select decrypted_secret from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_len', (select length(decrypted_secret) from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted' and not tgisinternal),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify' and not tgisinternal),
     'my_tokens', (select count(*) from public.fcm_tokens where user_id = auth.uid()),
@@ -1955,43 +1929,22 @@ grant execute on function public.push_probe_result(bigint) to authenticated;
 -- ============================================================
 -- 15. الإصدار v2.4: ترويسة Authorization لطلبات pg_net (إصلاح 401 من البوابة)
 -- ============================================================
--- (اختياري لكن موصى به) خزّن مفتاح anon في Vault:
---   select vault.create_secret('<SUPABASE_ANON_KEY>', 'SUPABASE_ANON_KEY');
+-- ملاحظة (v2.15): مسار التريگرات بلا Vault — الرابط والسرّ مُضمَّنان
+--   مباشرةً، والدالة تُنشر بـ verify_jwt = false ⇒ لا مفتاح anon إطلاقاً.
 
 create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, vault, net as $$
+returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  v_url text;
-  v_secret text;
-  v_auth text;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_headers jsonb;
   v_req bigint;
 begin
-  select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-  -- ترويسة Authorization: مفتاح anon من Vault إن وُجد، وإلا السر المشترك نفسه
-  select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_ANON_KEY' limit 1;
-  if coalesce(v_auth, '') = '' then
-    select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_SERVICE_ROLE_KEY' limit 1;
-  end if;
-  -- لا مفتاح مكتوب في الكود: بلا JWT صالح في Vault لا يُرسَل أي طلب (fail-closed)
-  if coalesce(v_auth, '') = '' or v_auth !~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SUPABASE_ANON_KEY غير مضبوط في Vault');
-    return;
-  end if;
-
-  if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SEND_PUSH_URL/SEND_PUSH_SECRET غير مضبوطين في Vault');
-    return;
-  end if;
-
+  -- الرابط والسرّ مُضمَّنان مباشرةً (بلا Vault) — لا ترويسة Authorization:
+  --   الدالة منشورة بـ verify_jwt = false ⇒ التحقّق عبر x-send-push-secret
   v_headers := jsonb_build_object(
     'Content-Type', 'application/json',
-    'x-send-push-secret', v_secret,
-    'Authorization', 'Bearer ' || v_auth,
-    'apikey', v_auth
+    'x-send-push-secret', v_secret
   );
 
   begin
@@ -2041,7 +1994,7 @@ create or replace function public.notify_admins_new_profile()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, vault, net
+set search_path = public, net
 as $$
 declare
   v_admins integer;
@@ -2273,7 +2226,7 @@ grant execute on function public.registered_users_count() to authenticated;
 -- (ج) تشخيص: أضف مؤشرات الميزتين إلى push_diagnostics()
 -- ============================================================
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions, net as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions, net as $$
 declare
   v jsonb;
   v_last jsonb;
@@ -2307,10 +2260,11 @@ begin
 
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url', (select decrypted_secret from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_len', (select length(decrypted_secret) from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted' and not tgisinternal),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify' and not tgisinternal),
     'trigger_new_user', v_admin_triggers > 0,
@@ -2781,11 +2735,10 @@ create trigger on_call_room_notify
 --    نفس التوقيع السابق (بلا تغيير) ⇒ لا يتأثّر أي مستدعٍ قائم.
 -- ============================================================
 create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, vault, net as $$
+returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  v_url text;
-  v_secret text;
-  v_auth text;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_headers jsonb;
   v_req bigint;
   v_allowed boolean := false;
@@ -2803,31 +2756,11 @@ begin
     return;
   end if;
 
-  select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-  -- ترويسة Authorization: مفتاح anon من Vault إن وُجد، وإلا السر المشترك نفسه
-  select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_ANON_KEY' limit 1;
-  if coalesce(v_auth, '') = '' then
-    select decrypted_secret into v_auth from vault.decrypted_secrets where name = 'SUPABASE_SERVICE_ROLE_KEY' limit 1;
-  end if;
-  -- لا مفتاح مكتوب في الكود: بلا JWT صالح في Vault لا يُرسَل أي طلب (fail-closed)
-  if coalesce(v_auth, '') = '' or v_auth !~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SUPABASE_ANON_KEY غير مضبوط في Vault');
-    return;
-  end if;
-
-  if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SEND_PUSH_URL/SEND_PUSH_SECRET غير مضبوطين في Vault');
-    return;
-  end if;
-
+  -- الرابط والسرّ مُضمَّنان مباشرةً (بلا Vault) — لا ترويسة Authorization:
+  --   الدالة منشورة بـ verify_jwt = false ⇒ التحقّق عبر x-send-push-secret
   v_headers := jsonb_build_object(
     'Content-Type', 'application/json',
-    'x-send-push-secret', v_secret,
-    'Authorization', 'Bearer ' || v_auth,
-    'apikey', v_auth
+    'x-send-push-secret', v_secret
   );
 
   begin
@@ -2854,7 +2787,7 @@ create or replace function public.notify_admins_new_profile()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, vault, net
+set search_path = public, net
 as $$
 declare
   v_admins integer;
@@ -3081,7 +3014,7 @@ end $$;
 -- ⑧ التشخيص: مؤشرات العزل في push_diagnostics()
 -- ============================================================
 create or replace function public.push_diagnostics()
-returns jsonb language plpgsql security definer set search_path = public, vault, extensions, net as $$
+returns jsonb language plpgsql security definer set search_path = public, extensions, net as $$
 declare
   v jsonb;
   v_last jsonb;
@@ -3134,10 +3067,11 @@ begin
 
   select jsonb_build_object(
     'pg_net_installed', exists (select 1 from pg_extension where extname = 'pg_net'),
-    'vault_url', (select decrypted_secret from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1),
-    'vault_url_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_URL' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_set', exists (select 1 from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret,'') <> ''),
-    'vault_secret_len', (select length(decrypted_secret) from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1),
+    'edge_function_url', 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push',
+    'edge_url_hardcoded', true,
+    'edge_url_ok', true,
+    'secret_hardcoded', true,
+    'vault_dependency', false,
     'trigger_messages', exists (select 1 from pg_trigger where tgname = 'on_message_inserted' and not tgisinternal),
     'trigger_calls', exists (select 1 from pg_trigger where tgname = 'on_call_room_notify' and not tgisinternal),
     'trigger_new_user', v_admin_triggers > 0,
@@ -3331,53 +3265,32 @@ end $$;
 -- ============================================================
 
 comment on function public.push_call_edge(text, uuid, uuid, jsonb) is
-'بوابة الإشعارات من قاعدة البيانات: Trigger → pg_net → Edge Function send-push (الأمان والعزل) → Cloudflare Worker (توليد OAuth2/JWT والاتصال بـ FCM) → Firebase. Vault: SEND_PUSH_URL = رابط دالة send-push (ليس الـ Worker)، SEND_PUSH_SECRET = السر المشترك.';
+'بوابة الإشعارات من قاعدة البيانات: Trigger → pg_net → Edge Function send-push (الأمان والعزل) → Cloudflare Worker (توليد OAuth2/JWT والاتصال بـ FCM) → Firebase. منذ v2.15: رابط دالة send-push والسرّ مُضمَّنان مباشرةً — بلا Vault.';
 
 -- تشخيص إعداد البوابة: أعلام منطقية بلا كشف أسرار
 create or replace function public.push_gateway_check()
-returns jsonb language plpgsql security definer set search_path = public, vault as $$
+returns jsonb language plpgsql security definer set search_path = public as $$
 declare
-  v_url text;
-  v_secret_set boolean;
-  v_auth_set boolean;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
 begin
-  select decrypted_secret into v_url
-    from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-
-  select exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret, '') <> ''
-  ) into v_secret_set;
-
-  select exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SUPABASE_ANON_KEY' and coalesce(decrypted_secret, '') <> ''
-  ) or exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SUPABASE_SERVICE_ROLE_KEY' and coalesce(decrypted_secret, '') <> ''
-  ) into v_auth_set;
-
   return jsonb_build_object(
-    'vault_url_set', coalesce(v_url, '') <> '',
-    'vault_url_is_edge_function', v_url like '%/functions/v1/send-push%',
-    'vault_url_is_worker', v_url like '%workers.dev%',
-    'vault_url_ok', coalesce(v_url, '') <> '' and v_url like '%/functions/v1/send-push%',
-    'vault_secret_set', v_secret_set,
-    'auth_key_set', v_auth_set,
-    'chain', 'Database Trigger → Edge Function (أمان/عزل) → Cloudflare Worker → FCM → Service Worker',
+    'url', v_url,
+    'url_hardcoded', true,
+    'url_is_edge_function', v_url like '%/functions/v1/send-push%',
+    'url_is_worker', coalesce(v_url, '') like '%workers.dev%',
+    'url_ok', coalesce(v_url, '') like '%/functions/v1/send-push%',
+    'secret_hardcoded', true,
+    'vault_dependency', false,
+    'chain', 'Database Trigger → pg_net (http_post غير متزامن) → Edge Function send-push (رابط وسرّ مُضمَّنان — verify_jwt = false) → FCM HTTP v1 → Service Worker',
     'gateway_hint', case
-      when v_url like '%workers.dev%' then
-        '⚠️ خطأ إعداد: Vault SEND_PUSH_URL يشير إلى الـ Worker مباشرة — هذا يتجاوز طبقة الأمان والعزل. أعد ضبطه على رابط دالة send-push، وضع رابط الـ Worker في أسرار الدالة (PUSH_GATEWAY_URL أو SEND_PUSH_URL).'
+      when coalesce(v_url, '') like '%workers.dev%' then
+        '⚠️ الرابط المُضمَّن يشير إلى الـ Worker مباشرة — يجب أن يشير إلى دالة send-push.'
       when coalesce(v_url, '') = '' then
-        '⚠️ Vault SEND_PUSH_URL غير مضبوط — لن تُرسل أي إشعارات من الـ Triggers.'
+        '⚠️ الرابط المُضمَّن فارغ — لن تُرسل إشعارات الـ Triggers.'
       when v_url not like '%/functions/v1/send-push%' then
-        '⚠️ Vault SEND_PUSH_URL لا يبدو رابط دالة send-push — راجع الإعداد.'
-      when not v_secret_set then
-        '⚠️ Vault SEND_PUSH_SECRET غير مضبوط.'
-      when not v_auth_set then
-        '⚠️ لا SUPABASE_ANON_KEY ولا SUPABASE_SERVICE_ROLE_KEY في Vault — طلبات pg_net سترفض بـ 401 (fail-closed).'
+        '⚠️ الرابط المُضمَّن يجب أن يشير إلى Edge Function send-push.'
       else
-        '✅ المسار سليم: الـ Triggers تستدعي send-push (الأمان/العزل) والإرسال النهائي عبر الـ Worker.'
+        '✅ المسار سليم: التريگرات تستدعي send-push برابط وسرّ مُضمَّنين بلا Vault.'
     end
   );
 end;
@@ -3563,7 +3476,8 @@ end $$;
 -- ============================================================
 -- 20. الإصدار v2.14 (2026-10-18): مفاتيح Supabase الحديثة + FCM المباشر
 -- ------------------------------------------------------------
--- push_call_edge يدعم JWT legacy وsb_publishable_/sb_secret_ الحديثة.
+-- push_call_edge (v2.14) يدعم JWT legacy وsb_(publishable|secret)_ الحديثة —
+--   ومنذ v2.15 لم تعد ترويسة apikey لازمة (verify_jwt = false).
 -- الإرسال النهائي من Edge Function إلى FCM HTTP v1 مباشرة (لا Worker وسيط).
 -- ============================================================
 -- v2.14 — دعم مفاتيح Supabase الجديدة في مسار pg_net -> send-push.
@@ -3571,15 +3485,13 @@ end $$;
 -- تُرسل في apikey فقط؛ تبقى مصادقة هذا المسار الفعلية عبر x-send-push-secret.
 
 create or replace function public.push_call_edge(p_kind text, p_ref uuid, p_recipient uuid, p_body jsonb)
-returns void language plpgsql security definer set search_path = public, vault, net as $$
+returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  v_url text;
-  v_secret text;
-  v_api_key text;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   v_headers jsonb;
   v_req bigint;
   v_allowed boolean := false;
-  v_is_jwt boolean := false;
 begin
   begin
     v_allowed := public.push_recipient_allowed(p_kind, p_ref, p_recipient, p_body);
@@ -3593,37 +3505,11 @@ begin
     return;
   end if;
 
-  select decrypted_secret into v_url from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select decrypted_secret into v_secret from vault.decrypted_secrets where name = 'SEND_PUSH_SECRET' limit 1;
-  select decrypted_secret into v_api_key from vault.decrypted_secrets where name = 'SUPABASE_ANON_KEY' limit 1;
-  if coalesce(v_api_key, '') = '' then
-    select decrypted_secret into v_api_key from vault.decrypted_secrets where name = 'SUPABASE_SERVICE_ROLE_KEY' limit 1;
-  end if;
-
-  v_is_jwt := coalesce(v_api_key, '') ~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$';
-  if coalesce(v_api_key, '') = '' or not (
-    v_is_jwt or v_api_key ~ '^sb_(publishable|secret)_[A-Za-z0-9_-]+$'
-  ) then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: Supabase API key غير صالح أو غير مضبوط في Vault');
-    return;
-  end if;
-
-  if coalesce(v_url, '') = '' or coalesce(v_secret, '') = '' then
-    insert into public.push_delivery_log(kind, ref_id, recipient_id, note)
-    values (p_kind, p_ref, p_recipient, 'SKIPPED: SEND_PUSH_URL/SEND_PUSH_SECRET غير مضبوطين في Vault');
-    return;
-  end if;
 
   v_headers := jsonb_build_object(
     'Content-Type', 'application/json',
-    'x-send-push-secret', v_secret,
-    'apikey', v_api_key
+    'x-send-push-secret', v_secret
   );
-  -- لا تمرر sb_publishable_* كـ Bearer: ليس JWT وسيؤدي إلى فشل التحقق.
-  if v_is_jwt then
-    v_headers := v_headers || jsonb_build_object('Authorization', 'Bearer ' || v_api_key);
-  end if;
 
   begin
     select net.http_post(url := v_url, headers := v_headers, body := p_body, timeout_milliseconds := 8000)
@@ -3638,49 +3524,32 @@ end;
 $$;
 
 comment on function public.push_call_edge(text, uuid, uuid, jsonb) is
-'بوابة الإشعارات: Database Trigger → pg_net → Edge Function send-push (عزل/تحقق) → FCM HTTP v1 مباشرة. يدعم Vault SUPABASE_ANON_KEY بصيغة JWT القديمة أو sb_publishable_* الجديدة.';
+'بوابة الإشعارات: Database Trigger → pg_net → Edge Function send-push (عزل/تحقق) → FCM HTTP v1 مباشرة. منذ v2.15: الرابط والسرّ مُضمَّنان مباشرةً — بلا Vault (صيغة sb_(publishable|secret)_ لم تعد لازمة مع verify_jwt = false).';
 
 
 create or replace function public.push_gateway_check()
-returns jsonb language plpgsql security definer set search_path = public, vault as $$
+returns jsonb language plpgsql security definer set search_path = public as $$
 declare
-  v_url text;
-  v_secret_set boolean;
-  v_auth_set boolean;
+  v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
 begin
-  select decrypted_secret into v_url
-    from vault.decrypted_secrets where name = 'SEND_PUSH_URL' limit 1;
-  select exists (
-    select 1 from vault.decrypted_secrets
-    where name = 'SEND_PUSH_SECRET' and coalesce(decrypted_secret, '') <> ''
-  ) into v_secret_set;
-  select exists (
-    select 1 from vault.decrypted_secrets
-    where name in ('SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY')
-      and (decrypted_secret ~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
-        or decrypted_secret ~ '^sb_(publishable|secret)_[A-Za-z0-9_-]+$')
-  ) into v_auth_set;
-
   return jsonb_build_object(
-    'vault_url_set', coalesce(v_url, '') <> '',
-    'vault_url_is_edge_function', v_url like '%/functions/v1/send-push%',
-    -- kept for backward-compatible clients; always false for the direct-FCM path.
-    'vault_url_is_worker', coalesce(v_url, '') like '%workers.dev%',
-    'vault_url_ok', coalesce(v_url, '') <> '' and v_url like '%/functions/v1/send-push%',
-    'vault_secret_set', v_secret_set,
-    'auth_key_set', v_auth_set,
-    'chain', 'Database Trigger → Edge Function (أمان/عزل) → FCM HTTP v1 → Service Worker',
+    'url', v_url,
+    'url_hardcoded', true,
+    'url_is_edge_function', v_url like '%/functions/v1/send-push%',
+    'url_is_worker', coalesce(v_url, '') like '%workers.dev%',
+    'url_ok', coalesce(v_url, '') like '%/functions/v1/send-push%',
+    'secret_hardcoded', true,
+    'vault_dependency', false,
+    'chain', 'Database Trigger → pg_net (http_post غير متزامن) → Edge Function send-push (رابط وسرّ مُضمَّنان — verify_jwt = false) → FCM HTTP v1 → Service Worker',
     'gateway_hint', case
+      when coalesce(v_url, '') like '%workers.dev%' then
+        '⚠️ الرابط المُضمَّن يشير إلى الـ Worker مباشرة — يجب أن يشير إلى دالة send-push.'
       when coalesce(v_url, '') = '' then
-        '⚠️ Vault SEND_PUSH_URL غير مضبوط — لن تُرسل إشعارات الـ Triggers.'
+        '⚠️ الرابط المُضمَّن فارغ — لن تُرسل إشعارات الـ Triggers.'
       when v_url not like '%/functions/v1/send-push%' then
-        '⚠️ Vault SEND_PUSH_URL يجب أن يشير إلى Edge Function send-push.'
-      when not v_secret_set then
-        '⚠️ Vault SEND_PUSH_SECRET غير مضبوط.'
-      when not v_auth_set then
-        '⚠️ أضف SUPABASE_ANON_KEY بصيغة JWT أو sb_publishable_* إلى Vault.'
+        '⚠️ الرابط المُضمَّن يجب أن يشير إلى Edge Function send-push.'
       else
-        '✅ المسار سليم: Trigger → send-push → FCM HTTP v1 مباشرة.'
+        '✅ المسار سليم: التريگرات تستدعي send-push برابط وسرّ مُضمَّنين بلا Vault.'
     end
   );
 end;
@@ -3734,8 +3603,10 @@ grant execute on function public.expire_stale_ringing_calls_for_conversation(uui
 -- x-send-push-secret. net.http_post غير متزامن (الطلب في net.calls والرد في
 -- net._http_response) ⇒ إدراج الرسالة/المكالمة لا ينتظر الشبكة ولا يتأثر بفكّ Vault.
 --
--- ⚠️ SECRET: قيمة x-send-push-secret المُضمَّنة يجب أن تطابق SEND_PUSH_SECRET
+-- ⚠️ SECRET: قيمة x-send-push-secret مُضمَّنة عمداً ومكتوبة أدناه مباشرةً
+--    (القيمة المعتمدة: my_send_push_19921121_almgawell_19921121) — يجب أن تطابق تماماً SEND_PUSH_SECRET
 --    المضبوط على دالة send-push، وإلا رُدّت الطلبات بـ 401.
+--    لا تُقرأ من Vault إطلاقاً.
 -- مطابق لهجرة sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql
 -- ============================================================
 
@@ -3752,9 +3623,10 @@ create or replace function public.trigger_send_push_notification(
 )
 returns void language plpgsql security definer set search_path = public, net as $$
 declare
-  -- ⚠️ SECRET — استبدل القيمة أدناه بقيمة SEND_PUSH_SECRET المضبوطة على
-  --    دالة send-push (Edge Function Secrets). إن اختلفت القيمتان ⇒ 401.
-  v_secret text := 'REPLACE_WITH_SEND_PUSH_SECRET';
+  -- ⚠️ SECRET — مُضمَّن مباشرةً (بلا Vault). يجب أن يطابق تماماً
+  --    SEND_PUSH_SECRET المضبوط على دالة send-push (Edge Function Secrets)،
+  --    وإلا رُدّت الطلبات بـ 401.
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
   -- رابط دالة send-push العام على البوابة (مُضمَّن مباشرة — بلا Vault)
   v_url text := 'https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push';
   v_headers jsonb;
