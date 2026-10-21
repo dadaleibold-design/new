@@ -16,6 +16,12 @@ import {
   getReadState,
 } from "./db.js";
 import {
+  clientPushCall,
+  clientPushMessage,
+  clientPushNewUser,
+  clientPushProbe,
+} from "./clientPush.js";
+import {
   enablePushNotifications,
   listenForForegroundMessages,
   sendTestNotification,
@@ -1312,8 +1318,36 @@ function wireChrome() {
         }
       }
 
-      log(null, "٢) مسار الخلفية: قاعدة البيانات → pg_net → send-push (نفس مسار الرسائل الحقيقية)…");
-      // فحص إعداد البوابة: الرابط والسرّ مُضمَّنان (لا استعلام عن Vault إطلاقاً)
+      log(null, "٢) مسار العميل: المتصفح → Realtime → send-push → FCM (المسار الحيّ في وضع العميل)…");
+      // ★ فحص اتصال العميل المباشر بالدالة — بديل فحص شبكة القاعدة (pg_net).
+      //   لا سرّ مشترك في المتصفح: المصادقة برمز المستخدم.
+      try {
+        const probe = await clientPushProbe();
+        log(true, "اتصال المتصفح بـ send-push: سليم ✅ (200)"
+          + " — " + (probe?.devices ?? 0) + " جهاز مرتبط بهذا الحساب"
+          + " (وضع " + (probe?.mode || "client") + ")");
+      } catch (err) {
+        log(false, "اتصال المتصفح بـ send-push فشل: " + (err?.message || err)
+          + " — تحقّق أن الدالة منشورة: supabase functions deploy send-push --no-verify-jwt");
+      }
+      // وضع القاعدة: «عميل» = لا شبكة من القاعدة إطلاقاً (وهو المطلوب هنا)
+      try {
+        const { data: diagMode, error: modeErr } = await supabase.rpc("push_diagnostics");
+        if (modeErr) {
+          log(null, "وضع القاعدة غير معروف — نفّذ migration v2.19 (2026-10-25)");
+        } else {
+          const mode = diagMode?.push_mode || "unknown";
+          log(mode === "client",
+            "وضع القاعدة: عميل فقط ✅ — القاعدة لا تُجري أي طلب شبكة (مقصود: القاعدة معزولة)",
+            "وضع القاعدة: " + mode);
+          if (mode === "db") {
+            log(false, "وضع القاعدة 'db' ⇒ التريغر يحاول pg_net وهو محجوب — select public.push_set_mode('client');");
+          }
+        }
+      } catch (err) {
+        log(null, "تعذّر قراءة وضع القاعدة: " + (err?.message || err));
+      }
+      // إعداد المسار (الرابط/السرّ/نقطة التسليم) — كما هو، بلا شبكة
       try {
         const { data: gw, error: gwErr } = await supabase.rpc("push_gateway_check");
         if (gwErr) {
@@ -1334,44 +1368,7 @@ function wireChrome() {
       } catch (err) {
         log(null, "فحص البوابة تعذّر: " + (err?.message || err));
       }
-      try {
-        const { data: probe, error: probeErr } = await supabase.rpc("push_probe");
-        if (probeErr) {
-          log(false, "دالة push_probe غير موجودة — نفّذ migration v2.3");
-        } else if (!probe?.request_id) {
-          log(false, "الـ Trigger لم يستطع استدعاء pg_net — تحقق أن امتداد pg_net مفعّل وأن الرابط المُضمَّن في trigger_send_push_notification (migration v2.15) صحيح");
-        } else {
-          let res = null;
-          for (let i = 0; i < 8; i += 1) {
-            await new Promise((ok) => setTimeout(ok, 1200));
-            const { data } = await supabase.rpc("push_probe_result", { p_request_id: probe.request_id });
-            if (data && !data.pending) {
-              res = data;
-              break;
-            }
-          }
-          if (!res) {
-            log(false, "لم يصل رد من send-push خلال 10 ثوانٍ (timeout) — تحقق أن الرابط المُضمَّن في trigger_send_push_notification يطابق رابط الدالة المنشورة");
-          } else if (res.status_code === 200) {
-            log(true, `قاعدة البيانات وصلت إلى send-push بنجاح (200): ${res.response || ""}`);
-          } else if (res.status_code === 401 && /NO_AUTH_HEADER|Missing authorization|INVALID_JWT_FORMAT|Bearer/i.test(res.response || "")) {
-            log(false, "401 من بوابة Supabase (وليس من الدالة): انشر الدالة بـ --no-verify-jwt — المسار الجديد (v2.15) لا يحتاج ترويسة Authorization إطلاقاً");
-          } else if (res.status_code === 401) {
-            log(false, "401 من send-push: السرّ المُضمَّن في trigger_send_push_notification (x-send-push-secret) لا يطابق SEND_PUSH_SECRET على الدالة — وحّدهما (السرّ المُضمَّن: my_send_push_19921121_almgawell_19921121)");
-          } else if (res.status_code === 404) {
-            log(false, "404: الرابط المُضمَّن في trigger_send_push_notification خاطئ — يجب أن يكون https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push");
-          } else if (res.dns_error) {
-            log(false, "القاعدة لا تصل إلى نقطة التسليم (فشل DNS) — " + (res.hint || res.error || ""));
-          } else {
-            log(false, `رد غير متوقع من send-push: ${res.status_code || res.error} ${res.response || ""}`
-              + (res.hint ? " — " + res.hint : ""));
-          }
-        }
-      } catch (err) {
-        log(false, "فشل المسبار: " + (err?.message || err));
-      }
-      // v2.18: حكم حاسم على مسار التسليم — نداء واحد يكفي (مسبار حقيقي لكل
-      // مرشّح + قراءة رموز الحالة + ترشيح الوجهة الصالحة).
+      // حكم مسار التسليم (في وضع العميل يُرجع فوراً: لا فائدة من فحص DNS معطّل)
       try {
         const { data: verdict, error: vErr } = await supabase.rpc("push_path_verdict", { p_apply: false });
         if (vErr) {
@@ -1387,48 +1384,9 @@ function wireChrome() {
               + (c.hint ? " — " + c.hint : ""));
           }
           log(null, "الحكم: " + (verdict?.verdict || "—"));
-          if (verdict?.best_url && verdict?.delivery_url !== verdict?.best_url) {
-            log(null, "لتحويل مسار التسليم إلى الوجهة الناجحة: select public.push_path_verdict(true);"
-              + "  (من SQL Editor أو بمفتاح service_role)");
-          }
-          if (verdict?.delivery_url && verdict?.delivery_url !== verdict?.best_url && !verdict?.best_url) {
-            log(false, "لا توجد وجهة تعمل حالياً — انشر بوابة بديلة (worker/send-push-relay.js) ثم"
-              + " select public.push_set_delivery_url('https://<worker>.workers.dev/');");
-          }
         }
       } catch (err) {
         log(null, "الحكم على مسار التسليم تعذّر: " + (err?.message || err));
-      }
-      // v2.16: فحص مباشر من القاعدة يتجاوز كل دوال المسار — يميّز بين
-      // «جسم دالة قديم» و«المشروع لا يستطيع الوصول إلى المضيف».
-      try {
-        const { data: eg, error: egErr } = await supabase.rpc("push_egress_check");
-        if (egErr) {
-          log(null, "فحص الخروج (push_egress_check) غير متاح — نفّذ migration v2.16 (2026-10-22)");
-        } else if (eg?.queued === true && eg?.request_id) {
-          let eRes = null;
-          for (let i = 0; i < 8; i += 1) {
-            await new Promise((ok) => setTimeout(ok, 1200));
-            const { data } = await supabase.rpc("push_probe_result", { p_request_id: eg.request_id });
-            if (data && !data.pending) {
-              eRes = data;
-              break;
-            }
-          }
-          if (!eRes) {
-            log(null, "فحص الخروج: لم يصل رد من pg_net خلال 10 ثوانٍ");
-          } else if (eRes.status_code === 200) {
-            log(true, "فحص الخروج: القاعدة تصل إلى send-push مباشرةً (200) — DNS والشبكة سليمان");
-          } else if (eRes.dns_error) {
-            log(false, "فحص الخروج: القاعدة لا تصل إلى نقطة التسليم — " + (eRes.hint || eRes.error || ""));
-          } else {
-            log(false, "فحص الخروج: " + (eRes.hint || `${eRes.status_code || eRes.error} ${eRes.response || ""}`));
-          }
-        } else {
-          log(false, "فحص الخروج فشل: " + (eg?.error || "—") + (eg?.hint ? " — " + eg.hint : ""));
-        }
-      } catch (err) {
-        log(null, "فحص الخروج تعذّر: " + (err?.message || err));
       }
       log(null, "اختبر الآن والتطبيق في الخلفية. نجاح FCM يثبت قبول الطلب فقط؛ إن لم يظهر الإشعار، افحص سجل [push-sw] وإعدادات الإذن/النظام.");
     } catch (err) {
@@ -1635,6 +1593,11 @@ function subscribeCallRoomsWatch() {
           const row = payload.new || payload.old;
           if (!row || !state.me) return;
           if (row.caller_id !== state.me.id && row.callee_id !== state.me.id) return;
+          // ★ وضع العميل: المتصل يطلق إشعار الرنين (المستلَم = callee من الغرفة)
+          if (row.caller_id === state.me.id && row.status === "ringing" && payload.eventType !== "UPDATE") {
+            void clientPushCall({ roomId: row.id, callType: row.call_type || "audio" })
+              .catch((err) => console.warn("[client-push] فشل إطلاق إشعار المكالمة:", err?.message || err));
+          }
           refreshMissedCallsBadge();
           const modal = $("#call-history-modal");
           if (modal && !modal.classList.contains("hidden")) {
@@ -6740,8 +6703,11 @@ function subscribeGlobalMessageWatch() {
           const preview = messagePreviewText(msg);
           const lastAt = msg.created_at || new Date().toISOString();
 
-          // رسالة من جهاز آخر لنفس الحساب: تحديث المعاينة فقط، بلا عدّاد غير مقروء
+          // ★ وضع العميل (v2.19): القاعدة معزولة شبكياً ⇒ الإشعار يُطلق من
+          //   جهاز المُرسِل (يرصد الحدث عبر Realtime) ← ثم يستدعي دالة send-push
+          //   مباشرةً بمصادقة رمز المستخدم. المستلَم يُشتقّ على الخادم.
           if (msg.sender_id === state.me.id) {
+            void notifyRecipientByClient(msg);
             if (!patchConversationRow(msg.conversation_id, { lastMessage: preview, lastAt })) {
               loadContacts();
             }
@@ -6815,6 +6781,35 @@ function subscribeGlobalMessageWatch() {
 }
 
 /**
+ * ★ وضع العميل (v2.19): إطلاق إشعار الرسالة من جهاز المُرسِل.
+ * - الدالة على الخادم تُثبّت المُرسِل من رمز المستخدم (لا يُقبل من العميل)
+ *   وتُشتقّ المستلَم من المحادثة ⇒ لا impersonation.
+ * - منع التكرار محلياً: كل رسالة تُطلق مرة واحدة لكل جهاز.
+ */
+const _clientPushedMessages = new Set();
+
+async function notifyRecipientByClient(msg) {
+  if (!msg?.id) return;
+  if (_clientPushedMessages.has(msg.id)) return;
+  _clientPushedMessages.add(msg.id);
+  if (_clientPushedMessages.size > 200) {
+    const first = _clientPushedMessages.values().next().value;
+    _clientPushedMessages.delete(first);
+  }
+  try {
+    await clientPushMessage({
+      messageId: msg.id,
+      conversationId: msg.conversation_id,
+      content: msg.content || "",
+      messageType: msg.message_type || "text",
+    });
+  } catch (err) {
+    // لا تُفشل واجهة المستخدم: الإشعار opportunist — يُسجَّل فقط
+    console.warn("[client-push] فشل إطلاق إشعار الرسالة:", err?.message || err);
+  }
+}
+
+/**
  * قناة المشرفين: تسجيل مستخدم جديد.
  * تعمل كطبقة ثانية بجانب إشعار FCM (تظهر حتى لو كان الإشعار مغلقاً أو الجهاز
  * لا يدعم Push)، وتُحدّث الدليل لحظياً إن كان مفتوحاً.
@@ -6845,6 +6840,9 @@ function subscribeAdminDirectory() {
           const name = String(row.display_name || "").trim() || "مستخدم";
           showAuthError(`👤 مستخدم جديد: ${name} — اضغط لبدء محادثة`, { id: row.id });
           playNotificationSound();
+          // ★ وضع العميل: المشرف يطلق إشعار «مستخدم جديد» لبقية المشرفين
+          void clientPushNewUser({ userId: row.id, displayName: name })
+            .catch((err) => console.warn("[client-push] فشل إطلاق إشعار مستخدم جديد:", err?.message || err));
         },
       },
     ],

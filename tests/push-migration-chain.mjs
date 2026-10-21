@@ -202,11 +202,23 @@ await db.query("update public.profiles set is_admin = true, display_name = 'أ' 
 await db.query("update public.profiles set display_name = 'ب' where id = $1", [USER]);
 const conv = (await db.query("insert into public.conversations (user_id, admin_id) values ($1,$2) returning id", [USER, ADMIN])).rows[0].id;
 
+// ── ★ وضع العميل (v2.19): القاعدة لا تتصل بأي شبكة ──
+await db.exec("delete from net.calls; delete from public.push_delivery_log");
+await db.query("insert into public.messages (conversation_id, sender_id, content, message_type) values ($1,$2,$3,'text')", [conv, USER, "وضع العميل"]);
+
+const clientCalls = await q("select count(*)::int c from net.calls");
+check("وضع العميل: التريغر لا يُجري أي طلب شبكة", clientCalls[0]?.c === 0, `count=${clientCalls[0]?.c}`);
+const clientLog = await q("select kind, recipient_id, request_id, note from public.push_delivery_log order by id desc limit 1");
+check("وضع العميل: يسجّل النيّة فقط (CLIENT-MODE)",
+  /CLIENT-MODE/.test(clientLog[0]?.note || "") && clientLog[0]?.request_id == null, JSON.stringify(clientLog[0] || {}));
+
+// ── وضع القاعدة (تراجع اختياري): pg_net يعمل كما كان ──
+await q("select public.push_set_mode('db')");
 await db.exec("delete from net.calls; delete from public.push_delivery_log");
 await db.query("insert into public.messages (conversation_id, sender_id, content, message_type) values ($1,$2,$3,'text')", [conv, USER, "دخان"]);
 
 const calls = await q("select request_id, url, headers from net.calls order by id desc limit 1");
-check("التريغر أرسل طلباً واحداً عبر pg_net", calls.length === 1, `count=${calls.length}`);
+check("وضع القاعدة: التريغر أرسل طلباً واحداً عبر pg_net", calls.length === 1, `count=${calls.length}`);
 check("الرابط المُرسل = الرابط المُضمَّن", calls[0]?.url === URL, String(calls[0]?.url));
 check("الترويسة x-send-push-secret = السرّ المُضمَّن", calls[0]?.headers?.["x-send-push-secret"] === SECRET);
 check("الترويسات = Content-Type + x-send-push-secret فقط",
@@ -215,7 +227,7 @@ check("الترويسات = Content-Type + x-send-push-secret فقط",
 const log = await q("select kind, recipient_id, request_id, note from public.push_delivery_log order by id desc limit 1");
 check("سجل التسليم يوثّق الطلب (لا تخطٍّ)", log[0]?.request_id != null && log[0]?.note == null, JSON.stringify(log[0] || {}));
 
-// ── المسبار يعمل بلا Vault ──
+// ── المسبار يعمل بلا Vault (وضع القاعدة) ──
 await db.exec("delete from net.calls; delete from public.push_delivery_log");
 await db.exec(`set test.uid = '${USER}'`);
 const probe = (await db.query("select public.push_probe() p")).rows[0]?.p;
@@ -266,7 +278,7 @@ check("push_diagnostics يكشف القاعدة المتأخرة: live_path_stal
 check("push_diagnostics يكشف الاعتماد على Vault: vault_dependency = true", stale?.vault_dependency === true);
 check("push_diagnostics: live_path_functions.push_call_edge.reads_vault = true",
   stale?.live_path_functions?.push_call_edge?.reads_vault === true);
-check("push_diagnostics: live_path_hint ينبّه على أحدث هجرة", /v2\.1[68]/.test(stale?.live_path_hint || ""), stale?.live_path_hint);
+check("push_diagnostics: live_path_hint ينبّه على أحدث هجرة", /v2\.1[689]/.test(stale?.live_path_hint || ""), stale?.live_path_hint);
 
 // تطبيق v2.16 يُصلح القاعدة المتأخرة
 await db.exec(read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql"));
@@ -389,7 +401,8 @@ check("push_set_delivery_url: يقبل نقطة بديلة", setRes?.ok === true
 const altUrl = (await q("select public.push_delivery_url() u"))[0]?.u;
 check("push_delivery_url: صار يشير إلى البوابة البديلة", altUrl === "https://relay.example.workers.dev/", String(altUrl));
 
-// التريغر يستخدم نقطة التسليم البديلة
+// التريغر يستخدم نقطة التسليم البديلة (وضع القاعدة)
+await q("select public.push_set_mode('db')");
 await db.exec("delete from net.calls; delete from public.push_delivery_log");
 await db.query("insert into public.messages (conversation_id, sender_id, content, message_type) values ($1,$2,$3,'text')", [conv, USER, "بريد بديل"]);
 const altCall = await q("select url, headers from net.calls order by id desc limit 1");
@@ -397,8 +410,9 @@ check("التريغر يرسل إلى نقطة التسليم البديلة", a
 check("الترويسة x-send-push-secret = السرّ المُضمَّن (مع البوابة البديلة)",
   altCall[0]?.headers?.["x-send-push-secret"] === SECRET);
 
-// العودة للافتراضي
+// العودة للافتراضي + الرجوع إلى وضع العميل
 await q("select public.push_set_delivery_url(null)");
+await q("select public.push_set_mode('client')");
 const backUrl = (await q("select public.push_delivery_url() u"))[0]?.u;
 check("push_set_delivery_url: الرجوع للافتراضي", backUrl === URL, String(backUrl));
 

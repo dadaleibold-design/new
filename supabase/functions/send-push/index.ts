@@ -68,6 +68,24 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const CALL_RING_MAX_AGE_MS = 2 * 60 * 1000;
+
+// ── منع التكرار: في وضع «العميل» قد يطلب أكثر من جهاز من أجهزة المرسل
+// إرسال الإشعار نفسه (كل جهاز يرصد الرسالة عبر Realtime).
+// الحل: ذاكرة قصيرة داخل العزل (isolate) بمفتاح message_id.
+const PUSH_DEDUPE_TTL_MS = 60 * 1000;
+const _pushSeen = new Map<string, number>();
+/** هل أُرسل هذا الإشعار قبل قليل؟ (قراءة فقط — لا تُسجَّل هنا) */
+function isDuplicatePush(key: string): boolean {
+  if (!key) return false;
+  const now = Date.now();
+  for (const [k, t] of _pushSeen) if (now - t > PUSH_DEDUPE_TTL_MS) _pushSeen.delete(k);
+  return _pushSeen.has(key);
+}
+/** تُستدعى بعد الإرسال الناجح فقط — حتى لا تُضيع إعادة محاولة بعد فشل */
+function markPushSent(key: string) {
+  if (!key) return;
+  _pushSeen.set(key, Date.now());
+}
 const FCM_CONCURRENCY = 10;
 
 function json(data: unknown, status = 200) {
@@ -275,7 +293,89 @@ serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   try {
-    const input = await req.json();
+    let input = await req.json();
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 0) مسار العميل (client_*) — مصادقة برمز المستخدم (JWT) لا بالسرّ المشترك.
+    //    الغرض: نقل إرسال الإشعارات من قاعدة البيانات (محجوبة شبكياً) إلى
+    //    الواجهة — المتصفح يرصد الحدث عبر Realtime ثم يستدعي هذه الدالة.
+    //    ⚠️ لا سرّ مشترك في المتصفح: المصادقة برمز المستخدم + التحقّق
+    //       على الخادم (المُرسِل = صاحب الرمز، والمستلَم يُشتقّ من المحادثة).
+    // ══════════════════════════════════════════════════════════════════════
+    let clientUser: { id: string } | null = null;
+    if (String(input.type || "").startsWith("client_")) {
+      const authHeader = req.headers.get("authorization");
+      if (!authHeader) return json({ error: "Unauthorized" }, 401);
+      const tokenVal = authHeader.replace(/^Bearer\s+/i, "");
+      const { data: { user }, error: userErr } = await supabase.auth.getUser(tokenVal);
+      if (userErr || !user) return json({ error: "Unauthorized user" }, 401);
+      clientUser = { id: String(user.id) };
+
+      if (input.type === "client_probe") {
+        // فحص الاتصال من المتصفح — بلا إشعار وبلا أثر
+        const tokens = await loadDeviceTokens(clientUser.id);
+        return json({
+          ok: true, mode: "client", user_id: clientUser.id,
+          devices: tokens.length,
+          service: "send-push (client mode)",
+        });
+      }
+
+      if (input.type === "client_message") {
+        // نقرأ الرسالة من القاعدة: المُرسِل يُثبَت من الرمز (لا يُقبل من العميل)
+        const messageId = String(input.message_id || "");
+        if (!messageId) return json({ error: "message_id required" }, 400);
+        const { data: msg } = await supabase.from("messages")
+          .select("id, conversation_id, sender_id, content, message_type, attachment_type")
+          .eq("id", messageId).maybeSingle();
+        if (!msg) return json({ error: "message not found" }, 404);
+        if (String(msg.sender_id) !== clientUser.id) {
+          return json({ error: "forbidden: not the message sender" }, 403);
+        }
+        input = {
+          type: "new_message",
+          message_id: msg.id,
+          conversation_id: msg.conversation_id,
+          sender_id: clientUser.id,
+          content: msg.content ?? (msg.attachment_type === "image" ? "📷 صورة" : msg.attachment_type === "audio" ? "🎤 رسالة صوتية" : "📎 مرفق"),
+          message_type: msg.message_type,
+        };
+      } else if (input.type === "client_call") {
+        const roomId = String(input.room_id || "");
+        if (!roomId) return json({ error: "room_id required" }, 400);
+        const { data: room } = await supabase.from("call_rooms")
+          .select("id, caller_id, callee_id, conversation_id, status, call_type, started_at")
+          .eq("id", roomId).maybeSingle();
+        if (!room) return json({ error: "call room not found" }, 404);
+        // المتصل هو صاحب الرمز فقط
+        if (String(room.caller_id) !== clientUser.id) {
+          return json({ error: "forbidden: not the call caller" }, 403);
+        }
+        const callType = String(input.call_type || room.call_type || "audio");
+        input = {
+          type: "incoming_call",
+          room_id: room.id,
+          conversation_id: room.conversation_id,
+          caller_id: clientUser.id,
+          callee_id: room.callee_id,
+          call_type: callType,
+        };
+      } else if (input.type === "client_new_user") {
+        // إشعار «مستخدم جديد» للمشرفين — المتصل يجب أن يكون مشرفاً
+        const { data: me } = await supabase.from("profiles")
+          .select("is_admin, is_super_admin").eq("id", clientUser.id).maybeSingle();
+        if (!me?.is_admin && !me?.is_super_admin) {
+          return json({ error: "forbidden: admins only" }, 403);
+        }
+        const newUserId = String(input.user_id || "");
+        if (!newUserId) return json({ error: "user_id required" }, 400);
+        const { data: prof } = await supabase.from("profiles")
+          .select("display_name").eq("id", newUserId).maybeSingle();
+        input = { type: "new_user", user_id: newUserId, display_name: prof?.display_name || "مستخدم جديد" };
+      } else {
+        return json({ error: "unknown client type" }, 400);
+      }
+    }
 
     // 1. اختبار يدوي لتأكيد عمل الإشعارات
     if (input.type === "test") {
@@ -309,7 +409,8 @@ serve(async (req) => {
       return json({ sent: results.filter((r) => r.ok).length, total: results.length, results });
     }
 
-    if (!isAuthorized(req)) return json({ error: "Unauthorized: Invalid Secret" }, 401);
+    // مسار العميل مُصادق برمز المستخدم ⇒ لا يحتاج السرّ المشترك
+    if (!clientUser && !isAuthorized(req)) return json({ error: "Unauthorized: Invalid Secret" }, 401);
 
     // 2. إشعارات المكالمات (Incoming Call / Call Ended)
     if (input.type === "incoming_call" || input.type === "call_ended") {
@@ -391,6 +492,10 @@ serve(async (req) => {
     if (!messageId || !conversationId || !senderId) {
       return json({ error: "message_id, conversation_id and sender_id are required" }, 400);
     }
+    // منع الإرسال المكرر (عدة أجهزة للمرسل قد تطلب الإشعار نفسه)
+    if (isDuplicatePush(messageId)) {
+      return json({ sent: 0, total: 0, skipped: "duplicate (already pushed)" });
+    }
     const { data: conversation } = await supabase.from("conversations").select("user_id, admin_id").eq("id", conversationId).maybeSingle();
     if (!conversation) return json({ error: "Conversation not found" }, 404);
     const { data: sender } = await supabase.from("profiles").select("display_name, is_super_admin").eq("id", senderId).maybeSingle();
@@ -420,6 +525,8 @@ serve(async (req) => {
     let delivered = false;
     if (results.some((r) => r.ok)) {
       delivered = true;
+      // تُسجَّل بعد نجاح الإرسال فقط — حتى لا تُضيع إعادة محاولة بعد فشل
+      markPushSent(messageId);
       await supabase.from("messages").update({ status: "delivered" }).eq("id", messageId).eq("status", "sent");
     }
     return json({ sent: results.filter((r) => r.ok).length, total: results.length, results, delivered });
