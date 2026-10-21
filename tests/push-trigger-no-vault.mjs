@@ -40,6 +40,7 @@ const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 const MIGRATION_V215 = read("sql/migrations/2026-10-21_v2_15_hardcoded_send_push_endpoint.sql");
 const MIGRATION_V216 = read("sql/migrations/2026-10-22_v2_16_send_push_live_state.sql");
 const MIGRATION_V217 = read("sql/migrations/2026-10-23_v2_17_push_delivery_endpoint_and_net_diagnostics.sql");
+const MIGRATION_V218 = read("sql/migrations/2026-10-24_v2_18_push_path_verdict_and_self_healing.sql");
 
 // القيم المعتمدة (مُضمَّنة في الكود — بلا Vault).
 const EXPECTED_URL = "https://gqocavvhkfzgxzscrjms.supabase.co/functions/v1/send-push";
@@ -387,6 +388,26 @@ check("v2.17: التريغر يتبع نقطة التسليم البديلة (ب
   altCall?.url === "https://relay.example.workers.dev/" && altCall?.headers?.["x-send-push-secret"] === HARDCODED_SECRET,
   String(altCall?.url));
 await db.query("select public.push_set_delivery_url(null)");
+
+/* ---------- ⑨ v2.18: الحكم الحاسم + الإصلاح الذاتي ---------- */
+await db.exec(MIGRATION_V218);
+const verdict218 = (await db.query("select public.push_path_verdict(false) v")).rows[0].v;
+check("v2.18: push_path_verdict يفحص مرشّحات التسليم",
+  Array.isArray(verdict218?.candidates) && verdict218.candidates.length >= 2,
+  JSON.stringify((verdict218?.candidates || []).map((c) => c.label)));
+check("v2.18: كل مرشّح يحمل url + hint + status_code",
+  (verdict218?.candidates || []).every((c) => c.url && c.hint && c.status_code !== undefined));
+check("v2.18: المسبار العام مبلَّغ", typeof verdict218?.internet_reachable === "boolean");
+const gw218 = (await db.query("select public.push_gateway_check() g")).rows[0].g;
+check("v2.18: push_gateway_check بلا Vault وتعرض وجهة التسليم",
+  gw218?.vault_dependency === false && gw218?.secret_hardcoded === true && !!gw218?.delivery_url,
+  JSON.stringify(gw218 || {}));
+// الإصلاح الذاتي: حذف الدالة ثم إعادة تطبيق الهجرة ⇒ تُنشأ من جديد
+await db.exec("drop function if exists public.push_gateway_check()");
+await db.exec(MIGRATION_V218);
+const gw218b = (await db.query("select public.push_gateway_check() g")).rows[0].g;
+check("v2.18: الإصلاح الذاتي يُعيد إنشاء الدالة الناقصة",
+  gw218b?.vault_dependency === false && gw218b?.url_ok === true, JSON.stringify(gw218b || {}));
 
 /* ---------- النتيجة ---------- */
 if (fails) {
