@@ -79,8 +79,8 @@ if (requested === "static") {
     !/push_call_edge/.test(migration) && !/net\.http_post/.test(migration));
   check("الهجرة تُبقي دليل المستخدمين (admin_directory_search)",
     /create or replace function public\.admin_directory_search\(/.test(migration));
-  check("schema.sql لا يحوي trigger المستخدم الجديد",
-    !/create trigger on_profile_created_notify_admins/.test(schema));
+  check("schema.sql يحوي trigger المستخدم الجديد (on_profile_created_notify_admins)",
+    /create trigger on_profile_created_notify_admins/.test(schema));
   check("schema.sql يحوي admin_directory_search",
     /create or replace function public\.admin_directory_search\(/.test(schema));
   check("schema.sql لا يحوي admin_recipient_ids (حُذفت مع مسار الإشعارات)",
@@ -116,8 +116,8 @@ if (requested === "static") {
     /priority: "high"/.test(sendPush));
   check("send-push يتخطّى بلا مشرف أو بلا توكن",
     /skipped: "no admins"/.test(sendPush) && /skipped: "no fcm token"/.test(sendPush));
-  check("send-push موثّق لجدول profiles عبر Database Webhook",
-    /profiles/.test(sendPush) && /Database Webhook/i.test(sendPush));
+  check("send-push موثّق لجدول profiles عبر تريگر القاعدة / Webhook",
+    /profiles/.test(sendPush) && (/Database Webhook/i.test(sendPush) || /on_profile_created_notify_admins/.test(sendPush)));
 
   // --- Service Worker ---
   check("SW version مُحدَّث", /SW_BUILD = "2026-10-15\.2"/.test(sw));
