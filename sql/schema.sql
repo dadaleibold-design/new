@@ -33,11 +33,14 @@ DROP FUNCTION IF EXISTS public.push_recipient_allowed(text, uuid, uuid, jsonb) C
 DROP FUNCTION IF EXISTS public.push_skip_note(text, uuid) CASCADE;
 DROP FUNCTION IF EXISTS public.conversation_direct_recipient(uuid, uuid) CASCADE;
 DROP FUNCTION IF EXISTS public.admin_recipient_ids() CASCADE;
+DROP FUNCTION IF EXISTS public.handle_new_message_notification() CASCADE;
+DROP FUNCTION IF EXISTS public.handle_new_message_push() CASCADE;
 DROP FUNCTION IF EXISTS public.notify_new_message() CASCADE;
 DROP FUNCTION IF EXISTS public.notify_call_room() CASCADE;
 DROP FUNCTION IF EXISTS public.notify_admins_new_profile() CASCADE;
 DROP TABLE IF EXISTS public.push_settings CASCADE;
 DROP TRIGGER IF EXISTS on_message_inserted ON public.messages;
+DROP TRIGGER IF EXISTS send_fcm_on_new_message ON public.messages;
 DROP TRIGGER IF EXISTS on_call_room_notify ON public.call_rooms;
 DROP TRIGGER IF EXISTS on_profile_created_notify_admins ON public.profiles;
 DROP FUNCTION IF EXISTS public.admin_directory_search(text, integer, integer) CASCADE;
@@ -2302,61 +2305,28 @@ grant execute on function public.expire_stale_ringing_calls_for_conversation(uui
 
 
 -- ============================================================================
--- 26. الإصدار v3.0 (2026-10-26): الإشعارات عبر Supabase Database Webhooks فقط
+-- 26. الإصدار v3.0 (2026-10-26): إشعارات الخلفية البسيطة عبر pg_net وتريگرات قاعدة البيانات
 -- ----------------------------------------------------------------------------
--- 📌 القرار المعماري (نهائي):
---    قاعدة البيانات **لا تُجري أي طلب HTTP**. لا pg_net، لا Vault، لا تريگرات
---    إشعارات، لا Cloudflare Worker وسيط، لا أسرار أو روابط مخزَّنة في القاعدة.
---    السبب: حاوية القاعدة في هذا المشروع معزولة شبكياً (فشل تحليل DNS لكل
---    نطاق supabase.co) — وأي محاولة إرسال من داخل القاعدة تفشل بصمت.
---
--- ✅ المسار الوحيد المعتمد:
---
---    INSERT/UPDATE على الجداول أدناه
---          │
---          ▼  (Supabase Database Webhook — مُدار سحابياً في لوحة التحكم)
---    POST https://<project-ref>.supabase.co/functions/v1/send-push
---          │  الترويسة: x-send-push-secret: <SEND_PUSH_SECRET>
---          ▼
---    Edge Function send-push  (supabase/functions/send-push)
---          │  Firebase Admin من متغيرات البيئة فقط
---          ▼
---    FCM HTTP v1  ──►  firebase-messaging-sw.js  ──►  إشعار النظام
---
---    • لا يوجد أي إعداد إشعارات مطلوب داخل SQL — الـ Webhook يُنشأ من لوحة
---      Supabase:  Database → Webhooks → Create a new hook
---      الاسم        | الجدول        | الأحداث          | النوع
---      -------------|---------------|------------------|----------------
---      push_message | messages      | INSERT           | Supabase Edge Function → send-push
---      push_call    | call_rooms    | INSERT + UPDATE  | Supabase Edge Function → send-push
---      push_signup  | profiles      | INSERT           | Supabase Edge Function → send-push
---      (أو HTTP Request إلى نفس الرابط مع ترويسة السرّ أعلاه.)
---
---    • الحمولة التي ترسلها Supabase تلقائياً:
---        { "type": "INSERT"|"UPDATE"|"DELETE",
---          "table": "messages"|"call_rooms"|"profiles",
---          "schema": "public",
---          "record": { ...الصف الجديد... },
---          "old_record": { ...الصف القديم أو null... } }
---      ودالة send-push تتعرّف على الحدث من (table, type) وتستخرج المستلم من
---      سجلّ المحادثة/الغرفة نفسه — لا تثق بأي معرّف مستلم قادم من الحمولة.
---
--- 🔎 التشخيص: سجل التسليم push_delivery_log يكتبه الـ Edge Function وحده
---    (service_role). للفحص من SQL Editor:
---      select kind, source, sent, total, skipped, created_at
---        from public.push_delivery_log order by created_at desc limit 20;
---    وللفحص الكامل من التطبيق: زر «اختبار الإشعارات» يستدعي
---      POST /functions/v1/send-push  { "type": "diagnostics" }
+-- 📌 القرار المعماري (مطابق لإعدادات المشروع العامل البسيطة):
+--    • امتداد pg_net مفعّل في المخطط العام (Async HTTP) — بلا Supabase Vault.
+--    • تريگر send_fcm_on_new_message على جدول messages يستدعي دالة
+--      handle_new_message_notification (مع وجود notify_new_message و
+--      handle_new_message_push للتوافق الكامل).
+--    • تريگرات المكالمات (on_call_room_notify) والمستخدمين الجدد
+--      (on_profile_created_notify_admins) تعمل تلقائياً من داخل SQL.
+--    • الرابط الصحيح لدالة المشروع:
+--      https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push
+--      (إصلاح الخطأ الإملائي القديم gqocavvhkfzgxzscrjms الذي كان يسبب فشل DNS).
+--    • لا حاجة لإنشاء أي Database Webhook يدوياً في لوحة تحكم Supabase.
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
--- 26.1 تنظيف نهائي لأي بقايا من الجيل القديم (idempotent)
+-- 26.1 تنظيف البقايا المعقدة القديمة (دوال المسبار/Vault/push_settings)
 -- ---------------------------------------------------------------------------
 do $$
 declare
   r record;
 begin
-  -- تريگرات الإشعارات القديمة (كانت تستدعي net.http_post)
   for r in
     select t.tgname, c.relname
     from pg_trigger t
@@ -2364,14 +2334,17 @@ begin
     join pg_namespace n on n.oid = c.relnamespace
     where n.nspname = 'public'
       and not t.tgisinternal
-      and t.tgname in ('on_message_inserted', 'on_call_room_notify',
-                       'on_profile_created_notify_admins')
+      and t.tgname in (
+        'on_message_inserted',
+        'send_fcm_on_new_message',
+        'on_call_room_notify',
+        'on_profile_created_notify_admins'
+      )
   loop
     execute format('drop trigger if exists %I on public.%I', r.tgname, r.relname);
   end loop;
 end $$;
 
--- الدوال القديمة (بأي توقيع) — لا تُترك نسخة واحدة في القاعدة
 do $$
 declare
   r record;
@@ -2382,6 +2355,7 @@ begin
     join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'public'
       and p.proname in (
+        'handle_new_message_notification', 'handle_new_message_push',
         'notify_new_message', 'notify_call_room', 'notify_admins_new_profile',
         'push_call_edge', 'trigger_send_push_notification',
         'push_probe', 'push_probe_result', 'push_probe_endpoint',
@@ -2399,22 +2373,280 @@ begin
   end loop;
 end $$;
 
--- جدول إعدادات الوجهة/الوضع (v2.17–v2.19) لم يبق له معنى: الوجهة في الـ Webhook
 drop table if exists public.push_settings cascade;
 
--- امتداد pg_net: يُزال إن كان مثبّتاً (لا اعتماد عليه إطلاقاً من الآن)
+-- ---------------------------------------------------------------------------
+-- 26.2 تفعيل امتداد pg_net (Async HTTP) — مطابق لإعدادات المشروع العامل
+-- ---------------------------------------------------------------------------
 do $$
 begin
-  if exists (select 1 from pg_extension where extname = 'pg_net') then
-    execute 'drop extension pg_net';
-    raise notice 'v3.0: أُزيل امتداد pg_net — الإشعارات تمرّ عبر Database Webhooks فقط.';
-  end if;
-exception when others then
-  raise notice 'v3.0: تعذّر إزالة امتداد pg_net (قد يملكه دور آخر) — أزله يدوياً: drop extension pg_net;';
+  begin
+    create extension if not exists pg_net with schema public;
+  exception when others then
+    begin
+      create extension if not exists pg_net;
+    exception when others then
+      raise notice 'pg_net غير متاح في هذه البيئة (تخطّي): %', sqlerrm;
+    end;
+  end;
 end $$;
 
 -- ---------------------------------------------------------------------------
--- 26.2 سجل التسليم (يكتبه Edge Function بـ service_role فقط)
+-- 26.3 دوال وتريگرات إشعارات الخلفية البسيطة (SECURITY DEFINER + pg_net)
+-- ---------------------------------------------------------------------------
+
+-- (أ) إشعار الرسائل الجديدة — الدالة الأساسية للتريگر send_fcm_on_new_message
+create or replace function public.handle_new_message_notification()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, net, extensions
+as $$
+declare
+  v_url text := 'https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
+begin
+  -- بطاقات المكالمات داخل جدول الرسائل يتكفّل بها تريگر call_rooms
+  if coalesce(new.message_type, 'text') = 'call' then
+    return new;
+  end if;
+
+  begin
+    perform net.http_post(
+      url := v_url,
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'x-send-push-secret', v_secret
+      ),
+      body := jsonb_build_object(
+        'type', 'INSERT',
+        'table', 'messages',
+        'schema', 'public',
+        'record', to_jsonb(new),
+        'message_id', new.id,
+        'conversation_id', new.conversation_id,
+        'sender_id', new.sender_id,
+        'content', new.content,
+        'message_type', coalesce(new.message_type, 'text'),
+        'attachment_type', new.attachment_type
+      ),
+      timeout_milliseconds := 8000
+    );
+  exception when others then
+    raise warning '[send_fcm_on_new_message] pg_net skipped: %', sqlerrm;
+  end;
+
+  return new;
+end;
+$$;
+
+-- دوال مرادفة في المخطط العام للتوافق الكامل مع إعدادات المشروع العامل
+create or replace function public.handle_new_message_push()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, net, extensions
+as $$
+declare
+  v_url text := 'https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
+begin
+  if coalesce(new.message_type, 'text') = 'call' then
+    return new;
+  end if;
+
+  begin
+    perform net.http_post(
+      url := v_url,
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'x-send-push-secret', v_secret
+      ),
+      body := jsonb_build_object(
+        'type', 'INSERT',
+        'table', 'messages',
+        'schema', 'public',
+        'record', to_jsonb(new),
+        'message_id', new.id,
+        'conversation_id', new.conversation_id,
+        'sender_id', new.sender_id,
+        'content', new.content,
+        'message_type', coalesce(new.message_type, 'text'),
+        'attachment_type', new.attachment_type
+      ),
+      timeout_milliseconds := 8000
+    );
+  exception when others then
+    raise warning '[handle_new_message_push] pg_net skipped: %', sqlerrm;
+  end;
+
+  return new;
+end;
+$$;
+
+create or replace function public.notify_new_message()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, net, extensions
+as $$
+declare
+  v_url text := 'https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
+begin
+  if coalesce(new.message_type, 'text') = 'call' then
+    return new;
+  end if;
+
+  begin
+    perform net.http_post(
+      url := v_url,
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'x-send-push-secret', v_secret
+      ),
+      body := jsonb_build_object(
+        'type', 'INSERT',
+        'table', 'messages',
+        'schema', 'public',
+        'record', to_jsonb(new),
+        'message_id', new.id,
+        'conversation_id', new.conversation_id,
+        'sender_id', new.sender_id,
+        'content', new.content,
+        'message_type', coalesce(new.message_type, 'text'),
+        'attachment_type', new.attachment_type
+      ),
+      timeout_milliseconds := 8000
+    );
+  exception when others then
+    raise warning '[notify_new_message] pg_net skipped: %', sqlerrm;
+  end;
+
+  return new;
+end;
+$$;
+
+-- (ب) إشعار المكالمات الواردة وانتهائها
+create or replace function public.notify_call_room()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, net, extensions
+as $$
+declare
+  v_url text := 'https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
+begin
+  if tg_op = 'INSERT' then
+    if coalesce(new.status, '') <> 'ringing' then
+      return new;
+    end if;
+  elsif tg_op = 'UPDATE' then
+    if new.status is not distinct from old.status then
+      return new;
+    end if;
+    if coalesce(new.status, '') not in ('missed', 'ended', 'declined', 'failed', 'network_lost') then
+      return new;
+    end if;
+  else
+    return new;
+  end if;
+
+  begin
+    perform net.http_post(
+      url := v_url,
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'x-send-push-secret', v_secret
+      ),
+      body := jsonb_build_object(
+        'type', tg_op,
+        'table', 'call_rooms',
+        'schema', 'public',
+        'record', to_jsonb(new),
+        'old_record', case when tg_op = 'UPDATE' then to_jsonb(old) else null end,
+        'room_id', new.id,
+        'conversation_id', new.conversation_id,
+        'caller_id', new.caller_id,
+        'callee_id', new.callee_id,
+        'call_type', new.call_type,
+        'status', new.status
+      ),
+      timeout_milliseconds := 8000
+    );
+  exception when others then
+    raise warning '[on_call_room_notify] pg_net skipped: %', sqlerrm;
+  end;
+
+  return new;
+end;
+$$;
+
+-- (ج) إشعار المشرفين عند تسجيل مستخدم جديد
+create or replace function public.notify_admins_new_profile()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, net, extensions
+as $$
+declare
+  v_url text := 'https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push';
+  v_secret text := 'my_send_push_19921121_almgawell_19921121';
+begin
+  begin
+    perform net.http_post(
+      url := v_url,
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'x-send-push-secret', v_secret
+      ),
+      body := jsonb_build_object(
+        'type', 'INSERT',
+        'table', 'profiles',
+        'schema', 'public',
+        'record', to_jsonb(new),
+        'user_id', new.id,
+        'display_name', new.display_name,
+        'email', new.email,
+        'phone', new.phone
+      ),
+      timeout_milliseconds := 8000
+    );
+  exception when others then
+    raise warning '[on_profile_created_notify_admins] pg_net skipped: %', sqlerrm;
+  end;
+
+  return new;
+end;
+$$;
+
+-- سحب صلاحية الاستدعاء المباشر عبر RPC من الأدوار العامة
+revoke all on function public.handle_new_message_notification() from public, anon, authenticated;
+revoke all on function public.handle_new_message_push() from public, anon, authenticated;
+revoke all on function public.notify_new_message() from public, anon, authenticated;
+revoke all on function public.notify_call_room() from public, anon, authenticated;
+revoke all on function public.notify_admins_new_profile() from public, anon, authenticated;
+
+-- إنشاء التريگرات على الجداول (مطابق للصورة: send_fcm_on_new_message → handle_new_message_notification)
+drop trigger if exists on_message_inserted on public.messages;
+drop trigger if exists send_fcm_on_new_message on public.messages;
+create trigger send_fcm_on_new_message
+  after insert on public.messages
+  for each row execute function public.handle_new_message_notification();
+
+drop trigger if exists on_call_room_notify on public.call_rooms;
+create trigger on_call_room_notify
+  after insert or update on public.call_rooms
+  for each row execute function public.notify_call_room();
+
+drop trigger if exists on_profile_created_notify_admins on public.profiles;
+create trigger on_profile_created_notify_admins
+  after insert on public.profiles
+  for each row execute function public.notify_admins_new_profile();
+
+-- ---------------------------------------------------------------------------
+-- 26.4 سجل التسليم (يكتبه Edge Function بـ service_role فقط)
 -- ---------------------------------------------------------------------------
 drop table if exists public.push_delivery_log cascade;
 
@@ -2423,7 +2655,7 @@ create table public.push_delivery_log (
   kind text not null,                                -- new_message | incoming_call | call_ended | new_user | test | probe
   ref_id uuid,                                       -- message_id / room_id / profile_id
   recipient_id uuid,                                 -- المستلم الفعلي (فردي) — null للإشعار الجماعي
-  source text not null default 'webhook',            -- webhook | manual | client
+  source text not null default 'webhook',            -- webhook | trigger | manual
   sent integer not null default 0,                   -- أجهزة نجح إرسالها
   total integer not null default 0,                  -- أجهزة حاولنا الإرسال إليها
   skipped text,                                      -- سبب التخطي (إن وُجد)
@@ -2432,7 +2664,7 @@ create table public.push_delivery_log (
 );
 
 comment on table public.push_delivery_log is
-'سجل تسليم إشعارات FCM — يكتبه Edge Function send-push بـ service_role بعد كل حدث Webhook. لا تكتب فيه أي دالة أو تريگر داخل القاعدة (v3.0).';
+'سجل تسليم إشعارات FCM — يكتبه Edge Function send-push بـ service_role بعد كل حدث.';
 
 create index if not exists idx_push_log_created_at on public.push_delivery_log (created_at desc);
 create index if not exists idx_push_log_recipient on public.push_delivery_log (recipient_id, created_at desc);
@@ -2466,18 +2698,3 @@ begin
     execute 'grant execute on function public.prune_push_delivery_log(integer) to service_role';
   end if;
 end $$;
-
--- ---------------------------------------------------------------------------
--- 26.3 ملاحظات تشغيلية
--- ---------------------------------------------------------------------------
--- • أسرار Firebase (FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL /
---   FIREBASE_PRIVATE_KEY أو FIREBASE_SERVICE_ACCOUNT) تُضبط كأسرار الدالة:
---       supabase secrets set --env-file .env
---   ولا تُخزَّن في القاعدة بأي شكل.
--- • SEND_PUSH_SECRET يُضبط مرة واحدة في أسرار الدالة، ويُدخل نفسه في ترويسة
---   الـ Webhook من لوحة Supabase. تغييره = تحديث مكانين فقط.
--- • الدالة منشورة بـ verify_jwt = false (supabase/config.toml) لأن الـ Webhook
---   لا يحمل JWT مستخدم؛ المصادقة عبر x-send-push-secret.
--- • بعد تطبيق هذا الملف:  Database → Webhooks → تأكد أن الروابط الثلاثة
---   (push_message / push_call / push_signup) تشير إلى
---   https://<project-ref>.supabase.co/functions/v1/send-push

@@ -128,23 +128,23 @@ npm run env:check   # التأكد من وجود كل متغيرات البيئ�
 الإشعارات الحالية تستخدم **FCM Web Push** مع Supabase Edge Function `send-push`؛ أما جدول
 `push_subscriptions` فهو بقايا مسار Web Push القديم ولا يدخل في مسار FCM الحالي.
 
-### آلية العمل الحالية (v3.0 — Database Webhooks فقط)
-- **قاعدة البيانات لا تُرسل إشعارات إطلاقاً**: لا `pg_net`، لا `net.http_post`، لا Vault،
-  ولا تريگرات إشعارات. القاعدة تكتب الصف فقط وتنتهي مسؤوليتها.
-- **Supabase Database Webhook** (يُدار من لوحة التحكم) يرصد `INSERT` على `messages`،
-  و`INSERT/UPDATE` على `call_rooms`، و`INSERT` على `profiles`، ويُنادي
-  `POST /functions/v1/send-push` بالحمولة الأصلية
-  `{ type, table, schema, record, old_record }`.
+### آلية العمل الحالية (تريگرات قاعدة البيانات البسيطة + `pg_net` — بلا Webhook يدوي وبلا Vault)
+- **تفعيل تلقائي بالكامل من داخل SQL**: امتداد `pg_net` مفعّل في المخطط العام (`Async HTTP`)،
+  وتريگر `send_fcm_on_new_message` على جدول `messages` يستدعي دالة
+  `handle_new_message_notification` (مع وجود `handle_new_message_push` و`notify_new_message`
+  للتوافق الكامل مع إعدادات المشروع العامل)، بالإضافة إلى تريگر `on_call_room_notify` على
+  `call_rooms` وتريگر `on_profile_created_notify_admins` على `profiles`.
+- **لا حاجة لإنشاء Database Webhooks يدوياً** من لوحة تحكم Supabase، ولا حاجة لـ Supabase Vault.
+- **الرابط الصحيح לדالة المشروع**: `https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push`
+  (تم إصلاح الخطأ الإملائي القديم `gqocavvhkfzgxzscrjms` الذي كان يسبّب فشل DNS `Couldn't resolve host name`).
 - `supabase/functions/send-push/index.ts` هي **الجهة الوحيدة** التي تفهم الحدث وتختار
   المستلم وتتحدث مع FCM. لا تثق بأي `recipient_id` قادم من الحمولة (تعارض ⇒ 409).
-- `supabase/functions/send-push/recipients.ts` تحمل قواعد العزل النقية (بديل دوال SQL
-  القديمة): رسالة ⇒ الطرف الآخر في نفس صف المحادثة، رنين ⇒ `callee_id` فقط وخلال
-  نافذة دقيقتين، مستخدم جديد ⇒ المشرفون فقط.
-- `supabase/functions/send-push/webhook.ts` تُطبِّع الحمولة وتتجاهل ما لا يخصّها
-  (تحديثات `messages` غير المتعلقة، غرف بحالة غير نهائية، مخطط غير `public`).
+- `supabase/functions/send-push/recipients.ts` تحمل قواعد العزل النقية: رسالة ⇒ الطرف الآخر
+  في نفس صف المحادثة، رنين ⇒ `callee_id` فقط وخلال نافذة دقيقتين، مستخدم جديد ⇒ المشرفون فقط.
+- `supabase/functions/send-push/webhook.ts` تُطبِّع الحمولة (سواء من تريگر `pg_net` القياسي أو
+  الحمولة المسطّحة البسيطة `{ message_id, conversation_id, sender_id, content }`) وتتجاهل ما لا يخصّها.
 - `js/push.js`: يهيّئ Firebase SDK، يطلب الإذن، ويسجّل `firebase-messaging-sw.js`،
   ويرسل **إشعاراً تجريبياً/تشخيصاً فقط** (`type: "test"` / `type: "diagnostics"`).
-  **لا يوجد أي إرسال إشعارات من المتصفح** ولا سرّ مشترك في الحزمة.
 - `firebase-messaging-sw.js`: مستمع `push` الخام هو المسؤول الوحيد عن الإشعار في
   الخلفية؛ يقرأ `data` ويعرضه عبر `registration.showNotification()`.
 - كل جهاز/متصفح له صف مستقل في `fcm_tokens`، وتقرأ الدالة التوكنات وتحذف الميت منها
@@ -516,39 +516,31 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   فتعمل اختبارات PostgreSQL فعلياً في `npm ci` (كانت تتخطّى صامتةً).
 - **الاختبار**: `npm run test:rls` (تدقيق العزل والصلاحيات على PostgreSQL حقيقي) ضمن `npm test`.
 
-## الإصدار v3.0 — إزالة الإشعارات من قاعدة البيانات (Database Webhooks فقط)
+## الإصدار v3.0 — تفعيل إشعارات الخلفية البسيطة عبر `pg_net` وتريگرات قاعدة البيانات
 
 الهجرة: `sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql` — آمنة لإعادة التنفيذ،
-ولا تحذف أي بيانات محادثات أو مستخدمين. الاستثناء الوحيد: `push_delivery_log` يُعاد
-إنشاؤه بالشكل الجديد (سجل تشخيصي فقط) فتُمحى سجلاته القديمة.
+ولا تحذف أي بيانات محادثات أو مستخدمين.
 
-### ما أُزيل نهائياً
-- **pg_net / `net.http_post`**: لا يستدعيها أي ملف SQL. الهجرة تُسقط الامتداد إن وُجد.
-- **Supabase Vault**: صفر قراءة لـ `vault.decrypted_secrets` / `vault.secrets`.
-  لم يبقَ أي سرّ أو رابط إشعارات مخزَّن في القاعدة.
-- **تريگرات الإشعارات**: `on_message_inserted` / `on_call_room_notify` /
-  `on_profile_created_notify_admins` — أُزيلت من المخطط وكل الهجرات.
-- **دوال الجيل القديم**: `push_call_edge` · `trigger_send_push_notification` ·
-  `notify_new_message` · `notify_call_room` · `notify_admins_new_profile` ·
-  `push_probe`/`push_probe_result` · `push_gateway_check` · `push_egress_check` ·
-  `push_net_diagnostics` · `push_path_verdict` · `push_delivery_url` ·
-  `push_set_delivery_url` · `push_mode`/`push_set_mode` · `push_recipient_allowed` ·
-  `push_skip_note` · `conversation_direct_recipient` · `admin_recipient_ids` ·
-  `push_diagnostics` · جدول `push_settings`.
-- **Cloudflare Worker**: `worker/send-push-relay.js` واختباراته.
-- **مسار العميل**: `js/clientPush.js` و`VITE_SEND_PUSH_SECRET` (صار الاسم ممنوعاً في
-  `scripts/generate-env.mjs` واختبار `tests/env-config.mjs`).
+### ما تم تفعيله (مطابق لإعدادات المشروع العامل البسيطة)
+- **امتداد `pg_net`**: مفعّل تلقائياً في المخطط العام (`create extension if not exists pg_net`).
+- **تريگرات ودوال الإشعارات البسيطة**:
+  - `send_fcm_on_new_message` على `public.messages` (`AFTER INSERT`) يستدعي `handle_new_message_notification()` (مع وجود `handle_new_message_push()` و`notify_new_message()` في المخطط العام).
+  - `on_call_room_notify` على `public.call_rooms` (`AFTER INSERT OR UPDATE`) يستدعي `notify_call_room()`.
+  - `on_profile_created_notify_admins` على `public.profiles` (`AFTER INSERT`) يستدعي `notify_admins_new_profile()`.
+- **إصلاح رابط دالة المشروع**: جميع التريگرات تستدعي الرابط الصحيح `https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push` (تم إصلاح الخطأ الإملائي القديم `gqocavvhkfzgxzscrjms` الذي كان يسبّب فشل DNS).
+- **إزالة التعقيدات القديمة**: صفر اعتماد على Supabase Vault، صفر حاجة لإنشاء Database Webhooks يدوياً، وإزالة دوال المسبار المعقدة (`push_probe`، `push_call_edge`، `push_settings`).
 
-### ما حلّ مكانه
+### الطبقات الحالية
 | الطبقة | الملف | المسؤولية |
 |---|---|---|
-| تطبيع الحدث | `supabase/functions/send-push/webhook.ts` | تحويل حمولة Webhook إلى `PushEvent` |
+| تريگرات القاعدة | `sql/schema.sql` (§26) | `send_fcm_on_new_message` + `pg_net` |
+| تطبيع الحدث | `supabase/functions/send-push/webhook.ts` | تحويل حمولة التريگر/Webhook إلى `PushEvent` |
 | قواعد المستلم | `supabase/functions/send-push/recipients.ts` | عزل الرسائل/المكالمات/المشرفين |
 | الإرسال | `supabase/functions/send-push/index.ts` | FCM HTTP v1 + `push_delivery_log` |
 | الإعداد | `supabase/config.toml` | `verify_jwt = false` + ترويسة السرّ |
 | الواجهة | `js/push.js` | `test` + `diagnostics` فقط |
 
-### سجل التسليم الجديد
+### سجل التسليم
 `push_delivery_log(kind, ref_id, recipient_id, source, sent, total, skipped, detail, created_at)`
 بـ RLS وقراءة للمشرفين فقط، ولا سياسة كتابة لأي عميل. تُنظَّف بدالة
 `prune_push_delivery_log(keep_days)` المحجوزة على `service_role`.

@@ -218,14 +218,16 @@ FCM_LOG.length = 0;
  * ============================================================ */
 {
   const { status, json } = await post({ type: "diagnostics" }, { Authorization: "Bearer user-jwt" });
-  check("diagnostics: 200 وأعلام القاعدة صفر", status === 200 &&
-    json?.database_notifications?.pg_net === false &&
+  check("diagnostics: 200 وتفعيل pg_net وتريگرات القاعدة البسيطة (بلا Vault)", status === 200 &&
+    json?.database_notifications?.pg_net === true &&
     json?.database_notifications?.vault === false &&
-    json?.database_notifications?.db_triggers === false, JSON.stringify(json?.database_notifications ?? null));
-  check("diagnostics: معمارية Database Webhooks + الهوكات المتوقعة",
-    json?.architecture === "supabase-database-webhooks" &&
+    json?.database_notifications?.db_triggers === true &&
+    Array.isArray(json?.database_notifications?.triggers) &&
+    json.database_notifications.triggers.includes("send_fcm_on_new_message"), JSON.stringify(json?.database_notifications ?? null));
+  check("diagnostics: معمارية pg_net + تريگرات القاعدة المتوقعة",
+    json?.architecture === "pg_net-database-triggers" &&
       JSON.stringify(json?.webhook?.expected_hooks?.map((h) => h.table)) === JSON.stringify(["messages", "call_rooms", "profiles"]));
-  check("diagnostics: سرّ الـ Webhook مضبوط وأجهزة الحساب = 2",
+  check("diagnostics: سرّ التريگر مضبوط وأجهزة الحساب = 2",
     json?.checks?.webhook_secret_ready === true && json?.me?.devices === 2);
   check("diagnostics: بلا JWT ⇒ 401", (await post({ type: "diagnostics" })).status === 401);
 }

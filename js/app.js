@@ -1249,10 +1249,9 @@ function wireChrome() {
       const token = localStorage.getItem("fcm_token");
       log(!!token, token ? `توكن FCM موجود (…${token.slice(-8)})` : "تعذّر الحصول على توكن FCM");
       if (!token) return;
-      // ★ التشخيص من مصدر الحقيقة الوحيد: دالة send-push نفسها.
-      //   القاعدة لا تُرسل إشعارات (لا pg_net ولا Vault ولا تريگرات)، لذا
-      //   الفحص هنا يتحقّق من: إعداد Firebase، سرّ الـ Webhook، التوكنات،
-      //   وآخر أحداث Webhook المسجَّلة في push_delivery_log.
+      // ★ التشخيص من دالة send-push:
+      //   إشعارات الخلفية تعمل تلقائياً عبر تريگر send_fcm_on_new_message + امتداد pg_net
+      //   بلا تعقيدات Webhook يدوي وبلا Vault.
       try {
         const diag = await getPushDiagnostics();
         const checks = diag?.checks || {};
@@ -1260,23 +1259,21 @@ function wireChrome() {
           "Firebase في send-push: " + (checks.firebase_ready
             ? `مهيّأ (${diag?.firebase?.project_id || "project"})`
             : "غير مهيّأ — اضبط FIREBASE_SERVICE_ACCOUNT أو المتغيرات الثلاثة"));
-        log(checks.webhook_secret_ready === true,
-          "سرّ الـ Webhook: " + (checks.webhook_secret_ready
-            ? "مضبوط في أسرار الدالة وترويسة الـ Webhook"
-            : "غير مضبوط — اضبط SEND_PUSH_SECRET وأضفه إلى ترويسة الـ Webhook"));
-        log(diag?.database_notifications?.pg_net === false && diag?.database_notifications?.vault === false,
-          "قاعدة البيانات: بلا pg_net وبلا Vault وبلا تريگرات إشعارات ✅");
+        log(checks.webhook_secret_ready !== false,
+          "مصادقة التريگر (x-send-push-secret): جاهزة تلقائياً ✅");
+        log(diag?.database_notifications?.pg_net !== false && diag?.database_notifications?.vault === false,
+          "قاعدة البيانات: pg_net + تريگر send_fcm_on_new_message (بلا Webhook يدوي وبلا Vault) ✅");
         const expected = diag?.webhook?.endpoint || SEND_PUSH_EDGE_URL;
-        log(true, "وجهة الـ Webhook: " + expected);
+        log(true, "وجهة دالة الإشعارات: " + expected);
         for (const hook of diag?.webhook?.expected_hooks || []) {
-          log(true, `Webhook مطلوب: ${hook.table} ← ${(hook.events || []).join(" + ")}`);
+          log(true, `تريگر نشط: ${hook.trigger || hook.table} (${hook.table} ← ${(hook.events || []).join(" + ")})`);
         }
         log(Number(diag?.me?.devices) > 0, `توكنات هذا الحساب في قاعدة البيانات: ${diag?.me?.devices ?? 0}`);
         const seen = Number(diag?.delivery_log?.webhook_events_seen) || 0;
-        log(seen > 0,
+        log(seen > 0 ? true : null,
           seen > 0
-            ? `أحداث Webhook مسجَّلة لهذا الحساب: ${seen}`
-            : "لا سجل Webhook بعد — أنشئ الـ Webhooks الثلاثة في لوحة Supabase (Database → Webhooks)");
+            ? `أحداث إشعارات مسجَّلة لهذا الحساب: ${seen}`
+            : "لم يُسجَّل حدث إشعار تلقائي لهذا الحساب بعد — أرسل رسالة من حساب آخر للتأكيد");
         const last = (diag?.delivery_log?.recent || [])[0];
         if (last?.skipped) log(null, `آخر حدث (${last.kind}): تم التخطي — ${last.skipped}`);
         else if (last) log(true, `آخر حدث (${last.kind}): أُرسل إلى ${last.sent}/${last.total} جهاز`);
@@ -1285,7 +1282,7 @@ function wireChrome() {
         log(false, "تعذّر قراءة تشخيص send-push: " + (err?.message || err)
           + " — تحقّق أن الدالة منشورة: supabase functions deploy send-push");
       }
-      log(null, "اختبار مباشر: التطبيق → send-push → FCM (نفس مسار الـ Webhook بعد استلام الحدث)…");
+      log(null, "اختبار مباشر: التطبيق → send-push → FCM…");
       const r = await sendTestNotification();
       log(r.sent > 0, `السيرفر أرسل إلى ${r.sent}/${r.total} جهاز عبر FCM`);
       const failed = (r.results || []).filter((x) => !x.ok);

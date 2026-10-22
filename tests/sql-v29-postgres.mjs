@@ -86,7 +86,7 @@ check("المكالمة: طرفا الغرفة يجب أن يكونا طرفي �
     callPartiesBelongToConversation(CONV_A, USER_A, USER_B) === false);
 
 /* ============================================================
- * ② قاعدة البيانات: صفر مسار إشعارات
+ * ② قاعدة البيانات: إشعارات الخلفية البسيطة عبر pg_net وتريگرات القاعدة (بلا Vault)
  * ============================================================ */
 const stripSql = (sql) => String(sql).replace(/--[^\n]*/g, " ");
 const MIGRATIONS = fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => ({
@@ -95,8 +95,11 @@ const MIGRATIONS = fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => 
 }));
 const ALL_CODE = stripSql(SCHEMA) + "\n" + MIGRATIONS.map((m) => m.code).join("\n");
 
-check("لا create extension pg_net في أي ملف SQL", !/create extension[^;]*pg_net/i.test(ALL_CODE));
-check("لا net.http_post في أي ملف SQL", !/net\.http_post/.test(ALL_CODE));
+check("تفعيل امتداد pg_net في schema.sql وهجرة v3.0", /create extension if not exists pg_net/i.test(ALL_CODE));
+check("استدعاء net.http_post بالرابط الصحيح للمشروع في SQL",
+  /net\.http_post/.test(ALL_CODE) &&
+  ALL_CODE.includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push") &&
+  !ALL_CODE.includes("gqocavvhkfzgxzscrjms"));
 check("لا قراءة من Vault في أي ملف SQL", !/vault\.(decrypted_secrets|secrets)/.test(ALL_CODE));
 const LEGACY = [
   "push_call_edge", "trigger_send_push_notification", "push_probe",
@@ -104,13 +107,14 @@ const LEGACY = [
   "push_path_verdict", "push_delivery_url", "push_set_delivery_url",
   "push_mode", "push_set_mode", "push_recipient_allowed", "push_skip_note",
   "conversation_direct_recipient", "admin_recipient_ids", "push_diagnostics",
-  "notify_new_message", "notify_call_room", "notify_admins_new_profile",
 ];
 const defRe = (fn) => new RegExp(`create (or replace )?function public\\.${fn}\\s*\\(`);
 const defined = LEGACY.filter((fn) => defRe(fn).test(ALL_CODE));
-check("لا تعريف لأي دالة إشعارات قديمة في SQL", defined.length === 0, defined.join(","));
-check("لا تريگرات إشعارات في SQL",
-  !/create trigger (on_message_inserted|on_call_room_notify|on_profile_created_notify_admins)/.test(ALL_CODE));
+check("لا تعريف لأي دالة إشعارات قديمة (push_*) في SQL", defined.length === 0, defined.join(","));
+check("تريگرات الإشعارات البسيطة موجودة في SQL (send_fcm_on_new_message)",
+  /create trigger send_fcm_on_new_message/.test(ALL_CODE) &&
+  /create trigger on_call_room_notify/.test(ALL_CODE) &&
+  /create trigger on_profile_created_notify_admins/.test(ALL_CODE));
 
 /* ============================================================
  * ③ هجرة v3.0 على مخطط كامل (PGlite)
@@ -149,13 +153,22 @@ try {
   process.exit(1);
 }
 
-const noPushFns = async (client) =>
+const legacyPushFns = async (client) =>
   (
     await client.query(`select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-      where n.nspname='public' and (p.proname like 'push_%' or p.proname like 'notify_%')`)
+      where n.nspname='public' and p.proname like 'push_%'`)
   ).rows.map((r) => r.proname);
-check("schema.sql لا يُنشئ أي دالة push_*/notify_*",
-  (await noPushFns(db)).length === 0, (await noPushFns(db)).join(","));
+const activeNotifyFns = async (client) =>
+  (
+    await client.query(`select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname='public' and p.proname in (
+        'handle_new_message_notification', 'handle_new_message_push',
+        'notify_new_message', 'notify_call_room', 'notify_admins_new_profile'
+      ) order by p.proname`)
+  ).rows.map((r) => r.proname);
+
+check("schema.sql لا يُنشئ أي دالة push_* قديمة",
+  (await legacyPushFns(db)).length === 0, (await legacyPushFns(db)).join(","));
 
 try {
   await db.exec(MIGRATION);
@@ -165,7 +178,8 @@ try {
   check("هجرة v3.0 تُنفَّذ مرتين بأمان (idempotent)", false, String(e.message).slice(0, 300));
 }
 
-check("لا دوال إشعارات بعد الهجرة", (await noPushFns(db)).length === 0);
+check("دوال الإشعارات البسيطة الخمس موجودة في القاعدة بعد الهجرة",
+  (await activeNotifyFns(db)).length === 5, (await activeNotifyFns(db)).join(","));
 
 /* ---------- سجل التسليم ---------- */
 const cols = (
@@ -225,16 +239,17 @@ const prunePriv = await db.query(`select
 check("prune_push_delivery_log ممنوعة على anon/authenticated",
   prunePriv.rows[0].anon_ok === false && prunePriv.rows[0].auth_ok === false);
 
-/* ---------- لا مسار HTTP من القاعدة ---------- */
+/* ---------- تريگرات الإشعارات البسيطة في القاعدة ---------- */
 const trigs = (
   await db.query(`select tgname from pg_trigger t join pg_class c on c.oid=t.tgrelid
     join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and not t.tgisinternal`)
 ).rows.map((r) => r.tgname);
-check("لا تريگر إشعارات على messages/call_rooms/profiles",
-  !trigs.some((t) => ["on_message_inserted", "on_call_room_notify", "on_profile_created_notify_admins"].includes(t)),
+check("تريگر send_fcm_on_new_message وتريگرات المكالمات والمستخدمين نشطة",
+  ["send_fcm_on_new_message", "on_call_room_notify", "on_profile_created_notify_admins"].every((t) => trigs.includes(t)) &&
+    !trigs.includes("on_message_inserted"),
   trigs.join(","));
 check("تريگرات المحادثة/الطوابع الزمنية غير المتعلقة بالإشعارات باقية",
-  trigs.includes("on_message_hook") || trigs.length > 0);
+  trigs.includes("on_message_touch_conversation") || trigs.length > 0);
 
 console.log(fails ? `\n${fails} فحص فشل` : "\nكل فحوصات عزل الإشعارات (v3.0) نجحت");
 process.exit(fails ? 1 : 0);

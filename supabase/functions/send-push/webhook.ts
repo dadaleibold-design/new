@@ -1,22 +1,24 @@
 /**
- * webhook.ts — تطبيع حمولة Supabase Database Webhook إلى حدث إشعار واضح
+ * webhook.ts — تطبيع حمولة تريگر pg_net أو Supabase Webhook إلى حدث إشعار واضح
  * ==========================================================================
- * Supabase ترسل هذا الشكل تلقائياً عند كل حدث مُعرَّف في لوحة التحكم:
+ * يدعم كلاً من:
  *
+ * 1) الشكل القياسي المرسل من تريگر pg_net (handle_new_message_notification /
+ *    notify_new_message / notify_call_room / notify_admins_new_profile) أو Webhook:
  *   {
- *     "type": "INSERT" | "UPDATE" | "DELETE",
+ *     "type": "INSERT" | "UPDATE" | "DELETE" | "new_message" | "incoming_call" | "call_ended" | "new_user",
  *     "table": "messages" | "call_rooms" | "profiles",
  *     "schema": "public",
  *     "record": { ...الصف الجديد... },
  *     "old_record": { ...الصف القديم أو null... }
  *   }
  *
+ * 2) الشكل المسطّح المبسط (تريگر pg_net البسيط أو الاختبار اليدوي):
+ *   { "message_id": "...", "conversation_id": "...", "sender_id": "...", "content": "..." }
+ *   أو مع حقل "type": "new_message" | "incoming_call" | "call_ended" | "new_user"
+ *
  * هذه الوحدة **نقية** (بلا شبكة ولا قاعدة بيانات) لذلك تُختبر مباشرة في Node:
  *   node tests/notification-isolation.mjs
- *
- * كما تقبل — للاختبار اليدوي وcURL فقط — الشكل المسطّح القديم:
- *   { "type": "new_message", "message_id": "...", "conversation_id": "...", ... }
- * الذي يُغلَّف داخلياً إلى نفس الحدث. لا يوجد مسار عميل (client_*) بعد اليوم.
  */
 
 /** جداول الإشعارات المعتمدة (ما عداها يُرفض بـ 400). */
@@ -64,7 +66,7 @@ function str(value: unknown): string {
   return value === null || value === undefined ? "" : String(value);
 }
 
-/** هل الحمولة حمولة Database Webhook القياسية؟ */
+/** هل الحمولة تحمل record + table (تريگر pg_net أو Database Webhook)؟ */
 export function isWebhookPayload(input: unknown): boolean {
   return isObject(input) && isObject(input.record) && typeof input.table === "string";
 }
@@ -77,7 +79,7 @@ export function isWebhookPayload(input: unknown): boolean {
 export function normalizePayload(input: unknown): NormalizedEvent {
   if (!isObject(input)) return { ok: false, error: "invalid payload: expected a JSON object" };
 
-  // ① شكل Database Webhook القياسي
+  // ① شكل تريگر pg_net / Database Webhook القياسي (يحوي table + record)
   if (isWebhookPayload(input)) {
     if (input.schema && input.schema !== "public") {
       return { ok: false, ignored: `schema ${str(input.schema)} is not public` };
@@ -91,7 +93,9 @@ export function normalizePayload(input: unknown): NormalizedEvent {
     const oldRecord = isObject(input.old_record) ? input.old_record : null;
 
     if (table === "messages") {
-      if (op !== "INSERT") return { ok: false, ignored: `messages ${op || "?"}: notifications only on INSERT` };
+      if (op && op !== "INSERT" && op !== "NEW_MESSAGE") {
+        return { ok: false, ignored: `messages ${op || "?"}: notifications only on INSERT` };
+      }
       if (str(record.message_type) === "call") {
         return { ok: false, ignored: "call card message: its room notification owns the push" };
       }
@@ -99,16 +103,16 @@ export function normalizePayload(input: unknown): NormalizedEvent {
     }
 
     if (table === "call_rooms") {
-      if (op === "INSERT") {
+      if (op === "INSERT" || op === "INCOMING_CALL") {
         if (str(record.status) !== "ringing") {
           return { ok: false, ignored: `call room inserted with status ${str(record.status) || "?"}` };
         }
         return { ok: true, event: { kind: "incoming_call", record } };
       }
-      if (op === "UPDATE") {
+      if (op === "UPDATE" || op === "CALL_ENDED") {
         const next = str(record.status);
         const previous = oldRecord ? str(oldRecord.status) : "";
-        if (next === previous) return { ok: false, ignored: "call status unchanged" };
+        if (oldRecord && next === previous) return { ok: false, ignored: "call status unchanged" };
         if (!TERMINAL_CALL_STATUSES.includes(next as any)) {
           return { ok: false, ignored: `call status ${next || "?"} is not terminal` };
         }
@@ -118,31 +122,42 @@ export function normalizePayload(input: unknown): NormalizedEvent {
     }
 
     // profiles
-    if (op !== "INSERT") return { ok: false, ignored: `profiles ${op || "?"}: only INSERT notifies admins` };
+    if (op && op !== "INSERT" && op !== "NEW_USER") {
+      return { ok: false, ignored: `profiles ${op || "?"}: only INSERT notifies admins` };
+    }
     return { ok: true, event: { kind: "new_user", record } };
   }
 
-  // ② شكل مسطّح للاختبار اليدوي: { type: "new_message", message_id, ... }
-  const kind = FLAT_KIND_ALIASES[str(input.type)];
+  // ② شكل مسطّح من تريگر pg_net البسيط أو الاختبار اليدوي:
+  //    { message_id, conversation_id, sender_id, content } أو مع حقل type
+  const rawType = str(input.type);
+  const kind: PushKind | undefined = FLAT_KIND_ALIASES[rawType] ??
+    (!rawType && (input.message_id || input.conversation_id) ? "new_message" : undefined);
+
   if (!kind) {
     return {
       ok: false,
-      error: "unsupported payload: expected a Supabase Database Webhook body ({type, table, record})",
+      error: "unsupported payload: expected a database trigger or webhook body ({type, table, record} or {message_id, conversation_id, sender_id})",
     };
   }
   const { type: _type, record: _record, ...flat } = input as Record<string, any>;
-  return { ok: true, event: { kind, record: flat } as PushEvent };
+  const normalizedRecord: Record<string, any> = {
+    ...flat,
+    id: flat.id || flat.message_id || flat.room_id || flat.user_id || "",
+  };
+  if (kind === "new_message" && str(normalizedRecord.message_type) === "call") {
+    return { ok: false, ignored: "call card message: its room notification owns the push" };
+  }
+  return { ok: true, event: { kind, record: normalizedRecord } as PushEvent };
 }
 
 /** معرّف الحدث المرجعي (message_id / room_id / profile_id) — للتسجيل والتشخيص. */
 export function eventRefId(event: PushEvent): string {
   const r = event.record || {};
-  if (event.kind === "new_message") return str(r.id);
-  if (event.kind === "incoming_call" || event.kind === "call_ended") return str(r.id);
-  return str(r.id);
+  return str(r.id || r.message_id || r.room_id || r.user_id);
 }
 
-/** مفتاح منع التكرار: نفس الحدث قد يصل أكثر من مرة (إعادة محاولة Webhook). */
+/** مفتاح منع التكرار: نفس الحدث قد يصل أكثر من مرة. */
 export function dedupeKey(event: PushEvent): string {
   const id = eventRefId(event);
   return id ? `${event.kind}:${id}` : "";

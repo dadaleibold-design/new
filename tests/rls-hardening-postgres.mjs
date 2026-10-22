@@ -315,20 +315,25 @@ for (const t of ["messages", "typing_status", "message_reactions", "profiles", "
 const SQL_FILES = ["sql/schema.sql", ...fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => "sql/migrations/" + f)];
 const leaks = SQL_FILES.filter((f) => /eyJhbGciOiJIUzI1NiIs/.test(read(f)));
 check("لا JWT ثابت في أي ملف SQL", leaks.length === 0, leaks.join(", "));
-const noNet = await db.query("select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and (p.proname like 'push_%' or p.proname like 'notify_%')");
-check("لا دوال إشعارات (push_*/notify_*) في القاعدة بعد v3.0", noNet.rows[0].n === 0, String(noNet.rows[0].n));
+const noLegacyPush = await db.query("select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and p.proname like 'push_%'");
+check("لا دوال إشعارات قديمة (push_*) في القاعدة بعد v3.0", noLegacyPush.rows[0].n === 0, String(noLegacyPush.rows[0].n));
+const activeTriggerFns = await db.query(
+  "select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and p.proname in ('handle_new_message_notification','handle_new_message_push','notify_new_message','notify_call_room','notify_admins_new_profile')",
+);
+check("دوال تريگرات الإشعارات البسيطة الخمس موجودة في القاعدة", activeTriggerFns.rows[0].n === 5, String(activeTriggerFns.rows[0].n));
 const pushPolicy = await db.query("select count(*)::int n from pg_policies where schemaname='public' and tablename='push_delivery_log'");
 check("push_delivery_log محمي بـ RLS (قراءة المشرفين فقط)", pushPolicy.rows[0].n >= 1, String(pushPolicy.rows[0].n));
 
-// ---------- v3.0: الوثائق والمسارات ----------
-check("v3.0: هجرة الإشعارات تعلن Database Webhooks", /Database Webhook/i.test(MIG_V30));
-check("v3.0: الهجرة تُسقط امتداد pg_net", /execute 'drop extension pg_net'/i.test(MIG_V30));
-check("v3.0: الهجرة لا تُنشئ أي دالة إشعارات",
-  !/create (or replace )?function public\.(push_|notify_)/i.test(
+// ---------- v3.0: تريگرات pg_net البسيطة والرابط الصحيح ----------
+check("v3.0: الهجرة تفعّل امتداد pg_net", /create extension if not exists pg_net/i.test(MIG_V30));
+check("v3.0: الهجرة تنشئ تريگر send_fcm_on_new_message", /create trigger send_fcm_on_new_message/i.test(MIG_V30));
+check("v3.0: الهجرة لا تُنشئ أي دالة push_* قديمة",
+  !/create (or replace )?function public\.push_/i.test(
     MIG_V30.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n"),
   ));
-check("v3.0: schema.sql يوثّق الـ Webhooks بدل التريگرات", /Database Webhook/i.test(read("sql/schema.sql")));
-check("v3.0: لا مسار لطابع زمني/سرّ مدفون في القاعدة",
+check("v3.0: schema.sql يحتوي الرابط الصحيح לדالة المشروع (gqocavvhhfwgkzscrjms)",
+  read("sql/schema.sql").includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push"));
+check("v3.0: لا وجود للرابط القديم ذي الخطأ الإملائي (gqocavvhkfzgxzscrjms) في كود SQL",
   !/gqocavvhkfzgxzscrjms\.supabase\.co/.test(read("sql/schema.sql").split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n")));
 
 // لا ملف SQL في المستودع يقرأ SEND_PUSH_URL/SEND_PUSH_SECRET من Vault

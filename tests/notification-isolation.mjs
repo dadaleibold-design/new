@@ -118,29 +118,37 @@ const fnBlock = (name) => {
   return next === -1 ? SCHEMA.slice(start) : SCHEMA.slice(start, start + 1 + next);
 };
 
-// ① قاعدة البيانات: صفر مسار إشعارات داخلية
+// ① قاعدة البيانات: إشعارات الخلفية البسيطة عبر pg_net وتريگرات القاعدة (بلا Vault وبلا دوال المسبار القديمة)
 const LEGACY_FNS = [
   "push_call_edge", "trigger_send_push_notification", "push_probe", "push_probe_result",
   "push_gateway_check", "push_egress_check", "push_net_diagnostics", "push_path_verdict",
   "push_path_verdict_db", "push_delivery_url", "push_set_delivery_url", "push_mode",
   "push_set_mode", "push_recipient_allowed", "push_skip_note", "conversation_direct_recipient",
-  "admin_recipient_ids", "notify_new_message", "notify_call_room", "notify_admins_new_profile",
-  "push_diagnostics", "push_fire_probe", "push_await_probe", "push_probe_endpoint",
+  "admin_recipient_ids", "push_diagnostics", "push_fire_probe", "push_await_probe",
+  "push_probe_endpoint",
 ];
 check("schema.sql لا يحوي تعريف أي دالة إشعارات قديمة",
   LEGACY_FNS.every((fn) => !new RegExp(`create (or replace )?function public\\.${fn}\\s*\\(`).test(SCHEMA)),
   LEGACY_FNS.filter((fn) => new RegExp(`create (or replace )?function public\\.${fn}\\s*\\(`).test(SCHEMA)).join(","));
-check("schema.sql لا يطلب امتداد pg_net", !/create extension[^;]*pg_net/i.test(SCHEMA));
-check("schema.sql لا يستدعي net.http_post", !/net\.http_post/.test(SCHEMA_CODE));
+check("schema.sql يفعّل امتداد pg_net لإشعارات الخلفية", /create extension if not exists pg_net/i.test(SCHEMA));
+check("schema.sql يستدعي net.http_post بالرابط الصحيح للمشروع",
+  /net\.http_post/.test(SCHEMA_CODE) &&
+  SCHEMA_CODE.includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push") &&
+  !SCHEMA_CODE.includes("gqocavvhkfzgxzscrjms"));
 check("schema.sql لا يقرأ من Vault", !/vault\./i.test(SCHEMA_CODE) && !/from vault/i.test(SCHEMA_CODE));
-check("schema.sql لا ينشئ تريگرات إشعارات",
-  !/create trigger (on_message_inserted|on_call_room_notify|on_profile_created_notify_admins)/.test(SCHEMA));
-check("لا create extension pg_net في أي ملف هجرة", !/create extension[^;]*pg_net/i.test(ALL_SQL));
-check("لا net.http_post في أي ملف هجرة", !/net\.http_post/.test(ALL_SQL));
+check("schema.sql ينشئ تريگرات الإشعارات البسيطة (send_fcm_on_new_message)",
+  /create trigger send_fcm_on_new_message/.test(SCHEMA) &&
+  /create trigger on_call_room_notify/.test(SCHEMA) &&
+  /create trigger on_profile_created_notify_admins/.test(SCHEMA));
+check("دوال الإشعارات البسيطة معرّفة في schema.sql",
+  ["handle_new_message_notification", "handle_new_message_push", "notify_new_message",
+   "notify_call_room", "notify_admins_new_profile"].every((fn) =>
+    new RegExp(`create or replace function public\\.${fn}\\s*\\(`).test(SCHEMA)));
 check("لا قراءة من Vault في أي ملف هجرة", !/vault\./i.test(ALL_SQL) && !/from vault/i.test(ALL_SQL));
-check("هجرة v3.0 تلغي pg_net وتوثّق الـ Webhooks",
-  /drop extension pg_net/.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
-  /Database Webhook/i.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")));
+check("هجرة v3.0 تفعّل pg_net والتريگر send_fcm_on_new_message بالرابط الصحيح",
+  /create extension if not exists pg_net/i.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
+  /create trigger send_fcm_on_new_message/i.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
+  read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql").includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push"));
 check("سجل التسليم يُكتب من الدالة لا من تريگر (لا insert في SQL)",
   !/insert into public\.push_delivery_log/i.test(SCHEMA));
 
@@ -216,6 +224,8 @@ check("Webhook: مخطط غير public تُتجاهل",
   normalizePayload({ type: "INSERT", table: "messages", schema: "private", record: {} }).ok === false);
 check("Webhook: الحمولة المسطّحة للاختبار اليدوي مدعومة",
   normalizePayload({ type: "new_message", message_id: "m9", conversation_id: "c1", sender_id: "U1" }).event.kind === "new_message");
+check("Webhook: حمولة التريگر المسطّحة (بلا type) مدعومة",
+  normalizePayload({ message_id: "m10", conversation_id: "c1", sender_id: "U1", content: "مرحبا" }).event.kind === "new_message");
 check("webhook.ts نقي (بلا شبكة/قاعدة)", !/fetch\(|supabase|from\(/.test(WEBHOOK));
 check("recipients.ts نقي (بلا شبكة/قاعدة)", !/fetch\(|supabase|from\(/.test(RECIPIENTS));
 
