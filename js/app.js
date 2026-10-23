@@ -1250,8 +1250,8 @@ function wireChrome() {
       log(!!token, token ? `توكن FCM موجود (…${token.slice(-8)})` : "تعذّر الحصول على توكن FCM");
       if (!token) return;
       // ★ التشخيص من دالة send-push:
-      //   إشعارات الخلفية تعمل تلقائياً عبر تريگر send_fcm_on_new_message + امتداد pg_net
-      //   بلا تعقيدات Webhook يدوي وبلا Vault.
+      //   المسار: تريغرات قاعدة البيانات + pg_net، والسرّ المشترك في Vault/Edge Secrets.
+      //   حالة قاعدة البيانات الفعلية تُراجع عبر sql/send-push-audit.sql.
       try {
         const diag = await getPushDiagnostics();
         const checks = diag?.checks || {};
@@ -1259,10 +1259,12 @@ function wireChrome() {
           "Firebase في send-push: " + (checks.firebase_ready
             ? `مهيّأ (${diag?.firebase?.project_id || "project"})`
             : "غير مهيّأ — اضبط FIREBASE_SERVICE_ACCOUNT أو المتغيرات الثلاثة"));
-        log(checks.webhook_secret_ready !== false,
-          "مصادقة التريگر (x-send-push-secret): جاهزة تلقائياً ✅");
-        log(diag?.database_notifications?.pg_net !== false && diag?.database_notifications?.vault === false,
-          "قاعدة البيانات: pg_net + تريگر send_fcm_on_new_message (بلا Webhook يدوي وبلا Vault) ✅");
+        log(checks.webhook_secret_ready === true,
+          checks.webhook_secret_ready === true
+            ? "مصادقة التريغر: SEND_PUSH_SECRET مضبوط في الدالة ✅"
+            : "SEND_PUSH_SECRET غير مضبوط (32+ حرفاً) — طابقه مع send_push_secret في Vault");
+        log(diag?.database_notifications?.pg_net === true && diag?.database_notifications?.vault === true,
+          "المعمارية المتوقعة: pg_net + التريغرات القانونية + Vault — تحقق من التطبيق الفعلي عبر SQL Audit");
         const expected = diag?.webhook?.endpoint || SEND_PUSH_EDGE_URL;
         log(true, "وجهة دالة الإشعارات: " + expected);
         for (const hook of diag?.webhook?.expected_hooks || []) {

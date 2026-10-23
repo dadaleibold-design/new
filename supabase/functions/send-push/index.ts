@@ -1,29 +1,27 @@
 /**
  * send-push — Edge Function لإرسال إشعارات FCM في الخلفية
  * ============================================================================
- * المسار البسيط والمستقر (تريگرات قاعدة البيانات + pg_net — بلا تعقيدات Webhook يدوي وبلا Vault):
+ * المسار الوحيد (تريگرات قاعدة البيانات + pg_net):
  *
  *   INSERT/UPDATE على messages / call_rooms / profiles
  *        │
- *        ▼  Database Trigger (send_fcm_on_new_message → handle_new_message_notification / notify_new_message)
+ *        ▼  Canonical Database Triggers
  *   net.http_post → POST /functions/v1/send-push
- *        │
- *        ▼  هذه الدالة: تُحقّق، تُحدّد المستلم، تقرأ التوكنات، تُرسل
+ *        │  Content-Type: application/json
+ *        │  x-send-push-secret: <نفس SEND_PUSH_SECRET>
+ *        ▼  هذه الدالة: تُحقّق، تُطبّع الحمولة، تُحدّد المستلم، تُرسل
  *   FCM HTTP v1 ──► firebase-messaging-sw.js ──► إشعار النظام
  *
- * المزايا:
- *   ✓ تفعيل تلقائي بالكامل من داخل SQL (pg_net + تريگرات بسيطة) كما في المشروع العامل.
- *   ✓ لا حاجة لإنشاء Webhooks يدوياً من لوحة تحكم Supabase.
- *   ✓ لا حاجة لـ Supabase Vault.
- *
  * المصادقة:
- *   • تريگر قاعدة البيانات (أو Webhook): ترويسة x-send-push-secret
- *     (تقبل SEND_PUSH_SECRET أو السرّ المدمج للتريگر أو SUPABASE_SERVICE_ROLE_KEY).
- *   • الاختبار اليدوي والتشخيص: رمز مستخدم (JWT).
+ *   • أحداث القاعدة: ترويسة x-send-push-secret فقط، ويجب أن تطابق
+ *     SEND_PUSH_SECRET. لا يوجد سرّ افتراضي أو تجاوز عند غياب الإعداد.
+ *   • يحتفظ SQL بنسخة التريغر في Vault بالاسم send_push_secret؛ لا سرّ في Git.
+ *   • الاختبار اليدوي والتشخيص: رمز مستخدم (JWT) في Authorization.
+ *   • verify_jwt=false على مستوى الدالة حتى لا ترفض البوابة طلب pg_net قبل وصوله.
  *
  * متغيرات البيئة (Supabase → Edge Functions → Secrets):
  *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (يوفّرها Supabase تلقائياً)
- *   SEND_PUSH_SECRET                        (اختياري — يوجد سرّ افتراضي مدمج للتريگر)
+ *   SEND_PUSH_SECRET                        (إلزامي — 32+ حرفاً، بلا قيمة افتراضية)
  *   FIREBASE_SERVICE_ACCOUNT                (JSON حساب الخدمة — مفضّل)
  *     أو: FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY
  *   PUSH_NORMAL_URGENCY=1                   (اختياري: أولوية عادية لرسائل الدردشة)
@@ -51,9 +49,9 @@ import {
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const SEND_PUSH_SECRET = Deno.env.get("SEND_PUSH_SECRET") ?? "";
+const SEND_PUSH_SECRET = (Deno.env.get("SEND_PUSH_SECRET") ?? "").trim();
 const PUSH_NORMAL_URGENCY = Deno.env.get("PUSH_NORMAL_URGENCY") === "1";
-const SERVICE_VERSION = "3.0.0";
+const SERVICE_VERSION = "3.1.0";
 
 const FIREBASE_SERVICE_ACCOUNT = Deno.env.get("FIREBASE_SERVICE_ACCOUNT") ?? "";
 let FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") ?? "";
@@ -90,14 +88,23 @@ const MESSAGE_TTL_SECONDS = 86_400;
  * 1) أدوات عامة
  * ══════════════════════════════════════════════════════════════════════════ */
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*",
+      ...extraHeaders,
     },
   });
+}
+
+function methodNotAllowed(method: string): Response {
+  // GET لا يمكن أن يكون طلب إشعار صالحاً. 405 + Allow يفرّق بوضوح بين
+  // طلب وصل إلى الدالة وبين 401 الصادر من بوابة Supabase قبل الدالة.
+  console.warn(`[send-push] rejected method=${method}; expected POST`);
+  return json({ error: "Method not allowed: use POST" }, 405, { Allow: "POST, OPTIONS" });
 }
 
 function text(value: unknown): string {
@@ -130,27 +137,12 @@ function markSent(key: string): void {
  * 3) مصادقة الطلب
  * ══════════════════════════════════════════════════════════════════════════ */
 
-const DEFAULT_TRIGGER_SECRET = "my_send_push_19921121_almgawell_19921121";
-
 function isWebhookAuthorized(req: Request): boolean {
+  if (SEND_PUSH_SECRET.length < 32) return false;
   const supplied = (req.headers.get("x-send-push-secret") ?? "").trim();
-  const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-  if (SEND_PUSH_SECRET && (supplied === SEND_PUSH_SECRET || bearer === SEND_PUSH_SECRET)) {
-    return true;
-  }
-  if (supplied === DEFAULT_TRIGGER_SECRET || bearer === DEFAULT_TRIGGER_SECRET) {
-    return true;
-  }
-  // خدمة Supabase (service_role) — مفيدة عند الاختبار من SQL/سكربت إداري
-  if (Boolean(bearer) && bearer === SUPABASE_SERVICE_ROLE_KEY) {
-    return true;
-  }
-  // في حال لم يضبط المستخدم SEND_PUSH_SECRET في أسرار الدالة ولم يُرسل سرّاً خاطئاً،
-  // نسمح بمرور استدعاء التريگر لأن الدالة تتحقّق من السجلات مباشرة عبر service_role.
-  if (!SEND_PUSH_SECRET && !supplied) {
-    return true;
-  }
-  return false;
+  // مسار أحداث القاعدة يقبل هذه الترويسة فقط. لا Bearer بديل، ولا service_role
+  // بديل، ولا سرّ مدمج، ولا fail-open عندما يكون الإعداد ناقصاً.
+  return supplied.length > 0 && supplied === SEND_PUSH_SECRET;
 }
 
 async function authenticatedUserId(req: Request): Promise<string | null> {
@@ -255,32 +247,40 @@ async function sendToFcm(
     },
   };
 
-  const accessToken = await getAccessToken();
   let last: FcmResult = { ok: false, status: 0, details: null };
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await fetch(
-      `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({ message }),
-        signal: AbortSignal.timeout(10_000),
-      },
-    );
-    const body = await response.text();
-    let details: any = null;
     try {
-      details = body ? JSON.parse(body) : null;
-    } catch {
-      details = { error: body.slice(0, 500) };
+      const accessToken = await getAccessToken();
+      const response = await fetch(
+        `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({ message }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const body = await response.text();
+      let details: any = null;
+      try {
+        details = body ? JSON.parse(body) : null;
+      } catch {
+        details = { error: body.slice(0, 500) };
+      }
+      last = { ok: response.ok, status: response.status, details };
+      if (response.ok || !RETRY_STATUS_CODES.includes(response.status)) return last;
+    } catch (error: any) {
+      // انقطاع الشبكة/Timeout لا يجب أن يُسقط Promise.all ويحوّل الحدث كله إلى 500.
+      last = {
+        ok: false,
+        status: 0,
+        details: { error: error?.message ?? String(error), retryable: true },
+      };
     }
-    last = { ok: response.ok, status: response.status, details };
-    if (response.ok) return last;
-    if (!RETRY_STATUS_CODES.includes(response.status)) break;
     if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
   }
   return last;
@@ -398,7 +398,7 @@ async function logDelivery(entry: DeliveryLog): Promise<void> {
       kind: entry.kind,
       ref_id: entry.refId || null,
       recipient_id: entry.recipientId || null,
-      source: entry.source ?? "webhook",
+      source: entry.source ?? "trigger",
       sent: entry.sent ?? 0,
       total: entry.total ?? 0,
       skipped: entry.skipped ?? null,
@@ -431,10 +431,29 @@ async function sendToAllDevices(
     const batch = rows.slice(i, i + FCM_CONCURRENCY);
     const settled = await Promise.all(
       batch.map(async (row) => {
-        const result = await sendToFcm(row.token, data, options);
-        const removed = !result.ok && isDeadToken(result.status, result.details);
-        if (removed) {
-          await supabase.from("fcm_tokens").delete().eq("id", row.id);
+        let result: FcmResult;
+        try {
+          result = await sendToFcm(row.token, data, options);
+        } catch (error: any) {
+          // حارس أخير لكل جهاز: فشل جهاز لا يلغي نتائج بقية الأجهزة.
+          result = {
+            ok: false,
+            status: 0,
+            details: { error: error?.message ?? String(error) },
+          };
+        }
+
+        const shouldRemove = !result.ok && isDeadToken(result.status, result.details);
+        let removed = false;
+        let cleanupError = "";
+        if (shouldRemove) {
+          try {
+            const { error } = await supabase.from("fcm_tokens").delete().eq("id", row.id);
+            if (error) throw error;
+            removed = true;
+          } catch (error: any) {
+            cleanupError = error?.message ?? String(error);
+          }
         }
         return {
           tokenId: row.id,
@@ -442,6 +461,7 @@ async function sendToAllDevices(
           status: result.status,
           removed,
           error: result.ok ? undefined : JSON.stringify(result.details),
+          cleanupError: cleanupError || undefined,
         };
       }),
     );
@@ -736,6 +756,7 @@ async function handleDiagnostics(userId: string): Promise<Response> {
   ]);
 
   const triggerDeliveries = deliveries.filter((row) => row?.source === "webhook" || row?.source === "trigger");
+  const triggerSecretConfigured = SEND_PUSH_SECRET.length >= 32;
 
   return json({
     ok: true,
@@ -744,7 +765,7 @@ async function handleDiagnostics(userId: string): Promise<Response> {
     architecture: "pg_net-database-triggers",
     database_notifications: {
       pg_net: true,
-      vault: false,
+      vault: true,
       db_triggers: true,
       triggers: [
         "send_fcm_on_new_message",
@@ -752,23 +773,25 @@ async function handleDiagnostics(userId: string): Promise<Response> {
         "on_profile_created_notify_admins",
       ],
       functions: [
+        "send_push_post",
         "handle_new_message_notification",
-        "handle_new_message_push",
-        "notify_new_message",
         "notify_call_room",
         "notify_admins_new_profile",
       ],
-      note: "إشعارات الخلفية تعمل تلقائياً عبر امتداد pg_net وتريگر send_fcm_on_new_message دون الحاجة لإنشاء Webhook يدوي.",
+      note: "المسار المتوقع: pg_net + التريغرات القانونية + Vault. نفّذ sql/send-push-audit.sql للتحقق من حالة قاعدة البيانات الفعلية.",
     },
     firebase: {
       configured: firebaseConfigured,
       project_id: FIREBASE_PROJECT_ID || null,
       service_account_email: FIREBASE_CLIENT_EMAIL || null,
     },
+    // اسم الحقل webhook محفوظ لتوافق الواجهة؛ النقل الفعلي هو تريغر pg_net.
     webhook: {
-      secret_configured: true,
+      secret_configured: triggerSecretConfigured,
       endpoint: `${SUPABASE_URL}/functions/v1/send-push`,
+      method: "POST",
       required_header: "x-send-push-secret",
+      gateway_verify_jwt: false,
       expected_hooks: [
         { table: "messages", events: ["INSERT"], trigger: "send_fcm_on_new_message" },
         { table: "call_rooms", events: ["INSERT", "UPDATE"], trigger: "on_call_room_notify" },
@@ -787,13 +810,15 @@ async function handleDiagnostics(userId: string): Promise<Response> {
     },
     checks: {
       firebase_ready: firebaseConfigured,
-      webhook_secret_ready: true,
+      webhook_secret_ready: triggerSecretConfigured,
       has_device: tokens.length > 0,
       webhook_flow_observed: triggerDeliveries.length > 0,
     },
-    hint: triggerDeliveries.length
-      ? "✅ وُصلت إشعارات تلقائية من تريگر قاعدة البيانات (send_fcm_on_new_message) — المسار الحيّ يعمل."
-      : "ℹ️ المسار جاهز عبر تريگر send_fcm_on_new_message + امتداد pg_net. أرسل رسالة تجريبية لتسجيل أول حدث.",
+    hint: !triggerSecretConfigured
+      ? "⚠️ اضبط SEND_PUSH_SECRET (32+ حرفاً) في Edge Secrets وطابقه مع send_push_secret في Vault."
+      : triggerDeliveries.length
+      ? "✅ وُصلت إشعارات تلقائية من تريگر قاعدة البيانات — راجع نتيجة التسليم الأخيرة."
+      : "ℹ️ اضبط Vault ونفّذ الهجرة، ثم أرسل رسالة من حساب آخر لتسجيل أول حدث تلقائي.",
   });
 }
 
@@ -804,24 +829,30 @@ async function handleDiagnostics(userId: string): Promise<Response> {
 Deno.serve(async (req: Request): Promise<Response> => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
+      status: 204,
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-send-push-secret",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Max-Age": "86400",
+        Allow: "POST, OPTIONS",
       },
     });
   }
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (req.method !== "POST") return methodNotAllowed(req.method);
 
   try {
     let payload: unknown;
     try {
       payload = await req.json();
     } catch {
-      return json({ error: "invalid JSON body" }, 400);
+      return json({ error: "invalid JSON body: expected one JSON object" }, 400);
+    }
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return json({ error: "invalid payload: expected a JSON object" }, 400);
     }
 
-    const type = text((payload as Record<string, unknown>)?.type);
+    const type = text((payload as Record<string, unknown>).type);
 
     // ── مسارات المستخدم (JWT) ──────────────────────────────────────────
     if (type === "test" || type === "diagnostics") {
@@ -830,7 +861,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
       return type === "test" ? await handleTest(userId) : await handleDiagnostics(userId);
     }
 
-    // ── مسار الـ Webhook (سرّ مشترك) ──────────────────────────────────
+    // ── مسار تريغر قاعدة البيانات (سرّ مشترك إلزامي) ─────────────────
+    if (SEND_PUSH_SECRET.length < 32) {
+      console.error("[send-push] SEND_PUSH_SECRET is missing or shorter than 32 characters");
+      return json({ error: "SEND_PUSH_SECRET is not configured correctly on send-push" }, 503);
+    }
     if (!isWebhookAuthorized(req)) {
       return json(
         { error: "Unauthorized: send x-send-push-secret matching SEND_PUSH_SECRET" },

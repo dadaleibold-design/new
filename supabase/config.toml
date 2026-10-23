@@ -1,13 +1,13 @@
 # ============================================================
 # إعدادات Edge Functions
 # ------------------------------------------------------------
-# send-push تُستدعى من Supabase Database Webhook (لا JWT مستخدم)، لذا يجب
-# تعطيل التحقق من JWT على مستوى البوابة — وإلا تُرفض بـ 401 ولا تصل
-# الإشعارات عندما يكون التطبيق مغلقاً. الدالة تتحقّق من الترويسة
-# x-send-push-secret (= SEND_PUSH_SECRET) داخلياً.
+# send-push تستقبل POST من pg_net بلا JWT مستخدم. يجب أن يبقى
+# verify_jwt=false وإلا ترفض بوابة Supabase الطلب قبل الدالة برمز
+# UNAUTHORIZED_NO_AUTH_HEADER. الأمان داخل الدالة إلزامي عبر
+# x-send-push-secret = SEND_PUSH_SECRET (32+ حرفاً)، ولا توجد قيمة افتراضية.
 #
-# ملاحظة v3.0: قاعدة البيانات لا تستدعي الدالة إطلاقاً (لا pg_net ولا Vault)؛
-# النداء الوحيد يأتي من Database Webhook في لوحة Supabase.
+# انشر بعد تعديل الإعداد/الكود:
+#   supabase functions deploy send-push --no-verify-jwt
 # ============================================================
 [functions.send-push]
 verify_jwt = false

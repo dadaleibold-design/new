@@ -11,12 +11,18 @@ export async function disablePushNotifications() { return true; }
 export async function getPushDiagnostics() {
   return {
     service: "send-push",
-    version: "3.0.0",
-    architecture: "supabase-database-webhooks",
-    database_notifications: { pg_net: false, vault: false, db_triggers: false },
+    version: "3.1.0",
+    architecture: "pg_net-database-triggers",
+    database_notifications: { pg_net: true, vault: true, db_triggers: true },
     firebase: { configured: true },
     webhook: { secret_configured: true, endpoint: "https://example.supabase.co/functions/v1/send-push" },
     me: { devices: 1 },
-    checks: { webhook_secret: true, firebase_configured: true, devices_registered: true },
+    delivery_log: { recent: [], webhook_events_seen: 0 },
+    checks: {
+      firebase_ready: true,
+      webhook_secret_ready: true,
+      has_device: true,
+      webhook_flow_observed: false,
+    },
   };
 }

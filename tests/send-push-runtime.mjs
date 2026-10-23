@@ -22,7 +22,7 @@ register("./hooks-send-push.mjs", import.meta.url);
 
 const PORT = 8123;
 const FUNCTION_URL = `http://127.0.0.1:${PORT}/`;
-const SECRET = "webhook-secret-for-tests";
+const SECRET = "webhook-secret-for-tests-32-chars-minimum";
 
 /* ---------- حساب خدمة RSA وهمي (لاختبار توقيع OAuth) ---------- */
 const generated = await crypto.subtle.generateKey(
@@ -87,6 +87,7 @@ globalThis.Deno = {
 /* ---------- محاكاة OAuth2 + FCM ---------- */
 const FCM_LOG = [];
 let fcmStatus = () => 200;
+let fcmNetworkError = () => false;
 let oauthClaims = null;
 const originalFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = async (input, init) => {
@@ -100,6 +101,7 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.includes("fcm.googleapis.com/v1/projects/demo-project/messages:send")) {
     const body = JSON.parse(String(init?.body || "{}"));
+    if (fcmNetworkError(body)) throw new Error("mock FCM network failure");
     const headers = new Headers(init?.headers);
     FCM_LOG.push({
       url,
@@ -191,6 +193,52 @@ const webhook = (table, type, record, old_record = null) => ({
 const resetCalls = () => { STUB_CALLS.length = 0; };
 
 /* ============================================================
+ * 0) عقد HTTP والمصادقة والحمولات الخلفية الطرفية
+ * ============================================================ */
+{
+  const getResponse = await fetch(FUNCTION_URL, { method: "GET" });
+  check("HTTP: GET يصل للدالة ⇒ 405 وليس 401، مع Allow: POST",
+    getResponse.status === 405 && (getResponse.headers.get("allow") || "").includes("POST"));
+  await getResponse.text();
+
+  const optionsResponse = await fetch(FUNCTION_URL, { method: "OPTIONS" });
+  check("HTTP: OPTIONS ⇒ 204 وCORS يسمح بالسرّ وPOST",
+    optionsResponse.status === 204 &&
+      (optionsResponse.headers.get("access-control-allow-methods") || "").includes("POST") &&
+      (optionsResponse.headers.get("access-control-allow-headers") || "").includes("x-send-push-secret"));
+  await optionsResponse.text();
+
+  const invalidJson = await fetch(FUNCTION_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-send-push-secret": SECRET },
+    body: "{broken",
+  });
+  check("Payload: JSON مكسور ⇒ 400 مضبوط", invalidJson.status === 400);
+  await invalidJson.text();
+
+  check("Payload: null ⇒ 400", (await post(null, { "x-send-push-secret": SECRET })).status === 400);
+  check("Payload: مصفوفة ⇒ 400", (await post([], { "x-send-push-secret": SECRET })).status === 400);
+  check("Payload: INSERT بلا record ⇒ 400 واضح",
+    (await post({ type: "INSERT", table: "messages", schema: "public", record: null },
+      { "x-send-push-secret": SECRET })).status === 400);
+
+  const deleted = await post(
+    { type: "DELETE", table: "messages", schema: "public", record: null, old_record: { id: "m-deleted" } },
+    { "x-send-push-secret": SECRET },
+  );
+  check("Payload: DELETE مع record=null ⇒ تجاهل 200 لا استثناء",
+    deleted.status === 200 && Boolean(deleted.json?.ignored), JSON.stringify(deleted.json ?? {}));
+
+  const bearerOnly = await post(
+    webhook("messages", "INSERT", { id: "m-auth", conversation_id: "c-1", sender_id: "u-1111" }),
+    { Authorization: `Bearer ${SECRET}` },
+  );
+  check("Auth: السرّ في Authorization بدلاً من x-send-push-secret ⇒ 401", bearerOnly.status === 401);
+  check("Auth: غياب الترويسة ⇒ 401 ولا إرسال إلى FCM",
+    (await post(webhook("messages", "INSERT", { id: "m-no-auth" }))).status === 401 && FCM_LOG.length === 0);
+}
+
+/* ============================================================
  * 1) اختبار تجريبي (JWT مستخدم) — عقد الطلب لكل جهاز
  * ============================================================ */
 FCM_LOG.length = 0;
@@ -218,9 +266,9 @@ FCM_LOG.length = 0;
  * ============================================================ */
 {
   const { status, json } = await post({ type: "diagnostics" }, { Authorization: "Bearer user-jwt" });
-  check("diagnostics: 200 وتفعيل pg_net وتريگرات القاعدة البسيطة (بلا Vault)", status === 200 &&
+  check("diagnostics: 200 ومعمارية pg_net + Vault والتريغرات القانونية", status === 200 &&
     json?.database_notifications?.pg_net === true &&
-    json?.database_notifications?.vault === false &&
+    json?.database_notifications?.vault === true &&
     json?.database_notifications?.db_triggers === true &&
     Array.isArray(json?.database_notifications?.triggers) &&
     json.database_notifications.triggers.includes("send_fcm_on_new_message"), JSON.stringify(json?.database_notifications ?? null));
@@ -258,8 +306,8 @@ resetCalls();
   const filters = JSON.stringify(update?.filters || []);
   check("new_message: التحديث على id الرسالة وstatus='sent'",
     update?.values?.status === "delivered" && filters.includes("m-1") && filters.includes("sent"), filters);
-  check("new_message: سجل التسليم مصدره webhook",
-    STUB_CALLS.some((c) => c.kind === "insert" && c.table === "push_delivery_log" && c.values.kind === "new_message" && c.values.source === "webhook"));
+  check("new_message: سجل التسليم مصدره trigger",
+    STUB_CALLS.some((c) => c.kind === "insert" && c.table === "push_delivery_log" && c.values.kind === "new_message" && c.values.source === "trigger"));
 
   // نفس الحدث مرة أخرى (إعادة محاولة Webhook) ⇒ لا إرسال ثانٍ
   FCM_LOG.length = 0;
@@ -385,8 +433,8 @@ FCM_LOG.length = 0;
 {
   const { status, json } = await post({ type: "diagnostics" }, { Authorization: "Bearer admin-jwt" });
   const recent = json?.delivery_log?.recent || [];
-  check("diagnostics: سجل التسليم يعرض أحداث Webhook الأخيرة", status === 200 && recent.length > 0 &&
-    recent.every((row) => row.source === "webhook"), JSON.stringify(recent.slice(0, 2)));
+  check("diagnostics: سجل التسليم يعرض أحداث التريغر الأخيرة", status === 200 && recent.length > 0 &&
+    recent.every((row) => row.source === "trigger"), JSON.stringify(recent.slice(0, 2)));
   check("diagnostics: checks.webhook_flow_observed = true",
     json?.checks?.webhook_flow_observed === true && Number(json?.delivery_log?.webhook_events_seen) > 0);
 }
@@ -419,7 +467,23 @@ fcmStatus = () => (++attempts === 1 ? 429 : 200);
 fcmStatus = () => 200;
 
 /* ============================================================
- * 10) JWT حساب الخدمة
+ * 10) انقطاع الشبكة على جهاز لا يُسقط بقية الأجهزة
+ * ============================================================ */
+FCM_LOG.length = 0;
+fcmNetworkError = (body) => body?.message?.token === "TOKEN_A";
+{
+  const { status, json } = await post({ type: "test" }, { Authorization: "Bearer user-jwt" });
+  const failed = json?.results?.find((r) => r.tokenId === "tok-1");
+  const healthy = json?.results?.find((r) => r.tokenId === "tok-2");
+  check("شبكة FCM: فشل جهاز ⇒ status=0 للجهاز ونجاح الجهاز الآخر بلا 500",
+    status === 200 && json?.sent === 1 && json?.total === 2 &&
+      failed?.status === 0 && /network failure/.test(String(failed?.error)) && healthy?.ok === true,
+    JSON.stringify(json ?? {}));
+}
+fcmNetworkError = () => false;
+
+/* ============================================================
+ * 11) JWT حساب الخدمة
  * ============================================================ */
 {
   check("OAuth: scope/audience/issuer صحيحة",

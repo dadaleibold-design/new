@@ -125,147 +125,126 @@ npm run env:check   # التأكد من وجود كل متغيرات البيئ�
 ```
 
 ## 7. إعداد الإشعارات الحقيقية (Firebase Cloud Messaging)
-الإشعارات الحالية تستخدم **FCM Web Push** مع Supabase Edge Function `send-push`؛ أما جدول
-`push_subscriptions` فهو بقايا مسار Web Push القديم ولا يدخل في مسار FCM الحالي.
+تستخدم `tayba` إشعارات **FCM Web Push** عبر Supabase Edge Function `send-push`. جدول
+`push_subscriptions` بقايا مسار قديم ولا يدخل في هذا المسار.
 
-### آلية العمل الحالية (تريگرات قاعدة البيانات البسيطة + `pg_net` — بلا Webhook يدوي وبلا Vault)
-- **تفعيل تلقائي بالكامل من داخل SQL**: امتداد `pg_net` مفعّل في المخطط العام (`Async HTTP`)،
-  وتريگر `send_fcm_on_new_message` على جدول `messages` يستدعي دالة
-  `handle_new_message_notification` (مع وجود `handle_new_message_push` و`notify_new_message`
-  للتوافق الكامل مع إعدادات المشروع العامل)، بالإضافة إلى تريگر `on_call_room_notify` على
-  `call_rooms` وتريگر `on_profile_created_notify_admins` على `profiles`.
-- **لا حاجة لإنشاء Database Webhooks يدوياً** من لوحة تحكم Supabase، ولا حاجة لـ Supabase Vault.
-- **الرابط الصحيح לדالة المشروع**: `https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push`
-  (تم إصلاح الخطأ الإملائي القديم `gqocavvhkfzgxzscrjms` الذي كان يسبّب فشل DNS `Couldn't resolve host name`).
-- `supabase/functions/send-push/index.ts` هي **الجهة الوحيدة** التي تفهم الحدث وتختار
-  المستلم وتتحدث مع FCM. لا تثق بأي `recipient_id` قادم من الحمولة (تعارض ⇒ 409).
-- `supabase/functions/send-push/recipients.ts` تحمل قواعد العزل النقية: رسالة ⇒ الطرف الآخر
-  في نفس صف المحادثة، رنين ⇒ `callee_id` فقط وخلال نافذة دقيقتين، مستخدم جديد ⇒ المشرفون فقط.
-- `supabase/functions/send-push/webhook.ts` تُطبِّع الحمولة (سواء من تريگر `pg_net` القياسي أو
-  الحمولة المسطّحة البسيطة `{ message_id, conversation_id, sender_id, content }`) وتتجاهل ما لا يخصّها.
-- `js/push.js`: يهيّئ Firebase SDK، يطلب الإذن، ويسجّل `firebase-messaging-sw.js`،
-  ويرسل **إشعاراً تجريبياً/تشخيصاً فقط** (`type: "test"` / `type: "diagnostics"`).
-- `firebase-messaging-sw.js`: مستمع `push` الخام هو المسؤول الوحيد عن الإشعار في
-  الخلفية؛ يقرأ `data` ويعرضه عبر `registration.showNotification()`.
-- كل جهاز/متصفح له صف مستقل في `fcm_tokens`، وتقرأ الدالة التوكنات وتحذف الميت منها
-  بـ `service_role`.
-- كل حدث يُسجَّل في `push_delivery_log` (يكتبه الـ Edge Function وحده) — وهو مصدر
-  التشخيص الحقيقي: `select * from public.push_delivery_log order by created_at desc limit 20;`
+### المعمارية الحالية الوحيدة: `pg_net` + تريغرات قاعدة البيانات + Vault
 
-### حدود المنصة (لا يمكن ضمان «100%» من جهة JavaScript)
-- بعد إغلاق الصفحة لا تعمل مؤقتات التطبيق أو WebSocket؛ الذي يمكن إيقاظه هو Service Worker
-  عند وصول Push. المتصفح ونظام التشغيل قد يؤخران أو يمنعان التسليم بسبب حظر الإذن، وضع توفير
-  الطاقة، DND، اتصال الجهاز أو سياسات النظام. `Urgency: high` وFCM `priority: high` يقللان
-  التأخير ولا يلغيان هذه القيود.
-- Service Worker لا يستطيع تشغيل ملف `notify.mp3` أو إبقاء صوت مستمر موثوقاً بالخلفية.
-  `silent: false` يطلب صوت الإشعار الافتراضي من المتصفح/النظام، ويظل خاضعاً لإعدادات الجهاز.
-  الملف الصوتي مخصص للمقدمة فقط، وتشغيله فيها قد يمنعه autoplay policy.
-- على iOS يلزم دعم Web Push في إصدار النظام، وإضافة التطبيق إلى الشاشة الرئيسية (PWA)؛
-  الإشعارات ليست مدعومة في كل سياقات Safari/المتصفحات المضمّنة.
-
-### تشخيص «الاختبار ينجح لكن إشعار الرسالة لا يصل»
-الاختبار التجريبي يختبر **الجلسة → Edge Function → FCM** فقط، ولا يلمس الـ Webhook.
-للتشخيص الكامل استخدم زر «اختبار الإشعارات» في التطبيق أو:
-
-```bash
-curl -s https://<project-ref>.supabase.co/functions/v1/send-push \
-  -H "apikey: $SUPABASE_ANON_KEY" \
-  -H "Authorization: Bearer $USER_JWT" \
-  -H "Content-Type: application/json" \
-  -d '{"type":"diagnostics"}'
-```
-
-يعيد التقرير:
-- `database_notifications`: `{ pg_net: false, vault: false, db_triggers: false }` — أي اعتماد
-  على القاعدة في الإشعارات يجب أن يكون صفراً.
-- `webhook.expected_hooks`: الجداول والأحداث الثلاثة المتوقَّعة، و`secret_configured`.
-- `me.devices`: عدد أجهزة حسابك المسجّلة.
-- `delivery_log.recent` + `checks.webhook_flow_observed`: هل وصل حدث Webhook فعلاً؟
-  إن كانت `false` فالـ Webhook غير مُنشأ أو يشير إلى رابط/سرّ خاطئ.
-
-ثم:
-1. راجع `push_delivery_log`: صف جديد عند كل رسالة/مكالمة/تسجيل مستخدم.
-2. افحص سجل Service Worker `[push-sw]`: `push received` يعني أن دفعة وصلت للمتصفح.
-3. عند `sent=1/1` مع غياب `push received`، لا تعتبر FCM ACK دليلاً على الوصول؛ أعد
-   تسجيل التوكن وتأكد أن التطبيق والدالة على نفس مشروع Firebase وVAPID.
-
-### خطوات الإعداد
-1. **مشروع Firebase**: أنشئ مشروعاً على [console.firebase.google.com](https://console.firebase.google.com)،
-   فعّل **Cloud Messaging**، واحصل على `firebaseConfig` من Project Settings → General → Your apps → Web app.
-2. **مفتاح VAPID الخاص بـ Firebase** (مختلف عن VAPID القديم): Project Settings → Cloud Messaging →
-   Web Push certificates → Generate key pair.
-3. ضع قيم الإعداد في متغيرات البيئة **مرة واحدة فقط** (بدل نسخها في ملفين):
-   `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_MESSAGING_SENDER_ID`,
-   `VITE_FIREBASE_APP_ID`. يقرأها `js/push.js` من `js/env.js`، ويقرأها
-   `firebase-messaging-sw.js` من نفس `env.js` عبر `importScripts` — فلا يمكن أن يختلفا
-   (كان اختلاف النسخ/الاختصار سبب خطأ "ServiceWorker script evaluation failed" سابقاً).
-   `authDomain` و `storageBucket` مشتقّان تلقائياً من `projectId`.
-4. ضع مفتاح VAPID في `VITE_VAPID_PUBLIC_KEY` (نفس المتغير يقرأه `js/push.js`).
-5. **نفّذ قسم 8 و 9 من `sql/schema.sql`** في SQL Editor (جدول `fcm_tokens` + صلاحيات).
-6. من داخل التطبيق: **الإعدادات ⚙️ → تفعيل إشعارات الجهاز**.
-
-### نشر Edge Function + ربط Database Webhook (الخطوة الحاسمة)
-
-```
+```text
 INSERT/UPDATE على messages | call_rooms | profiles
         │
-        ▼  Supabase Database Webhook (لوحة التحكم)
-POST https://<project-ref>.supabase.co/functions/v1/send-push
-        │  x-send-push-secret: <SEND_PUSH_SECRET>
+        ▼  Canonical Postgres Trigger
+net.http_post(
+  method = POST,
+  headers = { Content-Type: application/json, x-send-push-secret: ... },
+  body = { type, table, schema, record, old_record }
+)
+        │
         ▼
-Edge Function send-push  →  FCM HTTP v1  →  firebase-messaging-sw.js
+POST https://<project-ref>.supabase.co/functions/v1/send-push
+        │  verify_jwt = false على البوابة + تحقق السرّ داخل الدالة
+        ▼
+FCM HTTP v1 → firebase-messaging-sw.js → إشعار النظام
 ```
 
-**1) أسرار الدالة** (لا شيء منها في المستودع ولا في القاعدة):
+- `send_fcm_on_new_message` على `messages` (`INSERT`)، و`on_call_room_notify` على
+  `call_rooms` (`INSERT/UPDATE`)، و`on_profile_created_notify_admins` على `profiles` (`INSERT`).
+- الدالة SQL `public.send_push_post(jsonb)` هي نقطة HTTP الوحيدة. تقرأ `send_push_url`
+  و`send_push_secret` من **Supabase Vault**؛ لا رابط مشروع ولا سرّ مكتوب في Git.
+- `SEND_PUSH_SECRET` في **Edge Secrets** و`send_push_secret` في **Vault** مخزّنان منفصلان،
+  لكن يجب أن يحملا **القيمة نفسها**. القيمة إلزامية وطولها 32 حرفاً على الأقل.
+- لا تنشئ Database Webhooks يدوية للجداول الثلاثة. الهجرة تحذف تحديداً أي تريغر
+  `supabase_functions.http_request` قديم يستهدف `send-push` عليها، سواء كان `GET` أو `POST`،
+  حتى لا تتكرر الإشعارات أو تظهر طلبات غير مصادق عليها.
+- `supabase/functions/send-push/webhook.ts` يطبّع الحمولة، و`recipients.ts` يشتق المستلم
+  من قاعدة البيانات؛ لا يُوثق بأي `recipient_id` قادم من العميل.
+- كل جهاز له صف في `fcm_tokens`، وتُرسل الدالة إلى كل الأجهزة وتحذف التوكنات الميتة فقط.
+- النتيجة تُسجّل في `push_delivery_log` بمصدر `trigger`، وإعادة تنفيذ الهجرة لا تحذف السجل.
 
-```bash
-supabase functions deploy send-push
+### تفسير سجلات `GET` و`401` بدقة
 
-supabase secrets set \
-  SEND_PUSH_SECRET="$(openssl rand -hex 32)" \
-  FIREBASE_SERVICE_ACCOUNT="$(cat /مسار-آمن/service-account.json)"
-```
+| الأثر | مكان الرفض والمعنى |
+|---|---|
+| `401 UNAUTHORIZED_NO_AUTH_HEADER` | بوابة Edge Functions و`verify_jwt` ما زال مفعّلاً، أو الطلب بلا `Authorization/apikey`. الطلب لم يدخل كود الدالة. |
+| `405` مع `Allow: POST, OPTIONS` | الطلب وصل إلى الدالة، لكنه `GET` أو method غير مدعوم. |
+| `401` مع JSON يذكر `x-send-push-secret` | الطلب دخل الدالة، والسرّ مفقود/مخالف. |
+| `200` مع `ignored` | الحمولة صحيحة لكن الحدث لا يحتاج إشعاراً (مثل `messages UPDATE/DELETE`). |
 
-بدلاً من JSON كامل: `FIREBASE_PROJECT_ID` + `FIREBASE_CLIENT_EMAIL` +
-`FIREBASE_PRIVATE_KEY`. اختياري: `PUSH_NORMAL_URGENCY=1` لتخفيض أولوية رسائل الدردشة
-(الافتراضي `high`؛ المكالمات والاختبارات TTL 60 ثانية، والرسائل 24 ساعة).
+استدعاء `net.http_post` يولّد `POST` دائماً، وكل استدعاءات الواجهة إلى `send-push`
+هي `POST`. أما Database Webhook في لوحة Supabase فيمكن ضبطه على `GET`؛ لذلك فالهوكات
+القديمة هي المصدر المشتبه به عند ظهور `GET`، وليس تريغر `pg_net` الحالي. يثبت
+`sql/send-push-audit.sql` الهوكات المتبقية من دون طبع تعريفاتها أو أسرارها.
 
-`SUPABASE_URL` و`SUPABASE_SERVICE_ROLE_KEY` يوفّرهما Supabase تلقائياً لكل دالة.
+### الإعداد/الإصلاح في الإنتاج (بالترتيب)
 
-**2) `supabase/config.toml`** — الدالة منشورة بـ `verify_jwt = false` لأن الـ Webhook لا
-يحمل JWT مستخدم؛ المصادقة عبر ترويسة `x-send-push-secret` داخلياً.
+> السرّ الذي كان مدمجاً في النسخ القديمة أصبح مكشوفاً في تاريخ Git؛ **دوّره ولا تعِد استخدامه**.
 
-**3) إنشاء الـ Webhooks من لوحة Supabase** (مرة واحدة):
-`Database → Webhooks → Create a new hook` ثم أنشئ ثلاثة هوكات:
+1. **أنشئ سرّاً جديداً واضبط أسرار الدالة** (لا تضع القيمة في ملف داخل المستودع):
 
-| الاسم | الجدول | الأحداث | النوع |
-|---|---|---|---|
-| `push_message` | `public.messages` | `INSERT` | Supabase Edge Function → `send-push` |
-| `push_call` | `public.call_rooms` | `INSERT` + `UPDATE` | Supabase Edge Function → `send-push` |
-| `push_signup` | `public.profiles` | `INSERT` | Supabase Edge Function → `send-push` |
+   ```bash
+   export SEND_PUSH_SECRET="$(openssl rand -hex 32)"
+   supabase secrets set      SEND_PUSH_SECRET="$SEND_PUSH_SECRET"      FIREBASE_SERVICE_ACCOUNT="$(cat /مسار-آمن/service-account.json)"
+   ```
 
-- **الترويسة الإضافية (إلزامية):** `x-send-push-secret: <نفس SEND_PUSH_SECRET>`.
-  بدونها تردّ الدالة 401، وتظهر في `push_delivery_log` بلا أي صف.
-- إن استخدمت نوع **HTTP Request** بدل Edge Function، فالرابط:
-  `https://<project-ref>.supabase.co/functions/v1/send-push` مع نفس الترويسة.
-- الحمولة القياسية: `{ "type": "INSERT"|"UPDATE", "table": "...", "schema": "public",
-  "record": {...}, "old_record": {...} }` — الدالة تستخرج المستلم من سجلّ المحادثة/الغرفة
-  نفسه. لا تُضِف أي حقل مستلم في الحمولة.
-- الـ Webhooks مستضافة سحابياً ⇒ **لا تحتاج `pg_net` ولا Vault ولا أي SQL**، وتعوّض عزل
-  شبكة حاوية القاعدة الذي كان يسبب `Couldn't resolve host name`.
+   يمكن بدلاً من JSON ضبط `FIREBASE_PROJECT_ID` و`FIREBASE_CLIENT_EMAIL` و
+   `FIREBASE_PRIVATE_KEY`. اختياري: `PUSH_NORMAL_URGENCY=1`.
 
-**4) تحقّق بعد الربط:**
+2. **ضع القيمتين في Vault** من SQL Editor أو Database → Vault. إذا كان الاسمان موجودين،
+   حدّثهما من الواجهة بدلاً من إنشاء اسم مكرر. للإعداد الأول فقط:
 
-```sql
-select kind, source, sent, total, skipped, created_at
-  from public.push_delivery_log order by created_at desc limit 20;
-```
+   ```sql
+   select vault.create_secret(
+     'https://<project-ref>.supabase.co/functions/v1/send-push',
+     'send_push_url',
+     'Canonical send-push endpoint'
+   );
 
-صف جديد بعد كل رسالة/مكالمة/تسجيل مستخدم = المسار الحيّ يعمل. للفحص الكامل من التطبيق:
-زر «اختبار الإشعارات» في الإعدادات.
+   -- الصق القيمة نفسها التي وضعتها في SEND_PUSH_SECRET؛ لا تحفظها في Git.
+   select vault.create_secret(
+     '<نفس-قيمة-SEND_PUSH_SECRET>',
+     'send_push_secret',
+     'Shared secret for the canonical pg_net trigger'
+   );
+   ```
 
-> ملاحظة: iOS Safari لا يدعم FCM Web Push إلا عندما يكون التطبيق **مثبّتاً كـ PWA** على
-> الشاشة الرئيسية (iOS 16.4+)، تماماً كحال Web Push العادي.
+3. **نفّذ الهجرة المصححة**:
+   `sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql` (موجودة أيضاً في §26 من
+   `sql/schema.sql`). تتوقف برسالة واضحة إذا كان Vault ناقصاً، وتنشئ `pg_net` من دون
+   `WITH SCHEMA public`، وتزيل الهوكات القديمة، ولا تحذف سجل التسليم عند إعادة التنفيذ.
+
+4. **انشر الدالة وعطّل JWT على البوابة**؛ التحقق من السرّ يبقى إلزامياً داخلها:
+
+   ```bash
+   supabase functions deploy send-push --no-verify-jwt
+   ```
+
+   ملف `supabase/config.toml` يتضمن أيضاً:
+
+   ```toml
+   [functions.send-push]
+   verify_jwt = false
+   ```
+
+5. **تحقق من القاعدة والشبكة**: نفّذ `sql/send-push-audit.sql`. في أول نتيجة يجب أن تكون
+   كل قيم الجاهزية `true`، و`canonical_trigger_count = 3`، و`legacy_send_push_hooks = 0`.
+   راجع بعد رسالة حقيقية `net._http_response` (`status_code`) ثم `push_delivery_log`
+   (`sent/total/skipped`). لا يعرض ملف التدقيق محتوى الاستجابة أو الترويسات.
+
+6. **تحقق من الواجهة وFCM**:
+   - اضبط `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`,
+     `VITE_FIREBASE_MESSAGING_SENDER_ID`, `VITE_FIREBASE_APP_ID`, و`VITE_VAPID_PUBLIC_KEY`.
+   - يجب أن يكون حساب الخدمة في الدالة وVAPID وWeb app على **مشروع Firebase نفسه**.
+   - من التطبيق: الإعدادات → تفعيل إشعارات الجهاز، ثم أرسل **رسالة حقيقية من حساب آخر**
+     والتطبيق مغلق. زر الاختبار يثبت مسار `JWT → Edge → FCM` فقط ولا يختبر التريغر.
+   - عند `sent=1/1` وغياب الإشعار، راجع سجل Service Worker `[push-sw]`؛ قبول FCM للطلب
+     ليس دليلاً على أن نظام الهاتف عرض الإشعار.
+
+### حدود الضمان في الخلفية
+لا يمكن لكود الخادم ضمان عرض الإشعار بنسبة 100% على كل جهاز: الإذن، توفير الطاقة، DND،
+الشبكة، وسياسات المتصفح/النظام قد تؤخره أو تمنعه. الإصلاح هنا يضمن عقد الخادم والحمولة
+والمصادقة ومعالجة الأخطاء ضمن اختبارات المشروع. على iOS يلزم دعم Web Push وتثبيت PWA
+على الشاشة الرئيسية في السياقات التي تشترط ذلك، ولا يمكن للـService Worker تشغيل صوت
+مخصص مستمر بموثوقية في الخلفية.
 
 ## 8. صلاحيات المشرف العام (Super Admin)
 حساب `almgawell17@gmail.com` يملك صلاحيات مطلقة على **كل** المحادثات و**كل** المشرفين —
@@ -446,18 +425,18 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **إجراءات الرسالة** (حذف/تفاعل/رد) مخفية دائماً وتظهر فقط عند النقر على الفقاعة (Esc أو النقر خارجها يخفيها).
 - **قسم المشرفين قابل للطي**: مطوي افتراضياً للسوبر أدمن مع زر إظهار؛ الحالة محفوظة في `localStorage`.
 - **الإشعارات في الخلفية** — قائمة التحقق بعد النشر (v3.0):
-  1. نفّذ `sql/schema.sql` (أو الهجرات بالترتيب) — لا تريگرات إشعارات ولا `pg_net`.
-  2. أنشئ الـ Webhooks الثلاثة من **Database → Webhooks** في لوحة Supabase كما في القسم 7.
-  3. انشر `send-push` بـ `verify_jwt = false` واضبط `SEND_PUSH_SECRET` + أسرار Firebase.
-  4. من التطبيق: **🔔 إرسال إشعار تجريبي** ثم أغلق التطبيق — يجب أن يصل. إن لم يصل راجع
-     `select * from push_delivery_log order by created_at desc`.
+  1. اضبط `SEND_PUSH_SECRET` في Edge Secrets وقيمتي Vault كما في القسم 7.
+  2. نفّذ هجرة `pg_net` المصححة؛ لا تنشئ Database Webhooks يدوية للجداول الثلاثة.
+  3. انشر `send-push` بـ `verify_jwt = false` واضبط أسرار Firebase.
+  4. أرسل رسالة حقيقية من حساب آخر والتطبيق مغلق، ثم راجع `sql/send-push-audit.sql`
+     و`push_delivery_log`. زر الإشعار التجريبي وحده لا يختبر التريغر.
 - اختبارات دخانية: `cd tests && npm i jsdom && node smoke.mjs user|admin|super`.
 
 ## الإصدار v2.2 — تشخيص الإشعارات + حذف المستخدم الشامل
-- زر **🔔 إرسال إشعار تجريبي** يعرض تقريراً خطوة بخطوة (HTTPS، الإذن، Service Worker، إشعار محلي فوري، توكن FCM، ثم `send-push` → FCM)، ويليه تقرير التشخيص من الدالة (`type: "diagnostics"`) الذي يعلن حالة الـ Webhooks وسجل التسليم.
-- **أسباب عدم وصول الإشعارات**: (أ) `send-push` غير منشورة (404) ⇒ `supabase functions deploy send-push`
-  بـ `verify_jwt = false`؛ (ب) أسرار `SEND_PUSH_SECRET`/Firebase غير مضبوطة؛ (ج) الـ Webhooks الثلاثة
-  غير مُنشأة في لوحة Supabase أو ترويسة `x-send-push-secret` لا تطابق السرّ (401).
+- زر **🔔 إرسال إشعار تجريبي** يعرض تقريراً خطوة بخطوة (HTTPS، الإذن، Service Worker، إشعار محلي فوري، توكن FCM، ثم `send-push` → FCM)، ويليه تقرير التشخيص من الدالة (`type: "diagnostics"`) الذي يعلن جاهزية أسرار الدالة والمعمارية المتوقعة وسجل التسليم.
+- **أسباب عدم وصول الإشعارات**: (أ) `send-push` غير منشورة (404) أو JWT مفعّل على البوابة؛
+  (ب) أسرار `SEND_PUSH_SECRET`/Firebase أو Vault غير مضبوطة؛ (ج) الهجرة لم تُنفّذ، أو
+  ترويسة `x-send-push-secret` لا تطابق السرّ، أو بقي Webhook قديم يولّد `GET`/التكرار.
 - إشعار مرئي محلي عند وصول رسالة Realtime والتطبيق مفتوح في محادثة/تبويب آخر (لا يعتمد على FCM).
 - `admin_delete_user`: متاح لكل مشرف (`is_admin` أو `is_super_admin`)، يحذف: التخزين (مرفقات/أفاتار/خلفيات)، التفاعلات، الرسائل، الكتابة، المكالمات وسجلاتها، المحادثات، توكنات FCM، الملف الشخصي، وحساب `auth.users`؛ ويعيد إحصاءات ما حُذف. `reply_to_id` أصبح `on delete set null` حتى لا يعيق الحذف.
 - إجراءات الرسالة مخفية لكل الأدوار حتى النقر على الفقاعة.
@@ -467,8 +446,9 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 - **شارة المشرف المالك** بجانب اسم المستخدم للسوبر أدمن (في القائمة ورأس المحادثة) مع احتياط إن فشل الـ join.
 - **العدّادات**: تصفير فوري عند فتح المحادثة (قبل الشبكة)، تحديث موضعي لصف المحادثة بدل إعادة رسم القائمة، مزامنة التصفير بين الأجهزة، وإعادة اشتراك تلقائية عند انقطاع قناة Realtime.
 - **مسبار مسار الخلفية** (v3.0): زر الإشعار التجريبي يعرض تقرير `diagnostics` من الدالة —
-  `database_notifications { pg_net: false, vault: false, db_triggers: false }`، و`webhook.expected_hooks`،
-  و`delivery_log.recent`. إن لم يظهر أي حدث Webhook فالمشكلة في إعداد اللوحة لا في القاعدة.
+  `database_notifications { pg_net: true, vault: true, db_triggers: true }` كمعمارية متوقعة،
+  و`webhook.expected_hooks` (اسم API محفوظ للتوافق)، و`delivery_log.recent`. إثبات التريغر
+  الفعلي يكون برسالة حقيقية ثم `net._http_response` و`push_delivery_log` عبر SQL Audit.
 
 ## الإصدار v2.9 — عزل إشعارات الرسائل والمكالمات + الوضع الصامت للمشرف العام
 
@@ -503,9 +483,9 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
 الهجرة: `sql/migrations/2026-10-14_v2_11_security_hardening.sql` (مطابقة لما في `sql/schema.sql`).
 للقواعد القائمة: نفّذ الهجرة في SQL Editor، ثم أعد نشر `supabase/functions/agora-token` و`send-push`.
 
-- **لا مفاتيح ولا روابط إشعارات في SQL**: منذ v3.0 لا يحمل أي ملف SQL رابط send-push ولا سرّاً ولا أي
-  قراءة من Vault. العنوان يُدخل مرة واحدة في لوحة Supabase (Database Webhook)، والسرّ في أسرار الدالة
-  فقط، ويُتحقق منه عبر `x-send-push-secret` (الدالة منشورة بـ `verify_jwt = false`).
+- **لا قيم مفاتيح أو روابط إشعارات في SQL**: لا يحمل المخطط قيمة سرّ أو رابط مشروع ثابتاً.
+  يقرأ تريغر `pg_net` الاسمين `send_push_url` و`send_push_secret` من Vault، ويطابق الأخير
+  مع Edge Secret `SEND_PUSH_SECRET` عبر `x-send-push-secret` (`verify_jwt = false`).
 - **المشرف العام = مراقب للقراءة فقط**: يرى المحادثات والرسائل والمكالمات، لكنه لا يكتب ولا يحذف ولا يحظر
   (السياسات `SELECT` فقط، والحظر/الحذف يرفضهما الخادم، وأزرارهما مخفية عنه). لا يصله أي إشعار.
 - **لا RPC للزوار** وسحب الدوال الداخلية (تنظيف المكالمات، توزيع الإشعارات، قائمة المشرفين) من `anon` و`authenticated`.
@@ -516,44 +496,45 @@ supabase secrets set AGORA_APP_ID=... AGORA_APP_CERTIFICATE=...
   فتعمل اختبارات PostgreSQL فعلياً في `npm ci` (كانت تتخطّى صامتةً).
 - **الاختبار**: `npm run test:rls` (تدقيق العزل والصلاحيات على PostgreSQL حقيقي) ضمن `npm test`.
 
-## الإصدار v3.0 — تفعيل إشعارات الخلفية البسيطة عبر `pg_net` وتريگرات قاعدة البيانات
+## الإصدار v3.0 — تدقيق واستقرار إشعارات الخلفية عبر `pg_net`
 
-الهجرة: `sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql` — آمنة لإعادة التنفيذ،
-ولا تحذف أي بيانات محادثات أو مستخدمين.
+الهجرة: `sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql` — قابلة لإعادة
+التنفيذ، ولا تحذف بيانات المحادثات أو المستخدمين أو `push_delivery_log`.
 
-### ما تم تفعيله (مطابق لإعدادات المشروع العامل البسيطة)
-- **امتداد `pg_net`**: مفعّل تلقائياً في المخطط العام (`create extension if not exists pg_net`).
-- **تريگرات ودوال الإشعارات البسيطة**:
-  - `send_fcm_on_new_message` على `public.messages` (`AFTER INSERT`) يستدعي `handle_new_message_notification()` (مع وجود `handle_new_message_push()` و`notify_new_message()` في المخطط العام).
-  - `on_call_room_notify` على `public.call_rooms` (`AFTER INSERT OR UPDATE`) يستدعي `notify_call_room()`.
-  - `on_profile_created_notify_admins` على `public.profiles` (`AFTER INSERT`) يستدعي `notify_admins_new_profile()`.
-- **إصلاح رابط دالة المشروع**: جميع التريگرات تستدعي الرابط الصحيح `https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push` (تم إصلاح الخطأ الإملائي القديم `gqocavvhkfzgxzscrjms` الذي كان يسبّب فشل DNS).
-- **إزالة التعقيدات القديمة**: صفر اعتماد على Supabase Vault، صفر حاجة لإنشاء Database Webhooks يدوياً، وإزالة دوال المسبار المعقدة (`push_probe`، `push_call_edge`، `push_settings`).
+### نتيجة التدقيق
+- **`POST` إلزامي**: كل تريغر يمر عبر `public.send_push_post(jsonb)` الذي يستدعي
+  `net.http_post` مع `Content-Type: application/json` و`x-send-push-secret`.
+- **لا سرّ مدمج ولا fail-open**: أُزيل السرّ الافتراضي وقبول Bearer البديل وقبول الطلب
+  بلا سرّ عند غياب الإعداد. `SEND_PUSH_SECRET` إلزامي (32+ حرفاً) ويطابق Vault.
+- **إزالة مصدر `GET`/التكرار**: تحذف الهجرة فقط هوكات `supabase_functions.http_request`
+  القديمة التي تستهدف `send-push` على الجداول الثلاثة، وتُبقي ثلاثة تريغرات قانونية.
+- **عقد حمولة واحد**: `{type, table, schema, record, old_record}`؛ أُزيلت الحقول
+  المسطّحة المكررة من جسم SQL، مع بقاء توافق القراءة للحمولات القديمة في الدالة.
+- **أخطاء مضبوطة**: `GET` يعيد `405 + Allow` إذا وصل للدالة، وJSON غير الكائن/السجل
+  المفقود يعيد `400`، والعمليات غير المعنية تعيد `ignored`، ولا يفشل حدث كامل بسبب
+  انقطاع شبكة FCM على جهاز واحد.
+- **احتفاظ بالأدلة**: `CREATE TABLE IF NOT EXISTS` بدلاً من إسقاط سجل التسليم.
 
 ### الطبقات الحالية
 | الطبقة | الملف | المسؤولية |
 |---|---|---|
-| تريگرات القاعدة | `sql/schema.sql` (§26) | `send_fcm_on_new_message` + `pg_net` |
-| تطبيع الحدث | `supabase/functions/send-push/webhook.ts` | تحويل حمولة التريگر/Webhook إلى `PushEvent` |
+| تريغرات القاعدة | `sql/schema.sql` (§26) | `send_fcm_on_new_message` + `pg_net` + Vault |
+| عقد SQL/التدقيق | `sql/send-push-audit.sql` | الجاهزية، الهوكات القديمة، `net._http_response` |
+| تطبيع الحدث | `supabase/functions/send-push/webhook.ts` | تحويل الحمولة إلى `PushEvent` بلا استثناءات |
 | قواعد المستلم | `supabase/functions/send-push/recipients.ts` | عزل الرسائل/المكالمات/المشرفين |
 | الإرسال | `supabase/functions/send-push/index.ts` | FCM HTTP v1 + `push_delivery_log` |
-| الإعداد | `supabase/config.toml` | `verify_jwt = false` + ترويسة السرّ |
-| الواجهة | `js/push.js` | `test` + `diagnostics` فقط |
+| إعداد البوابة | `supabase/config.toml` | `verify_jwt = false` مع سرّ داخلي إلزامي |
+| الواجهة | `js/push.js` | `POST test` + `POST diagnostics` فقط |
 
-### سجل التسليم
+### سجل التسليم والاختبارات
 `push_delivery_log(kind, ref_id, recipient_id, source, sent, total, skipped, detail, created_at)`
-بـ RLS وقراءة للمشرفين فقط، ولا سياسة كتابة لأي عميل. تُنظَّف بدالة
-`prune_push_delivery_log(keep_days)` المحجوزة على `service_role`.
+محمي بـRLS، ومصدر أحداث القاعدة الجديدة `trigger`. الاختبارات الأساسية:
 
-### الاختبارات
-- `tests/send-push-runtime.mjs` — **تشغيل الدالة الحقيقية** على Node مع محاكي
-  supabase-js وOAuth2/FCM، بحمولات Webhook حقيقية: رسائل/مكالمات/مستخدم جديد،
-  التكرار، حراس العزل، التوكنات الميتة، إعادة المحاولة (`npm run test:runtime`).
-- `tests/notification-isolation.mjs` — قواعد `recipients.ts` + تطبيع `webhook.ts` + فحص
-  صفر مراجع `pg_net`/Vault/تريگرات في كل ملفات SQL.
-- `tests/sql-v29-postgres.mjs` — تنفيذ `schema.sql` + هجرة v3.0 على PostgreSQL حقيقي
-  (PGlite): لا دوال إشعارات، سجل تسليم محمي، سياسات المراقبة باقية.
-- `tests/rls-hardening-postgres.mjs` · `tests/sql-v28-postgres.mjs` — تحديث كامل للمعمارية.
+- `npm run test:runtime`: تشغيل الدالة الحقيقية مع محاكي Supabase/OAuth/FCM، بما فيه
+  `GET=405`، و`OPTIONS`، وJSON المكسور، و`null/DELETE`، والمصادقة، والتكرار، والمكالمات.
+- `npm run test:isolation`: عقد الحمولة وقواعد المستلمين وفحص عدم وجود سرّ مدمج.
+- `npm run test:sql:v29` و`npm run test:rls`: تنفيذ المخطط/الهجرة على PostgreSQL (PGlite)،
+  بما فيه إعادة التنفيذ والحفاظ على سجل التسليم.
 
-> ℹ️ الأقسام التاريخية (v2.12 → v2.19: Worker، Vault، pg_net، مسار العميل) حُذفت من
-> هذا الملف لأنها تصف بنية أُلغيت نهائياً. سجلّها محفوظ في تاريخ Git.
+> لا يعني `200` وحده عرض الإشعار على الهاتف؛ راجع `sent/total` ثم سجل Service Worker
+> وإعدادات النظام. خطوات الإعداد والتشغيل الكاملة في القسم 7.
