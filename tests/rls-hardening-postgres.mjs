@@ -9,8 +9,8 @@
  *   • المشرف العادي يحظر ويفتح محادثاته فقط
  *   • الزائر (anon) لا يصل لأي بيانات ولا ينفّذ دوال داخلية
  *   • لا مفتاح JWT ثابت في ملفات SQL
- *   • v3.0: قاعدة البيانات بلا pg_net/Vault/تريگرات إشعارات — الإرسال عبر
- *     Database Webhook، وقواعد المستلمين في supabase/functions/send-push/recipients.ts
+ *   • v3.0: pg_net + تريغرات قانونية + Vault، وقواعد المستلمين في
+ *     supabase/functions/send-push/recipients.ts
  * التشغيل: npm i --no-save @electric-sql/pglite && node tests/rls-hardening-postgres.mjs
  * (يتخطّى بلا فشل إن لم تكن الحزمة مثبّتة.)
  */
@@ -67,6 +67,9 @@ const check = (name, ok, extra = "") => {
 };
 
 await db.exec(STUB);
+await db.exec(`insert into vault.decrypted_secrets values
+  ('send_push_url', 'https://project-ref.supabase.co/functions/v1/send-push'),
+  ('send_push_secret', '0123456789abcdef0123456789abcdef');`);
 try {
   await db.exec(stripExt(read("sql/schema.sql")));
   check("schema.sql يُنفَّذ بلا أخطاء على PostgreSQL", true);
@@ -86,8 +89,8 @@ try {
 const MIG_V30_PATH = "sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql";
 const MIG_V30 = read(MIG_V30_PATH);
 try {
-  await db.exec(MIG_V30);
-  await db.exec(MIG_V30); // إعادة التنفيذ
+  await db.exec(stripExt(MIG_V30));
+  await db.exec(stripExt(MIG_V30)); // إعادة التنفيذ
   check("هجرة v3.0 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", true);
 } catch (e) {
   check("هجرة v3.0 تُنفَّذ فوق v2.11 ثم تُعاد بأمان (idempotent)", false, String(e.message).slice(0, 200));
@@ -318,9 +321,9 @@ check("لا JWT ثابت في أي ملف SQL", leaks.length === 0, leaks.join("
 const noLegacyPush = await db.query("select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and p.proname like 'push_%'");
 check("لا دوال إشعارات قديمة (push_*) في القاعدة بعد v3.0", noLegacyPush.rows[0].n === 0, String(noLegacyPush.rows[0].n));
 const activeTriggerFns = await db.query(
-  "select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and p.proname in ('handle_new_message_notification','handle_new_message_push','notify_new_message','notify_call_room','notify_admins_new_profile')",
+  "select count(*)::int n from pg_proc p join pg_namespace ns on ns.oid=p.pronamespace where ns.nspname='public' and p.proname in ('send_push_post','handle_new_message_notification','notify_call_room','notify_admins_new_profile')",
 );
-check("دوال تريگرات الإشعارات البسيطة الخمس موجودة في القاعدة", activeTriggerFns.rows[0].n === 5, String(activeTriggerFns.rows[0].n));
+check("نقطة POST ودوال تريغرات الإشعارات الثلاث موجودة", activeTriggerFns.rows[0].n === 4, String(activeTriggerFns.rows[0].n));
 const pushPolicy = await db.query("select count(*)::int n from pg_policies where schemaname='public' and tablename='push_delivery_log'");
 check("push_delivery_log محمي بـ RLS (قراءة المشرفين فقط)", pushPolicy.rows[0].n >= 1, String(pushPolicy.rows[0].n));
 
@@ -331,12 +334,15 @@ check("v3.0: الهجرة لا تُنشئ أي دالة push_* قديمة",
   !/create (or replace )?function public\.push_/i.test(
     MIG_V30.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n"),
   ));
-check("v3.0: schema.sql يحتوي الرابط الصحيح לדالة المشروع (gqocavvhhfwgkzscrjms)",
-  read("sql/schema.sql").includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push"));
-check("v3.0: لا وجود للرابط القديم ذي الخطأ الإملائي (gqocavvhkfzgxzscrjms) في كود SQL",
-  !/gqocavvhkfzgxzscrjms\.supabase\.co/.test(read("sql/schema.sql").split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n")));
+check("v3.0: schema.sql يقرأ إعدادات send-push من Vault بلا رابط ثابت",
+  /vault\.decrypted_secrets/.test(read("sql/schema.sql")) &&
+  !/https:\/\/[a-z0-9]+\.supabase\.co\/functions\/v1\/send-push/.test(read("sql/schema.sql")));
+check("v3.0: لا سرّ تريغر مدمج في كود SQL",
+  !/my_send_push_19921121|v_secret\s+text\s*:=\s*'/.test(
+    read("sql/schema.sql").split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n"),
+  ));
 
-// لا ملف SQL في المستودع يقرأ SEND_PUSH_URL/SEND_PUSH_SECRET من Vault
+// ملفا المخطط/الهجرة الحاليان فقط يقرآن أسماء أسرار Vault، لا قيمها.
 const SQL_PUSH_FILES = [
   "sql/schema.sql",
   ...fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => "sql/migrations/" + f),
@@ -345,7 +351,9 @@ const vaultPushRefs = SQL_PUSH_FILES.filter((f) => {
   const code = read(f).split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
   return /vault\.(decrypted_secrets|secrets)/.test(code);
 });
-check("لا ملف SQL يقرأ أسرار send-push من Vault (المسار مُضمَّن بالكامل)", vaultPushRefs.length === 0, vaultPushRefs.join(", "));
+check("قراءة Vault محصورة في schema والهجرة الحالية",
+  vaultPushRefs.length === 2 && vaultPushRefs.includes("sql/schema.sql") && vaultPushRefs.includes(MIG_V30_PATH),
+  vaultPushRefs.join(", "));
 
 if (fails) {
   console.log(`\nFAILED ${fails} check(s)`);

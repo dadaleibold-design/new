@@ -6,7 +6,7 @@
  * قواعد العزل إلى supabase/functions/send-push/recipients.ts وأُزيلت كل
  * طبقات الإرسال من القاعدة، فأصبح هذا الملف يتحقق من:
  *   • قواعد المستلم (رسالة/مكالمة/مستخدم جديد) في الوحدة النقية الجديدة
- *   • أن القاعدة خالية تماماً من pg_net / Vault / تريگرات إشعارات
+ *   • مسار pg_net + التريغرات القانونية + Vault بلا سرّ مدمج
  *   • سجل التسليم push_delivery_log: الشكل الجديد + RLS + لا كتابة للعملاء
  *   • سياسات المشرف العام (المراقبة) باقية كما في v2.9
  *   • هجرة v3.0 idempotent على مخطط كامل
@@ -86,7 +86,7 @@ check("المكالمة: طرفا الغرفة يجب أن يكونا طرفي �
     callPartiesBelongToConversation(CONV_A, USER_A, USER_B) === false);
 
 /* ============================================================
- * ② قاعدة البيانات: إشعارات الخلفية البسيطة عبر pg_net وتريگرات القاعدة (بلا Vault)
+ * ② قاعدة البيانات: pg_net + تريغرات قانونية + Vault للسرّ المشترك
  * ============================================================ */
 const stripSql = (sql) => String(sql).replace(/--[^\n]*/g, " ");
 const MIGRATIONS = fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => ({
@@ -96,11 +96,12 @@ const MIGRATIONS = fs.readdirSync(path.join(ROOT, "sql/migrations")).map((f) => 
 const ALL_CODE = stripSql(SCHEMA) + "\n" + MIGRATIONS.map((m) => m.code).join("\n");
 
 check("تفعيل امتداد pg_net في schema.sql وهجرة v3.0", /create extension if not exists pg_net/i.test(ALL_CODE));
-check("استدعاء net.http_post بالرابط الصحيح للمشروع في SQL",
+check("استدعاء net.http_post عبر إعدادات Vault بلا رابط/سرّ مدمج",
   /net\.http_post/.test(ALL_CODE) &&
-  ALL_CODE.includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push") &&
-  !ALL_CODE.includes("gqocavvhkfzgxzscrjms"));
-check("لا قراءة من Vault في أي ملف SQL", !/vault\.(decrypted_secrets|secrets)/.test(ALL_CODE));
+  ALL_CODE.includes("vault.decrypted_secrets") &&
+  ALL_CODE.includes("send_push_url") && ALL_CODE.includes("send_push_secret") &&
+  !ALL_CODE.includes("my_send_push_19921121") &&
+  !/https:\/\/[a-z0-9]+\.supabase\.co\/functions\/v1\/send-push/.test(ALL_CODE));
 const LEGACY = [
   "push_call_edge", "trigger_send_push_notification", "push_probe",
   "push_gateway_check", "push_egress_check", "push_net_diagnostics",
@@ -121,7 +122,14 @@ check("تريگرات الإشعارات البسيطة موجودة في SQL (s
  * ============================================================ */
 const STUB = `
 create schema if not exists auth; create schema if not exists extensions;
-create schema if not exists storage; create schema if not exists realtime;
+create schema if not exists vault; create schema if not exists storage; create schema if not exists realtime;
+create schema if not exists supabase_functions;
+create schema if not exists net;
+create table if not exists net._http_response (
+  id bigint, status_code integer, timed_out boolean, error_msg text, created timestamptz
+);
+create or replace function supabase_functions.http_request() returns trigger
+language plpgsql as $$ begin return new; end $$;
 do $$ begin
   if not exists (select 1 from pg_roles where rolname='anon') then create role anon nologin; end if;
   if not exists (select 1 from pg_roles where rolname='authenticated') then create role authenticated nologin; end if;
@@ -135,6 +143,10 @@ create or replace function auth.uid() returns uuid language sql stable as $$ sel
 create or replace function auth.role() returns text language sql stable as $$ select coalesce(nullif(current_setting('request.jwt.claim.role', true), ''), 'anon') $$;
 create or replace function auth.jwt() returns jsonb language sql stable as $$ select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb $$;
 create table if not exists auth.users (id uuid primary key, email text, raw_user_meta_data jsonb default '{}'::jsonb, phone text);
+create table if not exists vault.decrypted_secrets (name text, decrypted_secret text);
+insert into vault.decrypted_secrets values
+  ('send_push_url', 'https://project-ref.supabase.co/functions/v1/send-push'),
+  ('send_push_secret', '0123456789abcdef0123456789abcdef');
 create table if not exists storage.buckets (id text primary key, name text, public boolean default false);
 create table if not exists storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text, owner uuid, metadata jsonb);
 alter table storage.objects enable row level security;
@@ -162,24 +174,40 @@ const activeNotifyFns = async (client) =>
   (
     await client.query(`select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
       where n.nspname='public' and p.proname in (
-        'handle_new_message_notification', 'handle_new_message_push',
-        'notify_new_message', 'notify_call_room', 'notify_admins_new_profile'
+        'send_push_post', 'handle_new_message_notification',
+        'notify_call_room', 'notify_admins_new_profile'
       ) order by p.proname`)
   ).rows.map((r) => r.proname);
 
 check("schema.sql لا يُنشئ أي دالة push_* قديمة",
   (await legacyPushFns(db)).length === 0, (await legacyPushFns(db)).join(","));
 
+// محاكاة هوك Dashboard قديم: GET إلى send-push + هوك آخر لا يجب حذفه.
+await db.exec(`
+  create trigger legacy_get_send_push after insert on public.messages
+  for each row execute function supabase_functions.http_request(
+    'https://project-ref.supabase.co/functions/v1/send-push', 'GET', '{}', '{}', '1000'
+  );
+  create trigger unrelated_webhook after insert on public.messages
+  for each row execute function supabase_functions.http_request(
+    'https://example.test/other-endpoint', 'GET', '{}', '{}', '1000'
+  );
+`);
+
+const MIGRATION_FOR_PGLITE = MIGRATION.replace(/create extension if not exists \w+;/g, "-- ext");
 try {
-  await db.exec(MIGRATION);
-  await db.exec(MIGRATION);
+  await db.exec(MIGRATION_FOR_PGLITE);
+  await db.exec("insert into public.push_delivery_log(kind, source) values ('preserve-me', 'trigger')");
+  await db.exec(MIGRATION_FOR_PGLITE);
   check("هجرة v3.0 تُنفَّذ مرتين بأمان (idempotent)", true);
+  check("إعادة الهجرة تحافظ على سجل التسليم",
+    (await db.query("select count(*)::int n from public.push_delivery_log where kind='preserve-me'")).rows[0].n === 1);
 } catch (e) {
   check("هجرة v3.0 تُنفَّذ مرتين بأمان (idempotent)", false, String(e.message).slice(0, 300));
 }
 
-check("دوال الإشعارات البسيطة الخمس موجودة في القاعدة بعد الهجرة",
-  (await activeNotifyFns(db)).length === 5, (await activeNotifyFns(db)).join(","));
+check("نقطة POST ودوال الإشعارات الثلاث موجودة بلا مرادفات مكررة",
+  (await activeNotifyFns(db)).length === 4, (await activeNotifyFns(db)).join(","));
 
 /* ---------- سجل التسليم ---------- */
 const cols = (
@@ -190,9 +218,9 @@ const names = cols.map((c) => c.column_name);
 check("push_delivery_log: الأعمدة v3.0 (kind/ref_id/recipient_id/source/sent/total/skipped/detail)",
   ["kind", "ref_id", "recipient_id", "source", "sent", "total", "skipped", "detail"].every((c) => names.includes(c)),
   names.join(","));
-check("push_delivery_log: source افتراضيه webhook",
+check("push_delivery_log: source افتراضيه trigger",
   (await db.query(`select column_default from information_schema.columns
-    where table_name='push_delivery_log' and column_name='source'`)).rows[0]?.column_default?.includes("webhook"));
+    where table_name='push_delivery_log' and column_name='source'`)).rows[0]?.column_default?.includes("trigger"));
 const rls = await db.query(
   `select relrowsecurity from pg_class where relname='push_delivery_log' and relnamespace='public'::regnamespace`,
 );
@@ -248,8 +276,17 @@ check("تريگر send_fcm_on_new_message وتريگرات المكالمات و
   ["send_fcm_on_new_message", "on_call_room_notify", "on_profile_created_notify_admins"].every((t) => trigs.includes(t)) &&
     !trigs.includes("on_message_inserted"),
   trigs.join(","));
+check("الهجرة تحذف Webhook القديم GET إلى send-push ولا تحذف هوكاً آخر",
+  !trigs.includes("legacy_get_send_push") && trigs.includes("unrelated_webhook"), trigs.join(","));
 check("تريگرات المحادثة/الطوابع الزمنية غير المتعلقة بالإشعارات باقية",
   trigs.includes("on_message_touch_conversation") || trigs.length > 0);
+
+try {
+  await db.exec(read("sql/send-push-audit.sql"));
+  check("ملف SQL Audit يُنفَّذ بلا أخطاء ولا يحتاج تعريفات الهوكات/الأسرار", true);
+} catch (e) {
+  check("ملف SQL Audit يُنفَّذ بلا أخطاء", false, String(e.message).slice(0, 300));
+}
 
 console.log(fails ? `\n${fails} فحص فشل` : "\nكل فحوصات عزل الإشعارات (v3.0) نجحت");
 process.exit(fails ? 1 : 0);

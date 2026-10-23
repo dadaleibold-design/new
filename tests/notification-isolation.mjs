@@ -118,7 +118,7 @@ const fnBlock = (name) => {
   return next === -1 ? SCHEMA.slice(start) : SCHEMA.slice(start, start + 1 + next);
 };
 
-// ① قاعدة البيانات: إشعارات الخلفية البسيطة عبر pg_net وتريگرات القاعدة (بلا Vault وبلا دوال المسبار القديمة)
+// ① قاعدة البيانات: pg_net + تريغرات قانونية + Vault للسرّ (بلا دوال مسبار قديمة)
 const LEGACY_FNS = [
   "push_call_edge", "trigger_send_push_notification", "push_probe", "push_probe_result",
   "push_gateway_check", "push_egress_check", "push_net_diagnostics", "push_path_verdict",
@@ -131,26 +131,36 @@ check("schema.sql لا يحوي تعريف أي دالة إشعارات قديم
   LEGACY_FNS.every((fn) => !new RegExp(`create (or replace )?function public\\.${fn}\\s*\\(`).test(SCHEMA)),
   LEGACY_FNS.filter((fn) => new RegExp(`create (or replace )?function public\\.${fn}\\s*\\(`).test(SCHEMA)).join(","));
 check("schema.sql يفعّل امتداد pg_net لإشعارات الخلفية", /create extension if not exists pg_net/i.test(SCHEMA));
-check("schema.sql يستدعي net.http_post بالرابط الصحيح للمشروع",
+check("schema.sql يستدعي net.http_post عبر نقطة واحدة ويقرأ الرابط/السرّ من Vault",
   /net\.http_post/.test(SCHEMA_CODE) &&
-  SCHEMA_CODE.includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push") &&
-  !SCHEMA_CODE.includes("gqocavvhkfzgxzscrjms"));
-check("schema.sql لا يقرأ من Vault", !/vault\./i.test(SCHEMA_CODE) && !/from vault/i.test(SCHEMA_CODE));
+  /create or replace function public\.send_push_post\(p_payload jsonb\)/.test(SCHEMA) &&
+  SCHEMA_CODE.includes("vault.decrypted_secrets") &&
+  SCHEMA_CODE.includes("send_push_url") && SCHEMA_CODE.includes("send_push_secret") &&
+  !SCHEMA_CODE.includes("my_send_push_19921121"));
+check("schema.sql لا يحتوي سرّ تريغر مدمجاً أو رابط مشروع ثابتاً",
+  !/v_secret\s+text\s*:=\s*'/.test(SCHEMA_CODE) &&
+  !/https:\/\/[a-z0-9]+\.supabase\.co\/functions\/v1\/send-push/.test(SCHEMA_CODE));
 check("schema.sql ينشئ تريگرات الإشعارات البسيطة (send_fcm_on_new_message)",
   /create trigger send_fcm_on_new_message/.test(SCHEMA) &&
   /create trigger on_call_room_notify/.test(SCHEMA) &&
   /create trigger on_profile_created_notify_admins/.test(SCHEMA));
-check("دوال الإشعارات البسيطة معرّفة في schema.sql",
-  ["handle_new_message_notification", "handle_new_message_push", "notify_new_message",
-   "notify_call_room", "notify_admins_new_profile"].every((fn) =>
-    new RegExp(`create or replace function public\\.${fn}\\s*\\(`).test(SCHEMA)));
-check("لا قراءة من Vault في أي ملف هجرة", !/vault\./i.test(ALL_SQL) && !/from vault/i.test(ALL_SQL));
-check("هجرة v3.0 تفعّل pg_net والتريگر send_fcm_on_new_message بالرابط الصحيح",
+check("دوال الإشعارات القانونية فقط معرّفة في schema.sql",
+  ["send_push_post", "handle_new_message_notification", "notify_call_room", "notify_admins_new_profile"]
+    .every((fn) => new RegExp(`create or replace function public\\.${fn}\\s*\\(`).test(SCHEMA)) &&
+  !/create or replace function public\.(handle_new_message_push|notify_new_message)\s*\(/.test(SCHEMA));
+check("الهجرة الحالية تستخدم Vault ولا تدمج السرّ",
+  /vault\.decrypted_secrets/i.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
+  !/my_send_push_19921121|v_secret\s+text\s*:=\s*'/.test(ALL_SQL));
+check("هجرة v3.0 تفعّل pg_net والتريغر وتحذف هوكات supabase_functions القديمة",
   /create extension if not exists pg_net/i.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
   /create trigger send_fcm_on_new_message/i.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
-  read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql").includes("https://gqocavvhhfwgkzscrjms.supabase.co/functions/v1/send-push"));
+  /pn\.nspname = 'supabase_functions'/.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")) &&
+  /p\.proname = 'http_request'/.test(read("sql/migrations/2026-10-26_v3_0_database_webhooks_only.sql")));
 check("سجل التسليم يُكتب من الدالة لا من تريگر (لا insert في SQL)",
   !/insert into public\.push_delivery_log/i.test(SCHEMA));
+check("إعادة الهجرة لا تحذف سجل التسليم",
+  !/drop table if exists public\.push_delivery_log/i.test(SCHEMA_CODE) &&
+  /create table if not exists public\.push_delivery_log/i.test(SCHEMA_CODE));
 
 // ② قواعد الرسائل (recipients.ts)
 const C = { id: "c1", user_id: "U1", admin_id: "A1" };
@@ -226,6 +236,16 @@ check("Webhook: الحمولة المسطّحة للاختبار اليدوي م
   normalizePayload({ type: "new_message", message_id: "m9", conversation_id: "c1", sender_id: "U1" }).event.kind === "new_message");
 check("Webhook: حمولة التريگر المسطّحة (بلا type) مدعومة",
   normalizePayload({ message_id: "m10", conversation_id: "c1", sender_id: "U1", content: "مرحبا" }).event.kind === "new_message");
+check("Webhook: DELETE مع record=null يُتجاهل بلا استثناء",
+  normalizePayload({ type: "DELETE", table: "messages", schema: "public", record: null, old_record: { id: "m1" } }).ok === false &&
+  Boolean(normalizePayload({ type: "DELETE", table: "messages", record: null }).ignored));
+check("Webhook: INSERT مع record=null خطأ عقد واضح",
+  normalizePayload({ type: "INSERT", table: "messages", record: null }).ok === false &&
+  /record must be a JSON object/.test(normalizePayload({ type: "INSERT", table: "messages", record: null }).error));
+check("Webhook: القيم غير الكائنية لا ترمي استثناء",
+  [null, [], "bad", 42].every((value) => normalizePayload(value).ok === false));
+check("Webhook: typed record المسطّح مدعوم",
+  normalizePayload({ type: "new_message", record: { id: "m11", conversation_id: "c1", sender_id: "U1" } }).event.record.id === "m11");
 check("webhook.ts نقي (بلا شبكة/قاعدة)", !/fetch\(|supabase|from\(/.test(WEBHOOK));
 check("recipients.ts نقي (بلا شبكة/قاعدة)", !/fetch\(|supabase|from\(/.test(RECIPIENTS));
 
@@ -275,10 +295,12 @@ check("send-push لم يبق فيه أي مسار client_* (أُزيل في v3.0
 const SEND_PUSH_CODE = SEND_PUSH
   .replace(/\/\*[\s\S]*?\*\//g, " ")
   .replace(/(^|[^:])\/\/.*$/gm, "$1 ");
-check("send-push لا يقرأ من Vault ولا يستخدم pg_net",
-  !/net\.http_post|vault\.|from vault|create extension[^\n]*pg_net/i.test(SEND_PUSH_CODE));
+check("send-push لا يستعلم Vault ولا يستخدم pg_net بنفسه (SQL هو من يفعل)",
+  !/net\.http_post|vault\.decrypted_secrets|from\s+vault\b|create extension[^\n]*pg_net/i.test(SEND_PUSH_CODE));
 check("send-push لا يعتمد على Worker وسيط", !/workers\.dev|PUSH_GATEWAY/.test(SEND_PUSH));
-check("send-push يتطلب سرّ الـ Webhook", SEND_PUSH.includes("x-send-push-secret") && SEND_PUSH.includes("isWebhookAuthorized"));
+check("send-push يتطلب سرّ التريغر بلا قيمة افتراضية أو fail-open",
+  SEND_PUSH.includes("x-send-push-secret") && SEND_PUSH.includes("isWebhookAuthorized") &&
+  !SEND_PUSH.includes("DEFAULT_TRIGGER_SECRET") && !SEND_PUSH.includes("if (!SEND_PUSH_SECRET && !supplied)"));
 check("send-push يسجّل كل حدث في push_delivery_log", SEND_PUSH.includes("push_delivery_log") && SEND_PUSH.includes("logDelivery"));
 check("send-push يمنع تكرار نفس الحدث", SEND_PUSH.includes("isDuplicate(") && SEND_PUSH.includes("markSent("));
 check("الواجهة لم تعد ترسل إشعارات (حُذف js/clientPush.js)",
@@ -294,13 +316,14 @@ check("npm test يشغّل اختبار التشغيل الفعلي للـ Webho
 check("لا اختبارات Deno معلّقة على المعمارية القديمة",
   !fs.existsSync(path.join(ROOT, "tests/deno/send-push-runtime.test.ts")) &&
     !fs.existsSync(path.join(ROOT, "tests/deno/loop-guard-check.ts")));
-check("README يوثّق إنشاء الـ Webhooks الثلاثة",
-  /Database → Webhooks → Create a new hook/.test(README) &&
-    README.includes("push_message") && README.includes("push_call") && README.includes("push_signup"));
-check("README يوثّق ترويسة السرّ ورابط الدالة",
-  README.includes("x-send-push-secret") && README.includes("/functions/v1/send-push"));
-check("README لا يصف pg_net/Vault كمسار حالي",
-  !/pg_net\.http_post|من قاعدة البيانات → pg_net → send-push|Vault يقرأ/.test(README));
+check("README يوثّق مسار pg_net الموحّد وإعداد Vault والتدقيق",
+  README.includes("net.http_post") && README.includes("vault.create_secret") &&
+    README.includes("send_push_url") && README.includes("sql/send-push-audit.sql"));
+check("README يوثّق ترويسة السرّ ورابط الدالة وPOST",
+  README.includes("x-send-push-secret") && README.includes("/functions/v1/send-push") &&
+    README.includes("verify_jwt = false"));
+check("README لا يعود للمسار اليدوي المزدوج أو السرّ المدمج",
+  !/Database → Webhooks → Create a new hook|بلا Webhook يدوي وبلا Vault|my_send_push_19921121/.test(README));
 
 // ⑨ الواجهة: نفس القاعدة قبل أي صوت/إشعار/رنين
 check("app.js يستورد منطق العزل من وحدة العزل",

@@ -156,7 +156,9 @@ check("send-push: يقرأ معرّف الجهاز والمستخدم من fcm_t
     SEND_PUSH.includes('.select("id, token, platform, device_id, user_id")'));
 check("send-push: سجل عدد أجهزة المستلم", SEND_PUSH.includes("[send-push] recipient="));
 check("send-push: الإرسال إلى كل التوكنات (Promise.all لكل شريحة، لا أول توكن فقط)", SEND_PUSH.includes("const settled = await Promise.all(") && SEND_PUSH.includes("rows.slice(i, i + FCM_CONCURRENCY)"));
-check("send-push: الحذف مقصور على التوكنات الميّتة", SEND_PUSH.includes("const removed = !result.ok && isDeadToken(result.status, result.details);"));
+check("send-push: الحذف مقصور على التوكنات الميّتة",
+  SEND_PUSH.includes("const shouldRemove = !result.ok && isDeadToken(result.status, result.details);") &&
+  SEND_PUSH.includes("if (shouldRemove)"));
 
 const failsBefore = fails;
 console.log(fails === 0 ? "\nكل اختبارات الأجهزة المتعددة نجحت" : `\n${fails} فشل`);
